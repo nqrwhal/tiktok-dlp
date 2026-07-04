@@ -57,6 +57,10 @@ The bot requires the `Guilds`, `Guild Messages`, `Direct Messages`, and
 `Message Content` intents. Enable Message Content in the Discord developer
 portal for the application.
 
+Watched usernames only alert for videos newer than when the watch was added.
+Videos with no timestamp metadata are treated as eligible so new uploads are not
+missed when TikTok or `yt-dlp` omits dates.
+
 ## Docker
 
 ```bash

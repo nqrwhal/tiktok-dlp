@@ -4,7 +4,9 @@ import assert from 'node:assert/strict';
 import {
   TikTokMonitor,
   calculateFailureBackoffMs,
+  isVideoNewerThanWatch,
   normalizeWatchedUser,
+  resolveVideoTimestampMs,
 } from '../src/tiktok/monitor.js';
 
 class FakeStore {
@@ -145,6 +147,73 @@ test('runOnce downloads and alerts only unseen videos', async () => {
   });
 });
 
+test('timestamp helpers compare videos against watch creation time', () => {
+  assert.equal(resolveVideoTimestampMs({ timestamp: 1_700_000_000 }), 1_700_000_000_000);
+  assert.equal(resolveVideoTimestampMs({ timestamp: 1_700_000_000_000 }), 1_700_000_000_000);
+  assert.equal(resolveVideoTimestampMs({ upload_date: '20231114' }), Date.UTC(2023, 10, 14));
+  assert.equal(resolveVideoTimestampMs({ created_at: '2023-11-14T22:13:20.000Z' }), 1_700_000_000_000);
+  assert.equal(resolveVideoTimestampMs({}), null);
+
+  const watch = { created_at: 1_700_000_000_000 };
+  assert.equal(isVideoNewerThanWatch({ timestamp: 1_699_999_999 }, watch), false);
+  assert.equal(isVideoNewerThanWatch({ timestamp: 1_700_000_000 }, watch), false);
+  assert.equal(isVideoNewerThanWatch({ timestamp: 1_700_000_001 }, watch), true);
+  assert.equal(isVideoNewerThanWatch({}, watch), true);
+  assert.equal(isVideoNewerThanWatch({ timestamp: 1 }, {}), true);
+});
+
+test('runOnce skips videos older than the watch creation time', async () => {
+  const now = 1_700_000_100_000;
+  const alerts = [];
+  const store = new FakeStore([
+    {
+      username: 'creator',
+      channel_id: 'channel-1',
+      created_at: 1_700_000_000_000,
+      failure_count: 0,
+      next_check_at: null,
+    },
+  ]);
+  const downloader = new FakeDownloader([
+    {
+      id: 'old-1',
+      title: 'Old video',
+      timestamp: 1_699_999_999,
+      webpage_url: 'https://www.tiktok.com/@creator/video/1',
+    },
+    {
+      id: 'new-2',
+      title: 'New video',
+      timestamp: 1_700_000_001,
+      webpage_url: 'https://www.tiktok.com/@creator/video/2',
+    },
+  ]);
+
+  const monitor = new TikTokMonitor({
+    store,
+    downloader,
+    alert: async (payload) => alerts.push(payload),
+    now: () => now,
+  });
+
+  const summary = await monitor.runOnce();
+
+  assert.equal(downloader.downloadCalls.length, 1);
+  assert.equal(downloader.downloadCalls[0].video.id, 'new-2');
+  assert.equal(alerts.length, 1);
+  assert.equal(store.seen.has('old-1'), false);
+  assert.equal(store.seen.has('new-2'), true);
+  assert.deepEqual(summary, {
+    watchedUsers: 1,
+    skippedUsers: 0,
+    scannedVideos: 2,
+    downloadedVideos: 1,
+    alertedVideos: 1,
+    seenVideos: 0,
+    failures: 0,
+  });
+});
+
 test('runOnce backoffs failures and skips watches until due', async () => {
   const now = 1_700_000_000_000;
   const store = new FakeStore([
@@ -176,4 +245,3 @@ test('runOnce backoffs failures and skips watches until due', async () => {
   assert.equal(second.skippedUsers, 1);
   assert.equal(downloader.listCalls.length, 1);
 });
-

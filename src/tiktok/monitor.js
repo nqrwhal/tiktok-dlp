@@ -26,6 +26,38 @@ export function resolveVideoSourceUrl(video, fallbackUrl = '') {
   return String(video?.webpage_url ?? video?.original_url ?? video?.url ?? video?.source_url ?? fallbackUrl ?? '').trim();
 }
 
+export function resolveVideoTimestampMs(video) {
+  const numericTimestamp = Number(video?.timestamp ?? video?.release_timestamp ?? 0);
+  if (Number.isFinite(numericTimestamp) && numericTimestamp > 0) {
+    return numericTimestamp > 10_000_000_000 ? numericTimestamp : numericTimestamp * 1000;
+  }
+
+  const uploadDate = String(video?.upload_date ?? '');
+  if (/^\d{8}$/.test(uploadDate)) {
+    const yyyy = Number(uploadDate.slice(0, 4));
+    const mm = Number(uploadDate.slice(4, 6));
+    const dd = Number(uploadDate.slice(6, 8));
+    return Date.UTC(yyyy, mm - 1, dd);
+  }
+
+  for (const value of [video?.created_at, video?.date, video?.uploadDate]) {
+    const parsed = Date.parse(String(value ?? ''));
+    if (Number.isFinite(parsed)) return parsed;
+  }
+
+  return null;
+}
+
+export function isVideoNewerThanWatch(video, watch) {
+  const watchCreatedAt = Number(watch?.created_at ?? 0);
+  if (!watchCreatedAt) return true;
+
+  const videoTimestampMs = resolveVideoTimestampMs(video);
+  if (!videoTimestampMs) return true;
+
+  return videoTimestampMs > watchCreatedAt;
+}
+
 export function calculateFailureBackoffMs(failureCount, { baseMs = DEFAULT_BACKOFF_BASE_MS, maxMs = DEFAULT_BACKOFF_MAX_MS } = {}) {
   const attempts = Math.max(1, Number(failureCount ?? 0) + 1);
   return Math.min(maxMs, baseMs * (2 ** (attempts - 1)));
@@ -148,6 +180,10 @@ export class TikTokMonitor {
 
           const videoId = resolveVideoId(video);
           if (!videoId) continue;
+
+          if (!isVideoNewerThanWatch(video, watch)) {
+            continue;
+          }
 
           if (await Promise.resolve(this.store.hasSeenVideo(videoId))) {
             summary.seenVideos += 1;
