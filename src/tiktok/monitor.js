@@ -58,6 +58,16 @@ export function isVideoNewerThanWatch(video, watch) {
   return videoTimestampMs > watchCreatedAt;
 }
 
+export function shouldBaselineVideoWithoutAlert(video, watch) {
+  const watchCreatedAt = Number(watch?.created_at ?? 0);
+  if (!watchCreatedAt) return false;
+
+  const videoTimestampMs = resolveVideoTimestampMs(video);
+  if (videoTimestampMs) return videoTimestampMs <= watchCreatedAt;
+
+  return !watch?.last_success_at;
+}
+
 export function calculateFailureBackoffMs(failureCount, { baseMs = DEFAULT_BACKOFF_BASE_MS, maxMs = DEFAULT_BACKOFF_MAX_MS } = {}) {
   const attempts = Math.max(1, Number(failureCount ?? 0) + 1);
   return Math.min(maxMs, baseMs * (2 ** (attempts - 1)));
@@ -181,16 +191,26 @@ export class TikTokMonitor {
           const videoId = resolveVideoId(video);
           if (!videoId) continue;
 
-          if (!isVideoNewerThanWatch(video, watch)) {
-            continue;
-          }
-
           if (await Promise.resolve(this.store.hasSeenVideo(videoId))) {
             summary.seenVideos += 1;
             continue;
           }
 
           const sourceUrl = resolveVideoSourceUrl(video, normalized.profileUrl);
+          const seenRecord = {
+            videoId,
+            username: normalized.username,
+            sourceUrl,
+            title: video?.title ?? video?.description ?? '',
+          };
+
+          const baselineOnly = shouldBaselineVideoWithoutAlert(video, watch);
+          if (baselineOnly) {
+            await Promise.resolve(this.store.markVideoSeen(seenRecord, now));
+            summary.seenVideos += 1;
+            continue;
+          }
+
           const downloaded = await this.#downloadVideo(video, {
             watch,
             username: normalized.username,
@@ -213,18 +233,7 @@ export class TikTokMonitor {
 
           summary.alertedVideos += 1;
 
-          await Promise.resolve(
-            this.store.markVideoSeen(
-              {
-                videoId,
-                username: normalized.username,
-                sourceUrl,
-                title: video?.title ?? video?.description ?? '',
-                alertedAt: now,
-              },
-              now,
-            ),
-          );
+          await Promise.resolve(this.store.markVideoSeen({ ...seenRecord, alertedAt: now }, now));
         }
 
         await Promise.resolve(this.store.markWatchSuccess(normalized.username, now));

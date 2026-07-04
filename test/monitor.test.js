@@ -201,7 +201,7 @@ test('runOnce skips videos older than the watch creation time', async () => {
   assert.equal(downloader.downloadCalls.length, 1);
   assert.equal(downloader.downloadCalls[0].video.id, 'new-2');
   assert.equal(alerts.length, 1);
-  assert.equal(store.seen.has('old-1'), false);
+  assert.equal(store.seen.has('old-1'), true);
   assert.equal(store.seen.has('new-2'), true);
   assert.deepEqual(summary, {
     watchedUsers: 1,
@@ -209,7 +209,51 @@ test('runOnce skips videos older than the watch creation time', async () => {
     scannedVideos: 2,
     downloadedVideos: 1,
     alertedVideos: 1,
-    seenVideos: 0,
+    seenVideos: 1,
+    failures: 0,
+  });
+});
+
+test('runOnce baselines timestamp-free videos on the first watch scan', async () => {
+  const now = 1_700_000_100_000;
+  const alerts = [];
+  const store = new FakeStore([
+    {
+      username: 'creator',
+      channel_id: 'channel-1',
+      created_at: 1_700_000_000_000,
+      last_success_at: null,
+      failure_count: 0,
+      next_check_at: null,
+    },
+  ]);
+  const downloader = new FakeDownloader([
+    {
+      id: 'unknown-1',
+      title: 'Unknown timestamp',
+      webpage_url: 'https://www.tiktok.com/@creator/video/1',
+    },
+  ]);
+
+  const monitor = new TikTokMonitor({
+    store,
+    downloader,
+    alert: async (payload) => alerts.push(payload),
+    now: () => now,
+  });
+
+  const summary = await monitor.runOnce();
+
+  assert.equal(downloader.downloadCalls.length, 0);
+  assert.equal(alerts.length, 0);
+  assert.equal(store.seen.has('unknown-1'), true);
+  assert.deepEqual(summary, {
+    watchedUsers: 1,
+    skippedUsers: 0,
+    scannedVideos: 1,
+    downloadedVideos: 0,
+    alertedVideos: 0,
+    seenVideos: 1,
     failures: 0,
   });
 });
