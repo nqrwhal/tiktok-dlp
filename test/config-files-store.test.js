@@ -117,6 +117,8 @@ test('store persists watches, seen videos, jobs, files, and link tokens', async 
     store.createLinkToken({ token: 'tok', fileId, expiresAt: 7000 }, 6000);
     store.createLinkToken({ token: 'tok2', fileId, expiresAt: 9000 }, 6000);
 
+    assert.equal(store.getLatestFileByVideoId('v1').filename, 'video.mp4');
+    assert.equal(store.getLatestFileByVideoId('missing'), null);
     assert.equal(store.getValidToken('tok', 6500).filename, 'video.mp4');
     assert.equal(store.getValidToken('tok', 7500), null);
     assert.equal(store.getValidToken('tok2', 6500).filename, 'video.mp4');
@@ -271,6 +273,7 @@ test('download link listing can include monitored downloads', async () => {
   try {
     const userFileId = store.createFileRecord({
       requestedBy: 'user-1',
+      username: 'openai',
       sourceUrl: 'https://www.tiktok.com/@openai/video/1',
       filePath: path.join(dir, 'one.mp4'),
       filename: 'one.mp4',
@@ -300,7 +303,20 @@ test('download link listing can include monitored downloads', async () => {
       store.listDownloadLinksByRequester('user-1', { includeMonitored: true }).map((link) => link.token),
       ['monitor-token', 'user-token'],
     );
+    assert.deepEqual(
+      store.listDownloadLinksByRequester('user-1', { includeMonitored: true, limit: 1, offset: 1 }).map((link) => link.token),
+      ['user-token'],
+    );
     assert.equal(store.countDownloadLinksByRequester('user-1', { includeMonitored: true }), 2);
+    assert.deepEqual(
+      store.listDownloadLinksByRequester('user-1', { includeMonitored: true, username: 'OPENAI' }).map((link) => link.token),
+      ['monitor-token', 'user-token'],
+    );
+    assert.deepEqual(
+      store.listDownloadLinksByRequester('user-1', { includeMonitored: true, username: 'other' }).map((link) => link.token),
+      [],
+    );
+    assert.equal(store.countDownloadLinksByRequester('user-1', { includeMonitored: true, username: 'openai' }), 2);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -326,6 +342,25 @@ test('delivery payload includes link-management buttons', async () => {
     ['link:new:abc', 'link:extend:abc', 'link:permanent:abc'],
   );
   assert.equal(payload.components[0].components[2].data.label, 'Keep on server');
+});
+
+test('reused downloads use links for auto delivery', async () => {
+  const payload = await buildDeliveryPayload({
+    token: 'abc',
+    publicUrl: 'https://example.com/files/abc',
+    filePath: '/tmp/video.mp4',
+    filename: 'video.mp4',
+    title: 'clip',
+    sourceUrl: 'https://www.tiktok.com/@openai/video/1',
+    sizeBytes: 1,
+    reused: true,
+  }, {
+    publicBaseUrl: 'https://example.com',
+    discordUploadLimitBytes: 10,
+  }, 'auto');
+
+  assert.equal(payload.files, undefined);
+  assert.match(payload.content, /Download ready: https:\/\/example\.com\/files\/abc/);
 });
 
 test('help keyword works in DMs and scoped guild messages', () => {

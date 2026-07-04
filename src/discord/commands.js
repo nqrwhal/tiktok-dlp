@@ -83,6 +83,12 @@ const downloadsCommand = new SlashCommandBuilder()
           .setRequired(false)
           .setMinValue(1)
           .setMaxValue(25),
+      )
+      .addStringOption((option) =>
+        option
+          .setName('username')
+          .setDescription('Filter by TikTok username.')
+          .setRequired(false),
       ),
   )
   .addSubcommand((subcommand) =>

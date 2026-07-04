@@ -171,6 +171,17 @@ export class Store {
     return Number(result.lastInsertRowid);
   }
 
+  getLatestFileByVideoId(videoId) {
+    if (!videoId) return null;
+    return this.db.prepare(`
+      SELECT *
+      FROM files
+      WHERE video_id = ?
+      ORDER BY created_at DESC
+      LIMIT 1
+    `).get(String(videoId)) ?? null;
+  }
+
   createLinkToken({ token, fileId, expiresAt }, now = Date.now()) {
     this.db.prepare(`
       INSERT INTO link_tokens (token, file_id, expires_at, created_at)
@@ -245,7 +256,7 @@ export class Store {
     return this.db.prepare(`DELETE FROM files WHERE id IN (${placeholders})`).run(...uniqueIds).changes;
   }
 
-  listDownloadLinksByRequester(requestedBy, { limit = 25, activeOnly = true, includeMonitored = false, now = Date.now() } = {}) {
+  listDownloadLinksByRequester(requestedBy, { limit = 25, offset = 0, activeOnly = true, includeMonitored = false, username = '', now = Date.now() } = {}) {
     const ownerClause = includeMonitored
       ? `(
           files.requested_by = ?
@@ -257,6 +268,16 @@ export class Store {
           )
         )`
       : 'files.requested_by = ?';
+    const clauses = [ownerClause];
+    const params = [String(requestedBy ?? '')];
+    if (activeOnly) {
+      clauses.push('(link_tokens.expires_at = 0 OR link_tokens.expires_at > ?)');
+      params.push(now);
+    }
+    if (username) {
+      clauses.push('lower(files.username) = lower(?)');
+      params.push(String(username));
+    }
     const sql = `
       SELECT
         link_tokens.token,
@@ -279,18 +300,17 @@ export class Store {
         ) AS title
       FROM link_tokens
       JOIN files ON files.id = link_tokens.file_id
-      WHERE ${ownerClause}
-        ${activeOnly ? 'AND (link_tokens.expires_at = 0 OR link_tokens.expires_at > ?)' : ''}
+      WHERE ${clauses.join('\n        AND ')}
       ORDER BY link_tokens.created_at DESC
       LIMIT ?
+      OFFSET ?
     `;
-    const params = activeOnly
-      ? [String(requestedBy ?? ''), now, Math.max(1, Math.min(50, Number(limit) || 25))]
-      : [String(requestedBy ?? ''), Math.max(1, Math.min(50, Number(limit) || 25))];
+    params.push(Math.max(1, Math.min(50, Number(limit) || 25)));
+    params.push(Math.max(0, Number(offset) || 0));
     return this.db.prepare(sql).all(...params);
   }
 
-  countDownloadLinksByRequester(requestedBy, { activeOnly = true, includeMonitored = false, now = Date.now() } = {}) {
+  countDownloadLinksByRequester(requestedBy, { activeOnly = true, includeMonitored = false, username = '', now = Date.now() } = {}) {
     const ownerClause = includeMonitored
       ? `(
           files.requested_by = ?
@@ -302,14 +322,22 @@ export class Store {
           )
         )`
       : 'files.requested_by = ?';
+    const clauses = [ownerClause];
+    const params = [String(requestedBy ?? '')];
+    if (activeOnly) {
+      clauses.push('(link_tokens.expires_at = 0 OR link_tokens.expires_at > ?)');
+      params.push(now);
+    }
+    if (username) {
+      clauses.push('lower(files.username) = lower(?)');
+      params.push(String(username));
+    }
     const sql = `
       SELECT COUNT(*) AS count
       FROM link_tokens
       JOIN files ON files.id = link_tokens.file_id
-      WHERE ${ownerClause}
-        ${activeOnly ? 'AND (link_tokens.expires_at = 0 OR link_tokens.expires_at > ?)' : ''}
+      WHERE ${clauses.join('\n        AND ')}
     `;
-    const params = activeOnly ? [String(requestedBy ?? ''), now] : [String(requestedBy ?? '')];
     return this.db.prepare(sql).get(...params).count;
   }
 

@@ -14,6 +14,7 @@ import { removeStoredFiles } from '../cleanup/downloads.js';
 import { extractTikTokUrls, normalizeUsername, shouldUploadToDiscord, makePublicFileUrl, randomToken } from '../util/files.js';
 
 const LINK_BUTTON_PREFIX = 'link:';
+const DOWNLOADS_BUTTON_PREFIX = 'downloads:list:';
 const FIFTEEN_DAYS_MS = 15 * 24 * 60 * 60 * 1000;
 
 export async function startDiscordBot({ config, store, monitor, downloadOne, registerCommands }) {
@@ -39,7 +40,14 @@ export async function startDiscordBot({ config, store, monitor, downloadOne, reg
   client.on('interactionCreate', async (interaction) => {
     try {
       if (interaction.isButton()) {
-        await handleLinkButton({ interaction, config, store });
+        const handled = await handleButtonInteraction({ interaction, config, store });
+        if (!handled) {
+          await interaction.reply(buildNoticePayload({
+            title: 'Unknown Button',
+            description: 'Unknown button action.',
+            color: 0xef4444,
+          }));
+        }
         return;
       }
 
@@ -91,25 +99,38 @@ export async function handleInteraction({ interaction, config, store, monitor, d
       const username = normalizeUsername(interaction.options.getString('username', true));
       const channelId = interaction.channelId || config.discordChannelId;
       const watch = store.addWatch(username, channelId);
-      await interaction.reply({ content: `Watching @${watch.username}. Alerts will post in this channel.`, ephemeral: true });
+      await interaction.reply(buildNoticePayload({
+        title: 'Watch Added',
+        description: `Watching @${watch.username}. Alerts will post in this channel.`,
+      }));
       return;
     }
     if (subcommand === 'remove') {
       const username = normalizeUsername(interaction.options.getString('username', true));
       const removed = store.removeWatch(username);
-      await interaction.reply({ content: removed ? `Stopped watching @${username}.` : `@${username} was not watched.`, ephemeral: true });
+      await interaction.reply(buildNoticePayload({
+        title: removed ? 'Watch Removed' : 'Watch Not Found',
+        description: removed ? `Stopped watching @${username}.` : `@${username} was not watched.`,
+      }));
       return;
     }
     if (subcommand === 'list') {
       const watches = store.listWatches();
-      await interaction.reply({ content: formatWatchList(watches), ephemeral: true });
+      await interaction.reply(buildNoticePayload({
+        title: 'Watched Usernames',
+        description: formatWatchList(watches),
+      }));
       return;
     }
     if (subcommand === 'run') {
       await interaction.deferReply({ ephemeral: true });
       const username = normalizeUsername(interaction.options.getString('username', true));
       const result = await monitor.pollUsername(username, { force: true });
-      await interaction.editReply(`Checked @${username}: ${result.newVideos ?? 0} new video(s), ${result.skipped ?? 0} already seen.`);
+      await interaction.editReply(buildNoticePayload({
+        title: 'Watch Check Complete',
+        description: `Checked @${username}: ${result.newVideos ?? 0} new video(s), ${result.skipped ?? 0} already seen.`,
+        ephemeral: false,
+      }));
       return;
     }
   }
@@ -120,7 +141,10 @@ export async function handleInteraction({ interaction, config, store, monitor, d
   }
 
   if (command === 'history') {
-    await interaction.reply({ content: formatHistory(store.listJobs(10)), ephemeral: true });
+    await interaction.reply(buildNoticePayload({
+      title: 'Download History',
+      description: formatHistory(store.listJobs(10)),
+    }));
     return;
   }
 
@@ -223,16 +247,16 @@ export async function handleDownloadsInteraction({ interaction, config, store })
   if (subcommand === 'list') {
     const limit = interaction.options.getInteger('limit') ?? 10;
     const userId = interaction.user?.id ?? '';
-    const links = store.listDownloadLinksByRequester(userId, { limit, activeOnly: true, includeMonitored: true });
-    const total = store.countDownloadLinksByRequester(userId, { activeOnly: true, includeMonitored: true });
-    await interaction.reply({
-      content: formatUserDownloadLinks(links, {
-        config,
-        total,
-        limit,
-      }),
-      ephemeral: true,
-    });
+    const usernameInput = interaction.options.getString('username') ?? '';
+    const username = usernameInput ? normalizeUsername(usernameInput) : '';
+    await interaction.reply(buildDownloadsListPayload({
+      config,
+      store,
+      userId,
+      limit,
+      page: 0,
+      username,
+    }));
     return;
   }
 
@@ -241,12 +265,19 @@ export async function handleDownloadsInteraction({ interaction, config, store })
     const confirm = interaction.options.getString('confirm', true);
 
     if (confirm !== 'PURGE') {
-      await interaction.reply({ content: 'Purge cancelled. Run it again with `confirm:PURGE`.', ephemeral: true });
+      await interaction.reply(buildNoticePayload({
+        title: 'Purge Cancelled',
+        description: 'Run it again with `confirm:PURGE`.',
+      }));
       return;
     }
 
     if (scope === 'all' && !canPurgeAll(interaction)) {
-      await interaction.reply({ content: 'Only members with Manage Server can purge all downloads.', ephemeral: true });
+      await interaction.reply(buildNoticePayload({
+        title: 'Permission Required',
+        description: 'Only members with Manage Server can purge all downloads.',
+        color: 0xef4444,
+      }));
       return;
     }
 
@@ -255,8 +286,23 @@ export async function handleDownloadsInteraction({ interaction, config, store })
     const files = store.listFilesForPurge({ requestedBy });
     const counts = store.purgeDownloads({ requestedBy });
     const removal = await removeStoredFiles(files, config);
-    await interaction.editReply(formatPurgeResult({ scope, counts, removal }));
+    await interaction.editReply(buildNoticePayload({
+      title: 'Downloads Purged',
+      description: formatPurgeResult({ scope, counts, removal }),
+      ephemeral: false,
+    }));
   }
+}
+
+export async function handleButtonInteraction({ interaction, config, store }) {
+  const customId = String(interaction.customId ?? '');
+  if (customId.startsWith(LINK_BUTTON_PREFIX)) {
+    return handleLinkButton({ interaction, config, store });
+  }
+  if (customId.startsWith(DOWNLOADS_BUTTON_PREFIX)) {
+    return handleDownloadsListButton({ interaction, config, store });
+  }
+  return false;
 }
 
 export async function sendVideoAlert({ client, config, store, result, video, watch }) {
@@ -282,7 +328,7 @@ export async function sendVideoAlert({ client, config, store, result, video, wat
 
 export async function buildDeliveryPayload(result, config, requestedDelivery = 'auto', options = {}) {
   const canUpload = shouldUploadToDiscord(result.sizeBytes, config);
-  const wantsFile = requestedDelivery === 'file' || (requestedDelivery === 'auto' && canUpload);
+  const wantsFile = requestedDelivery === 'file' || (requestedDelivery === 'auto' && canUpload && !result.reused);
   const embed = buildVideoEmbed(result, options.video);
   const contentPrefix = options.contentPrefix ?? '';
 
@@ -318,13 +364,21 @@ export async function handleLinkButton({ interaction, config, store }) {
 
   const [, action, token] = customId.split(':');
   if (!token) {
-    await interaction.reply({ content: 'That link action is missing its token.', ephemeral: true });
+    await interaction.reply(buildNoticePayload({
+      title: 'Missing Token',
+      description: 'That link action is missing its token.',
+      color: 0xef4444,
+    }));
     return true;
   }
 
   const record = store.getToken(token);
   if (!record) {
-    await interaction.reply({ content: 'I cannot find that download anymore.', ephemeral: true });
+    await interaction.reply(buildNoticePayload({
+      title: 'Download Not Found',
+      description: 'I cannot find that download anymore.',
+      color: 0xef4444,
+    }));
     return true;
   }
 
@@ -332,35 +386,124 @@ export async function handleLinkButton({ interaction, config, store }) {
     const newToken = randomToken();
     const expiresAt = Date.now() + FIFTEEN_DAYS_MS;
     store.createLinkToken({ token: newToken, fileId: record.id, expiresAt });
-    await interaction.reply({
-      content: `New 15-day link: ${makePublicFileUrl(config, newToken)}`,
-      ephemeral: true,
-    });
+    await interaction.reply(buildNoticePayload({
+      title: 'New 15-Day Link',
+      description: makePublicFileUrl(config, newToken),
+    }));
     return true;
   }
 
   if (action === 'extend') {
     const updated = store.extendLinkToken(token, FIFTEEN_DAYS_MS);
-    await interaction.reply({
-      content: updated?.expires_at === 0
+    await interaction.reply(buildNoticePayload({
+      title: updated?.expires_at === 0 ? 'Permanent Link' : 'Link Extended',
+      description: updated?.expires_at === 0
         ? `This link is already permanent: ${makePublicFileUrl(config, token)}`
         : `Extended by 15 days. New expiry: ${formatExpiry(updated?.expires_at)}\n${makePublicFileUrl(config, token)}`,
-      ephemeral: true,
-    });
+    }));
     return true;
   }
 
   if (action === 'permanent') {
     store.setLinkTokenPermanent(token);
-    await interaction.reply({
-      content: `Permanent link kept: ${makePublicFileUrl(config, token)}`,
-      ephemeral: true,
-    });
+    await interaction.reply(buildNoticePayload({
+      title: 'Kept On Server',
+      description: `Permanent link kept: ${makePublicFileUrl(config, token)}`,
+    }));
     return true;
   }
 
-  await interaction.reply({ content: 'Unknown link action.', ephemeral: true });
+  await interaction.reply(buildNoticePayload({
+    title: 'Unknown Action',
+    description: 'Unknown link action.',
+    color: 0xef4444,
+  }));
   return true;
+}
+
+async function handleDownloadsListButton({ interaction, config, store }) {
+  const parsed = parseDownloadsListCustomId(interaction.customId);
+  if (!parsed) {
+    await interaction.reply(buildNoticePayload({
+      title: 'Invalid List Action',
+      description: 'That downloads list action is invalid.',
+      color: 0xef4444,
+    }));
+    return true;
+  }
+
+  if (parsed.userId !== String(interaction.user?.id ?? '')) {
+    await interaction.reply(buildNoticePayload({
+      title: 'Not Your List',
+      description: 'Only the user who opened this list can page through it.',
+      color: 0xef4444,
+    }));
+    return true;
+  }
+
+  const payload = buildDownloadsListPayload({
+    config,
+    store,
+    userId: parsed.userId,
+    limit: parsed.limit,
+    page: parsed.page,
+    username: parsed.username,
+  });
+  delete payload.ephemeral;
+  await interaction.update(payload);
+  return true;
+}
+
+function buildDownloadsListPayload({ config, store, userId, limit = 10, page = 0, username = '' }) {
+  const pageSize = Math.max(1, Math.min(25, Number(limit) || 10));
+  const currentPage = Math.max(0, Number(page) || 0);
+  const listOptions = {
+    limit: pageSize,
+    offset: currentPage * pageSize,
+    activeOnly: true,
+    includeMonitored: true,
+    username,
+  };
+  const links = store.listDownloadLinksByRequester(userId, listOptions);
+  const total = store.countDownloadLinksByRequester(userId, listOptions);
+  const pageCount = Math.max(1, Math.ceil(total / pageSize));
+  const clampedPage = Math.min(currentPage, pageCount - 1);
+
+  if (clampedPage !== currentPage) {
+    return buildDownloadsListPayload({ config, store, userId, limit: pageSize, page: clampedPage, username });
+  }
+
+  return {
+    embeds: [buildDownloadsListEmbed(links, {
+      config,
+      total,
+      page: clampedPage,
+      pageSize,
+      username,
+    })],
+    components: buildDownloadsPaginationRows({
+      userId,
+      limit: pageSize,
+      page: clampedPage,
+      pageCount,
+      username,
+    }),
+    ephemeral: true,
+  };
+}
+
+function buildNoticePayload({ title, description, color = 0x00f2ea, ephemeral = true }) {
+  const payload = {
+    embeds: [
+      new EmbedBuilder()
+        .setColor(color)
+        .setTitle(truncateText(title, 256))
+        .setDescription(truncateText(description, 4000))
+        .setTimestamp(new Date()),
+    ],
+  };
+  if (ephemeral) payload.ephemeral = true;
+  return payload;
 }
 
 function buildLinkManagementRows(token) {
@@ -381,6 +524,75 @@ function buildLinkManagementRows(token) {
         .setStyle(ButtonStyle.Success),
     ),
   ];
+}
+
+function buildDownloadsPaginationRows({ userId, limit, page, pageCount, username = '' }) {
+  if (pageCount <= 1) return [];
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(makeDownloadsListCustomId({ userId, limit, page: Math.max(0, page - 1), username }))
+        .setLabel('Previous')
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(page <= 0),
+      new ButtonBuilder()
+        .setCustomId(makeDownloadsListCustomId({ userId, limit, page: page + 1, username }))
+        .setLabel('Next')
+        .setStyle(ButtonStyle.Primary)
+        .setDisabled(page >= pageCount - 1),
+    ),
+  ];
+}
+
+function buildDownloadsListEmbed(links, { config, total, page, pageSize, username = '' }) {
+  const title = username ? `Downloads for @${username}` : 'Downloads';
+  const pageCount = Math.max(1, Math.ceil(total / pageSize));
+  const embed = new EmbedBuilder()
+    .setColor(0x00f2ea)
+    .setTitle(title)
+    .setFooter({ text: `Page ${page + 1} of ${pageCount} - ${total} active link${total === 1 ? '' : 's'}` })
+    .setTimestamp(new Date());
+
+  if (!links.length) {
+    embed.setDescription(username
+      ? `No active download links found for @${username}.`
+      : 'You do not have any active download links yet.');
+    return embed;
+  }
+
+  embed.addFields(...links.map((link, index) => {
+    const ordinal = page * pageSize + index + 1;
+    const title = truncateText(link.title || link.filename || link.source_url || 'download', 120);
+    const user = link.username ? `@${truncateText(link.username, 32)}` : '@unknown';
+    const url = makePublicFileUrl(config, link.token) || 'PUBLIC_BASE_URL is not configured.';
+    return {
+      name: truncateText(`${ordinal}. ${user} - ${title}`, 256),
+      value: truncateText([
+        url,
+        `expires: ${formatExpiry(link.expires_at)} - ${formatBytes(link.size_bytes)}`,
+      ].join('\n'), 1024),
+    };
+  }));
+
+  return embed;
+}
+
+function makeDownloadsListCustomId({ userId, limit, page, username = '' }) {
+  return `${DOWNLOADS_BUTTON_PREFIX}${encodeURIComponent(String(userId))}:${limit}:${page}:${encodeURIComponent(username)}`;
+}
+
+function parseDownloadsListCustomId(customId) {
+  const text = String(customId ?? '');
+  if (!text.startsWith(DOWNLOADS_BUTTON_PREFIX)) return null;
+  const rest = text.slice(DOWNLOADS_BUTTON_PREFIX.length);
+  const [encodedUserId, limit, page, encodedUsername = ''] = rest.split(':');
+  if (!encodedUserId) return null;
+  return {
+    userId: decodeURIComponent(encodedUserId),
+    limit: Math.max(1, Math.min(25, Number(limit) || 10)),
+    page: Math.max(0, Number(page) || 0),
+    username: decodeURIComponent(encodedUsername),
+  };
 }
 
 export function buildVideoEmbed(result, video = {}) {
@@ -414,22 +626,6 @@ function formatHistory(jobs) {
     const target = job.username ? `@${job.username}` : job.source_url;
     return `#${job.id} ${job.status} ${target} ${when}${job.error ? ` — ${job.error}` : ''}`;
   }).join('\n').slice(0, 1900);
-}
-
-function formatUserDownloadLinks(links, { config, total, limit }) {
-  if (!links.length) return 'You do not have any active download links yet.';
-
-  const rows = links.map((link, index) => {
-    const label = link.title || link.filename || link.source_url || 'download';
-    const url = makePublicFileUrl(config, link.token);
-    return [
-      `${index + 1}. ${label.slice(0, 90)}`,
-      url,
-      `expires: ${formatExpiry(link.expires_at)} • ${formatBytes(link.size_bytes)}`,
-    ].join('\n');
-  });
-  const suffix = total > links.length ? `\n\nShowing ${links.length} of ${total} active links. Use \`limit:${Math.min(25, total)}\` to see more.` : '';
-  return `${rows.join('\n\n')}${suffix}`.slice(0, 1900);
 }
 
 function formatPurgeResult({ scope, counts, removal }) {
@@ -479,4 +675,12 @@ function mediaLabel(result) {
 function formatExpiry(value) {
   if (Number(value) === 0) return 'never';
   return value ? new Date(value).toISOString() : 'unknown';
+}
+
+function truncateText(value, maxLength) {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+  if (text.length <= maxLength) return text;
+  if (maxLength <= 1) return text.slice(0, maxLength);
+  if (maxLength <= 3) return text.slice(0, maxLength);
+  return `${text.slice(0, maxLength - 3).trimEnd()}...`;
 }
