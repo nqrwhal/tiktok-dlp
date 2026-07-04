@@ -2,11 +2,11 @@ import { SlashCommandBuilder } from 'discord.js';
 
 const downloadCommand = new SlashCommandBuilder()
   .setName('download')
-  .setDescription('Download a TikTok video.')
+  .setDescription('Download a TikTok post.')
   .addStringOption((option) =>
     option
       .setName('url')
-      .setDescription('TikTok video URL.')
+      .setDescription('TikTok video, photo, or slideshow URL.')
       .setRequired(true),
   )
   .addStringOption((option) =>

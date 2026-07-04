@@ -1,8 +1,8 @@
 import { spawn as defaultSpawn } from 'node:child_process';
-import { mkdir, mkdtemp, readdir, stat } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { fileSize, makeDownloadLayout, moveDirectoryContents, pickPrimaryVideo, profileUrl as makeProfileUrl } from '../util/files.js';
+import { fileSize, isTikTokUrl, makeDownloadLayout, moveDirectoryContents, pickPrimaryVideo, profileUrl as makeProfileUrl } from '../util/files.js';
 
 const METADATA_BASE_ARGS = [
   '--ignore-config',
@@ -44,6 +44,8 @@ const DOWNLOAD_BASE_ARGS = [
   '%(id)s.%(ext)s',
 ];
 
+const MOBILE_USER_AGENT = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
+
 export function buildMetadataArgs(sourceUrl, options = {}) {
   const args = [...METADATA_BASE_ARGS];
   if (options.flatPlaylist) args.push('--flat-playlist');
@@ -81,8 +83,13 @@ export function buildDownloadArgs(sourceUrl, options = {}) {
 }
 
 export async function fetchVideoMetadata(sourceUrl, options = {}) {
-  const { stdout } = await runYtDlp(options.ytdlpPath ?? 'yt-dlp', buildMetadataArgs(sourceUrl, options), options);
-  return parseJsonOutput(stdout, 'metadata');
+  try {
+    const { stdout } = await runYtDlp(options.ytdlpPath ?? 'yt-dlp', buildMetadataArgs(sourceUrl, options), options);
+    return parseJsonOutput(stdout, 'metadata');
+  } catch (error) {
+    if (!shouldTryPhotoFallback(sourceUrl, error, options)) throw error;
+    return fetchPhotoPostMetadata(sourceUrl, options);
+  }
 }
 
 export async function listProfileVideos(usernameOrUrl, options = {}) {
@@ -117,10 +124,23 @@ export async function downloadVideo(sourceUrl, options = {}) {
 
   await ensureTempDir(tempDir);
 
-  const { stdout, stderr } = await runYtDlp(ytdlpPath, buildDownloadArgs(sourceUrl, {
-    ...options,
-    outputDir: tempDir,
-  }), options);
+  if (isPhotoPostMetadata(metadata)) {
+    return downloadPhotoPost(sourceUrl, metadata, tempDir, options);
+  }
+
+  let stdout = '';
+  let stderr = '';
+  try {
+    const result = await runYtDlp(ytdlpPath, buildDownloadArgs(sourceUrl, {
+      ...options,
+      outputDir: tempDir,
+    }), options);
+    stdout = result.stdout;
+    stderr = result.stderr;
+  } catch (error) {
+    if (!shouldTryPhotoFallback(sourceUrl, error, options)) throw error;
+    return downloadPhotoPost(sourceUrl, await fetchPhotoPostMetadata(sourceUrl, options), tempDir, options);
+  }
 
   let downloadDir = tempDir;
   let files = await collectFiles(tempDir);
@@ -160,6 +180,72 @@ export async function downloadVideo(sourceUrl, options = {}) {
     thumbnailUrl: normalized.thumbnail || '',
     stdout,
     stderr,
+  };
+}
+
+export async function fetchPhotoPostMetadata(sourceUrl, options = {}) {
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  if (typeof fetchImpl !== 'function') {
+    throw new Error('Fetch API is not available for TikTok photo fallback.');
+  }
+
+  const response = await fetchImpl(String(sourceUrl), {
+    redirect: 'follow',
+    headers: {
+      'user-agent': MOBILE_USER_AGENT,
+      'accept-language': 'en-US,en;q=0.9',
+      accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    },
+  });
+  if (!response?.ok) {
+    throw new Error(`TikTok photo metadata request failed with status ${response?.status ?? 'unknown'}.`);
+  }
+
+  const html = await response.text();
+  return parsePhotoPostMetadata(html, response.url || sourceUrl);
+}
+
+export function parsePhotoPostMetadata(html, sourceUrl = '') {
+  const data = parseRehydrationJson(html);
+  const item = findPhotoItem(data);
+  if (!item) {
+    throw Object.assign(new Error('TikTok photo post metadata was not found.'), {
+      kind: 'photo_metadata_not_found',
+      sourceUrl: String(sourceUrl),
+      stdout: '',
+      stderr: '',
+    });
+  }
+
+  const imageUrls = item.imagePost.images
+    .map((image) => image?.imageURL?.urlList?.find(Boolean))
+    .filter(Boolean);
+  if (!imageUrls.length) {
+    throw Object.assign(new Error('TikTok photo post did not include downloadable images.'), {
+      kind: 'photo_images_not_found',
+      sourceUrl: String(sourceUrl),
+      stdout: '',
+      stderr: '',
+    });
+  }
+
+  const username = String(item.author?.uniqueId ?? item.author?.nickname ?? '');
+  const id = String(item.id ?? '');
+  return {
+    id,
+    title: String(item.desc ?? id),
+    description: String(item.desc ?? ''),
+    uploader: username,
+    channel: username,
+    creator: username,
+    webpage_url: sourceUrl || makePhotoUrl(username, id),
+    original_url: sourceUrl || makePhotoUrl(username, id),
+    thumbnail: imageUrls[0],
+    timestamp: numberOrNull(item.createTime) ?? 0,
+    mediaType: 'slideshow',
+    imageCount: imageUrls.length,
+    imageUrls,
+    imagePost: item.imagePost,
   };
 }
 
@@ -356,6 +442,88 @@ function normalizePlaylistEntry(entry, sourceUrl, index) {
   };
 }
 
+async function downloadPhotoPost(sourceUrl, metadata, tempDir, options = {}) {
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  if (typeof fetchImpl !== 'function') {
+    throw new Error('Fetch API is not available for TikTok photo fallback.');
+  }
+
+  const normalized = normalizeMetadata(metadata, sourceUrl);
+  const imageEntries = [];
+  for (const [index, imageUrl] of metadata.imageUrls.entries()) {
+    const image = await fetchImage(imageUrl, fetchImpl);
+    const filename = `${String(index + 1).padStart(3, '0')}.${image.extension}`;
+    imageEntries.push({
+      name: filename,
+      data: image.data,
+    });
+  }
+
+  const videoId = normalized.videoId || normalized.id || 'slideshow';
+  const zipFilename = `${videoId}.zip`;
+  const zipPath = path.join(tempDir, zipFilename);
+  const infoJson = `${videoId}.info.json`;
+  const descriptionFile = `${videoId}.description`;
+  const manifest = {
+    id: videoId,
+    sourceUrl: String(sourceUrl),
+    title: normalized.title,
+    uploader: normalized.uploader,
+    imageCount: imageEntries.length,
+    images: imageEntries.map((entry) => entry.name),
+  };
+
+  await createZipFile(zipPath, [
+    ...imageEntries,
+    {
+      name: infoJson,
+      data: Buffer.from(JSON.stringify({ ...metadata, imageUrls: metadata.imageUrls }, null, 2)),
+    },
+    {
+      name: 'manifest.json',
+      data: Buffer.from(JSON.stringify(manifest, null, 2)),
+    },
+    ...(normalized.description ? [{
+      name: descriptionFile,
+      data: Buffer.from(String(normalized.description)),
+    }] : []),
+  ]);
+  await writeFile(path.join(tempDir, infoJson), JSON.stringify(metadata, null, 2));
+  if (normalized.description) {
+    await writeFile(path.join(tempDir, descriptionFile), String(normalized.description));
+  }
+
+  let downloadDir = tempDir;
+  let files = await collectFiles(tempDir);
+  if (options.downloadDir) {
+    const layout = makeDownloadLayout({ downloadDir: options.downloadDir }, normalized);
+    downloadDir = layout.dir;
+    files = await moveDirectoryContents(tempDir, downloadDir);
+  }
+
+  const primaryFile = pickPrimaryFile(files);
+  const sizeBytes = primaryFile ? await fileSize(primaryFile) : 0;
+  return {
+    sourceUrl: String(sourceUrl),
+    metadata: normalized,
+    downloadDir,
+    files,
+    primaryFile,
+    filePath: primaryFile,
+    filename: primaryFile ? path.basename(primaryFile) : '',
+    sizeBytes,
+    videoId,
+    username: normalized.uploader || '',
+    title: normalized.title || '',
+    description: normalized.description || '',
+    thumbnailUrl: normalized.thumbnail || '',
+    mediaType: 'slideshow',
+    imageCount: imageEntries.length,
+    stdout: '',
+    stderr: '',
+  };
+}
+
 async function collectFiles(dir) {
   const entries = await readdir(dir, { withFileTypes: true });
   const files = [];
@@ -394,6 +562,8 @@ async function makeTempDownloadDir(parentDir) {
 function pickPrimaryFile(files) {
   return files.find((entry) => /\.mp4$/i.test(entry))
     ?? files.find((entry) => /\.(webm|mov|mkv|m4v)$/i.test(entry))
+    ?? files.find((entry) => /\.zip$/i.test(entry))
+    ?? files.find((entry) => /\.(jpe?g|png|webp|gif|heic)$/i.test(entry))
     ?? files[0]
     ?? '';
 }
@@ -419,3 +589,199 @@ function numberOrNull(value) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
 }
+
+function shouldTryPhotoFallback(sourceUrl, error, options = {}) {
+  if (options.disablePhotoFallback) return false;
+  if (!isTikTokUrl(sourceUrl)) return false;
+  const kind = String(error?.kind ?? '');
+  const text = `${error?.message ?? ''}\n${error?.stderr ?? ''}\n${error?.stdout ?? ''}`.toLowerCase();
+  return kind === 'invalid_url'
+    || kind === 'no_formats'
+    || /\/photo\/|unsupported url|no video formats found|requested format is not available/.test(text);
+}
+
+function isPhotoPostMetadata(metadata) {
+  return metadata?.mediaType === 'slideshow'
+    && Array.isArray(metadata?.imageUrls)
+    && metadata.imageUrls.length > 0;
+}
+
+function parseRehydrationJson(html) {
+  const marker = 'id="__UNIVERSAL_DATA_FOR_REHYDRATION__"';
+  const markerIndex = String(html).indexOf(marker);
+  if (markerIndex < 0) {
+    throw Object.assign(new Error('TikTok rehydration data was not found.'), {
+      kind: 'photo_metadata_not_found',
+      stdout: '',
+      stderr: '',
+    });
+  }
+
+  const contentStart = String(html).indexOf('>', markerIndex);
+  const contentEnd = String(html).indexOf('</script>', contentStart);
+  if (contentStart < 0 || contentEnd < 0) {
+    throw Object.assign(new Error('TikTok rehydration data was malformed.'), {
+      kind: 'photo_metadata_not_found',
+      stdout: '',
+      stderr: '',
+    });
+  }
+
+  return JSON.parse(String(html).slice(contentStart + 1, contentEnd));
+}
+
+function findPhotoItem(value) {
+  if (!value || typeof value !== 'object') return null;
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const found = findPhotoItem(entry);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (Array.isArray(value.imagePost?.images)) return value;
+  for (const entry of Object.values(value)) {
+    const found = findPhotoItem(entry);
+    if (found) return found;
+  }
+  return null;
+}
+
+async function fetchImage(url, fetchImpl) {
+  const response = await fetchImpl(String(url), {
+    redirect: 'follow',
+    headers: {
+      'user-agent': MOBILE_USER_AGENT,
+      accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+    },
+  });
+  if (!response?.ok) {
+    throw new Error(`TikTok image request failed with status ${response?.status ?? 'unknown'}.`);
+  }
+  const contentType = String(response.headers?.get?.('content-type') ?? '');
+  return {
+    data: Buffer.from(await response.arrayBuffer()),
+    extension: extensionFromContentType(contentType) || extensionFromUrl(response.url || url) || 'jpg',
+  };
+}
+
+function extensionFromContentType(contentType) {
+  if (/png/i.test(contentType)) return 'png';
+  if (/webp/i.test(contentType)) return 'webp';
+  if (/gif/i.test(contentType)) return 'gif';
+  if (/heic|heif/i.test(contentType)) return 'heic';
+  if (/jpe?g/i.test(contentType)) return 'jpg';
+  return '';
+}
+
+function extensionFromUrl(url) {
+  const pathname = new URL(String(url)).pathname;
+  const extension = path.extname(pathname).replace(/^\./, '').toLowerCase();
+  if (['jpg', 'jpeg', 'png', 'webp', 'gif', 'heic'].includes(extension)) {
+    return extension === 'jpeg' ? 'jpg' : extension;
+  }
+  return '';
+}
+
+function makePhotoUrl(username, id) {
+  return username && id ? `https://www.tiktok.com/@${username}/photo/${id}` : '';
+}
+
+async function createZipFile(zipPath, entries) {
+  const now = new Date();
+  const centralDirectory = [];
+  const chunks = [];
+  let offset = 0;
+
+  for (const entry of entries) {
+    const data = Buffer.isBuffer(entry.data) ? entry.data : Buffer.from(entry.data);
+    const name = Buffer.from(entry.name);
+    const crc = crc32(data);
+    const localHeader = makeZipLocalHeader({ name, data, crc, date: now });
+    chunks.push(localHeader, data);
+    centralDirectory.push(makeZipCentralDirectoryHeader({ name, data, crc, date: now, offset }));
+    offset += localHeader.length + data.length;
+  }
+
+  const centralDirectoryOffset = offset;
+  const centralDirectoryBuffer = Buffer.concat(centralDirectory);
+  const endRecord = makeZipEndRecord(entries.length, centralDirectoryBuffer.length, centralDirectoryOffset);
+  await writeFile(zipPath, Buffer.concat([...chunks, centralDirectoryBuffer, endRecord]));
+}
+
+function makeZipLocalHeader({ name, data, crc, date }) {
+  const buffer = Buffer.alloc(30 + name.length);
+  buffer.writeUInt32LE(0x04034b50, 0);
+  buffer.writeUInt16LE(20, 4);
+  buffer.writeUInt16LE(0x0800, 6);
+  buffer.writeUInt16LE(0, 8);
+  buffer.writeUInt16LE(zipTime(date), 10);
+  buffer.writeUInt16LE(zipDate(date), 12);
+  buffer.writeUInt32LE(crc, 14);
+  buffer.writeUInt32LE(data.length, 18);
+  buffer.writeUInt32LE(data.length, 22);
+  buffer.writeUInt16LE(name.length, 26);
+  buffer.writeUInt16LE(0, 28);
+  name.copy(buffer, 30);
+  return buffer;
+}
+
+function makeZipCentralDirectoryHeader({ name, data, crc, date, offset }) {
+  const buffer = Buffer.alloc(46 + name.length);
+  buffer.writeUInt32LE(0x02014b50, 0);
+  buffer.writeUInt16LE(20, 4);
+  buffer.writeUInt16LE(20, 6);
+  buffer.writeUInt16LE(0x0800, 8);
+  buffer.writeUInt16LE(0, 10);
+  buffer.writeUInt16LE(zipTime(date), 12);
+  buffer.writeUInt16LE(zipDate(date), 14);
+  buffer.writeUInt32LE(crc, 16);
+  buffer.writeUInt32LE(data.length, 20);
+  buffer.writeUInt32LE(data.length, 24);
+  buffer.writeUInt16LE(name.length, 28);
+  buffer.writeUInt16LE(0, 30);
+  buffer.writeUInt16LE(0, 32);
+  buffer.writeUInt16LE(0, 34);
+  buffer.writeUInt16LE(0, 36);
+  buffer.writeUInt32LE(0, 38);
+  buffer.writeUInt32LE(offset, 42);
+  name.copy(buffer, 46);
+  return buffer;
+}
+
+function makeZipEndRecord(entryCount, centralDirectorySize, centralDirectoryOffset) {
+  const buffer = Buffer.alloc(22);
+  buffer.writeUInt32LE(0x06054b50, 0);
+  buffer.writeUInt16LE(0, 4);
+  buffer.writeUInt16LE(0, 6);
+  buffer.writeUInt16LE(entryCount, 8);
+  buffer.writeUInt16LE(entryCount, 10);
+  buffer.writeUInt32LE(centralDirectorySize, 12);
+  buffer.writeUInt32LE(centralDirectoryOffset, 16);
+  buffer.writeUInt16LE(0, 20);
+  return buffer;
+}
+
+function zipDate(date) {
+  return ((date.getFullYear() - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate();
+}
+
+function zipTime(date) {
+  return (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2);
+}
+
+function crc32(buffer) {
+  let crc = 0xffffffff;
+  for (const byte of buffer) {
+    crc = CRC32_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+const CRC32_TABLE = Array.from({ length: 256 }, (_, index) => {
+  let value = index;
+  for (let bit = 0; bit < 8; bit += 1) {
+    value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+  }
+  return value >>> 0;
+});

@@ -1,8 +1,9 @@
 # TikTok Discord Downloader
 
 Discord bot that monitors public TikTok usernames, downloads new videos with
-`yt-dlp`, and delivers them through Discord as either an uploaded attachment or
-an expiring download link.
+`yt-dlp`, falls back to ZIP packaging for public photo/slideshow posts, and
+delivers them through Discord as either an uploaded attachment or an expiring
+download link.
 
 ## Setup
 
@@ -26,7 +27,7 @@ Do not commit `.env`; it is ignored by git.
 ## Discord Commands
 
 The bot watches every guild channel it can read plus DMs. When someone posts a
-TikTok URL, it downloads the video and replies in that channel or DM. Global
+TikTok URL, it downloads the post and replies in that channel or DM. Global
 slash commands work in guild channels and bot DMs for explicit actions and
 management.
 
@@ -115,7 +116,7 @@ curl https://example.com/health
 - Download links require `PUBLIC_BASE_URL` to be reachable by the Discord users
   who click them.
 - Small videos are uploaded to Discord when they fit under
-  `DISCORD_UPLOAD_LIMIT_MB`; larger videos are linked.
+  `DISCORD_UPLOAD_LIMIT_MB`; larger videos and slideshow ZIPs are linked.
 - Every download gets a 15-day link by default. Discord buttons let you create
   another 15-day link, extend the current link by 15 days, or keep it
   permanently.

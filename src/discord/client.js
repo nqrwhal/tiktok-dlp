@@ -290,7 +290,7 @@ export async function buildDeliveryPayload(result, config, requestedDelivery = '
     const attachment = new AttachmentBuilder(result.filePath, { name: result.filename || path.basename(result.filePath) });
     const link = result.publicUrl || (result.token ? makePublicFileUrl(config, result.token) : '');
     return {
-      content: `${contentPrefix}${options.alert ? 'New TikTok video downloaded.' : 'Download ready.'}${link ? `\n15-day link: ${link}` : ''}`.trim(),
+      content: `${contentPrefix}${options.alert ? `New TikTok ${mediaLabel(result)} downloaded.` : 'Download ready.'}${link ? `\n15-day link: ${link}` : ''}`.trim(),
       embeds: [embed],
       files: [attachment],
       components: buildLinkManagementRows(result.token),
@@ -384,7 +384,7 @@ function buildLinkManagementRows(token) {
 }
 
 export function buildVideoEmbed(result, video = {}) {
-  const title = result.title || video.title || 'TikTok video';
+  const title = result.title || video.title || `TikTok ${mediaLabel(result)}`;
   const sourceUrl = result.sourceUrl || video.url;
   const embed = new EmbedBuilder()
     .setColor(0x00f2ea)
@@ -516,6 +516,10 @@ function formatBytes(bytes) {
   if (value < 1024) return `${value} B`;
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
   return `${(value / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function mediaLabel(result) {
+  return result?.mediaType === 'slideshow' ? 'slideshow' : 'post';
 }
 
 function formatExpiry(value) {
