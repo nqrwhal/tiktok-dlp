@@ -40,6 +40,7 @@ export class Store {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         type TEXT NOT NULL,
         status TEXT NOT NULL,
+        requested_by TEXT NOT NULL DEFAULT '',
         username TEXT,
         source_url TEXT NOT NULL,
         video_id TEXT,
@@ -54,6 +55,7 @@ export class Store {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         video_id TEXT,
         username TEXT,
+        requested_by TEXT NOT NULL DEFAULT '',
         source_url TEXT NOT NULL,
         path TEXT NOT NULL,
         filename TEXT NOT NULL,
@@ -72,6 +74,18 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_files_video_id ON files(video_id);
       CREATE INDEX IF NOT EXISTS idx_link_tokens_expires_at ON link_tokens(expires_at);
     `);
+    this.ensureColumn('jobs', 'requested_by', "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn('files', 'requested_by', "TEXT NOT NULL DEFAULT ''");
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_jobs_requested_by ON jobs(requested_by);
+      CREATE INDEX IF NOT EXISTS idx_files_requested_by ON files(requested_by);
+    `);
+  }
+
+  ensureColumn(table, column, definition) {
+    const columns = this.db.prepare(`PRAGMA table_info(${table})`).all();
+    if (columns.some((entry) => entry.name === column)) return;
+    this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
 
   addWatch(username, channelId, now = Date.now()) {
@@ -128,16 +142,16 @@ export class Store {
     `).run(videoId, username, sourceUrl, title ?? '', now, alertedAt);
   }
 
-  createJob({ type, status = 'queued', username = '', sourceUrl, videoId = '', title = '' }, now = Date.now()) {
+  createJob({ type, status = 'queued', requestedBy = '', username = '', sourceUrl, videoId = '', title = '' }, now = Date.now()) {
     const result = this.db.prepare(`
-      INSERT INTO jobs (type, status, username, source_url, video_id, title, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(type, status, username, sourceUrl, videoId, title, now, now);
+      INSERT INTO jobs (type, status, requested_by, username, source_url, video_id, title, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(type, status, String(requestedBy ?? ''), username, sourceUrl, videoId, title, now, now);
     return Number(result.lastInsertRowid);
   }
 
   updateJob(id, changes, now = Date.now()) {
-    const allowed = ['status', 'username', 'source_url', 'video_id', 'title', 'file_id', 'error'];
+    const allowed = ['status', 'requested_by', 'username', 'source_url', 'video_id', 'title', 'file_id', 'error'];
     const entries = Object.entries(changes).filter(([key]) => allowed.includes(key));
     if (!entries.length) return;
     const assignments = entries.map(([key]) => `${key} = ?`).join(', ');
@@ -149,11 +163,11 @@ export class Store {
     return this.db.prepare('SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?').all(limit);
   }
 
-  createFileRecord({ videoId = '', username = '', sourceUrl, filePath, filename, sizeBytes }, now = Date.now()) {
+  createFileRecord({ videoId = '', username = '', requestedBy = '', sourceUrl, filePath, filename, sizeBytes }, now = Date.now()) {
     const result = this.db.prepare(`
-      INSERT INTO files (video_id, username, source_url, path, filename, size_bytes, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(videoId, username, sourceUrl, filePath, filename, sizeBytes, now);
+      INSERT INTO files (video_id, username, requested_by, source_url, path, filename, size_bytes, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(videoId, username, String(requestedBy ?? ''), sourceUrl, filePath, filename, sizeBytes, now);
     return Number(result.lastInsertRowid);
   }
 
@@ -203,6 +217,92 @@ export class Store {
 
   deleteExpiredTokens(now = Date.now()) {
     return this.db.prepare('DELETE FROM link_tokens WHERE expires_at > 0 AND expires_at <= ?').run(now).changes;
+  }
+
+  listDownloadLinksByRequester(requestedBy, { limit = 25, activeOnly = true, now = Date.now() } = {}) {
+    const sql = `
+      SELECT
+        link_tokens.token,
+        link_tokens.expires_at,
+        link_tokens.created_at AS token_created_at,
+        files.id AS file_id,
+        files.video_id,
+        files.username,
+        files.source_url,
+        files.filename,
+        files.size_bytes,
+        files.created_at AS file_created_at
+      FROM link_tokens
+      JOIN files ON files.id = link_tokens.file_id
+      WHERE files.requested_by = ?
+        ${activeOnly ? 'AND (link_tokens.expires_at = 0 OR link_tokens.expires_at > ?)' : ''}
+      ORDER BY link_tokens.created_at DESC
+      LIMIT ?
+    `;
+    const params = activeOnly
+      ? [String(requestedBy ?? ''), now, Math.max(1, Math.min(50, Number(limit) || 25))]
+      : [String(requestedBy ?? ''), Math.max(1, Math.min(50, Number(limit) || 25))];
+    return this.db.prepare(sql).all(...params);
+  }
+
+  countDownloadLinksByRequester(requestedBy, { activeOnly = true, now = Date.now() } = {}) {
+    const sql = `
+      SELECT COUNT(*) AS count
+      FROM link_tokens
+      JOIN files ON files.id = link_tokens.file_id
+      WHERE files.requested_by = ?
+        ${activeOnly ? 'AND (link_tokens.expires_at = 0 OR link_tokens.expires_at > ?)' : ''}
+    `;
+    const params = activeOnly ? [String(requestedBy ?? ''), now] : [String(requestedBy ?? '')];
+    return this.db.prepare(sql).get(...params).count;
+  }
+
+  listFilesForPurge({ requestedBy = '' } = {}) {
+    if (requestedBy) {
+      return this.db.prepare('SELECT id, path, filename FROM files WHERE requested_by = ?').all(String(requestedBy));
+    }
+    return this.db.prepare('SELECT id, path, filename FROM files').all();
+  }
+
+  purgeDownloads({ requestedBy = '' } = {}) {
+    const scoped = Boolean(requestedBy);
+    const counts = scoped
+      ? {
+          files: this.db.prepare('SELECT COUNT(*) AS count FROM files WHERE requested_by = ?').get(String(requestedBy)).count,
+          links: this.db.prepare(`
+            SELECT COUNT(*) AS count
+            FROM link_tokens
+            JOIN files ON files.id = link_tokens.file_id
+            WHERE files.requested_by = ?
+          `).get(String(requestedBy)).count,
+          jobs: this.db.prepare('SELECT COUNT(*) AS count FROM jobs WHERE requested_by = ?').get(String(requestedBy)).count,
+        }
+      : {
+          files: this.db.prepare('SELECT COUNT(*) AS count FROM files').get().count,
+          links: this.db.prepare('SELECT COUNT(*) AS count FROM link_tokens').get().count,
+          jobs: this.db.prepare('SELECT COUNT(*) AS count FROM jobs').get().count,
+        };
+
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      if (scoped) {
+        this.db.prepare(`
+          DELETE FROM link_tokens
+          WHERE file_id IN (SELECT id FROM files WHERE requested_by = ?)
+        `).run(String(requestedBy));
+        this.db.prepare('DELETE FROM jobs WHERE requested_by = ?').run(String(requestedBy));
+        this.db.prepare('DELETE FROM files WHERE requested_by = ?').run(String(requestedBy));
+      } else {
+        this.db.prepare('DELETE FROM link_tokens').run();
+        this.db.prepare('DELETE FROM jobs').run();
+        this.db.prepare('DELETE FROM files').run();
+      }
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+    return counts;
   }
 
   stats() {

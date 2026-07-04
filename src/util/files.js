@@ -32,6 +32,22 @@ export function isTikTokUrl(value) {
   }
 }
 
+export function extractTikTokUrls(value, limit = 5) {
+  const matches = String(value ?? '').match(/https?:\/\/[^\s<>()]+/gi) ?? [];
+  const urls = [];
+  const seen = new Set();
+
+  for (const match of matches) {
+    const cleaned = match.replace(/[.,!?;:)\]}>'"]+$/g, '');
+    if (!isTikTokUrl(cleaned) || seen.has(cleaned)) continue;
+    seen.add(cleaned);
+    urls.push(cleaned);
+    if (urls.length >= limit) break;
+  }
+
+  return urls;
+}
+
 export function extractVideoId(value) {
   const text = String(value ?? '');
   const videoMatch = text.match(/\/video\/(\d+)/);

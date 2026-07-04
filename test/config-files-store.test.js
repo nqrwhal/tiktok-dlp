@@ -1,11 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { DatabaseSync } from 'node:sqlite';
 import os from 'node:os';
 import path from 'node:path';
 import { loadConfig, loadEnvFile, parsePositiveInt } from '../src/config.js';
 import {
   extractVideoId,
+  extractTikTokUrls,
   isTikTokUrl,
   makeDownloadLayout,
   normalizeUsername,
@@ -13,7 +15,7 @@ import {
   slugify,
 } from '../src/util/files.js';
 import { createStore } from '../src/state/store.js';
-import { buildDeliveryPayload, handleLinkButton } from '../src/discord/client.js';
+import { buildDeliveryPayload, handleLinkButton, shouldShowHelp } from '../src/discord/client.js';
 
 test('loadEnvFile reads simple env files without overriding existing values', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-env-'));
@@ -54,6 +56,10 @@ test('username and TikTok URL helpers normalize supported forms', () => {
   assert.equal(isTikTokUrl('https://www.tiktok.com/@openai/video/123'), true);
   assert.equal(isTikTokUrl('https://example.com/nope'), false);
   assert.equal(extractVideoId('https://www.tiktok.com/@openai/video/7350000000000000000'), '7350000000000000000');
+  assert.deepEqual(
+    extractTikTokUrls('watch https://www.tiktok.com/@openai/video/7350000000000000000, and https://example.com/nope'),
+    ['https://www.tiktok.com/@openai/video/7350000000000000000'],
+  );
   assert.throws(() => normalizeUsername('../bad'));
 });
 
@@ -100,6 +106,7 @@ test('store persists watches, seen videos, jobs, files, and link tokens', async 
     const fileId = store.createFileRecord({
       videoId: 'v1',
       username: 'openai',
+      requestedBy: 'user-1',
       sourceUrl: 'https://www.tiktok.com/@openai/video/v1',
       filePath: path.join(dir, 'video.mp4'),
       filename: 'video.mp4',
@@ -119,9 +126,92 @@ test('store persists watches, seen videos, jobs, files, and link tokens', async 
     assert.equal(store.deleteExpiredTokens(999999999), 1);
     assert.equal(store.getToken('tok').expires_at, 0);
     assert.equal(store.getToken('tok2'), null);
+    assert.equal(store.countDownloadLinksByRequester('user-1'), 1);
+    assert.equal(store.listDownloadLinksByRequester('user-1')[0].token, 'tok');
     assert.equal(store.stats().watchCount, 1);
     assert.equal(store.listJobs(1)[0].status, 'complete');
     assert.equal(store.removeWatch('openai'), true);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('store migrates older databases before creating requester indexes', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-migration-'));
+  const dbPath = path.join(dir, 'state.db');
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec(`
+      CREATE TABLE jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        type TEXT NOT NULL,
+        status TEXT NOT NULL,
+        username TEXT,
+        source_url TEXT NOT NULL,
+        video_id TEXT,
+        title TEXT,
+        file_id INTEGER,
+        error TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        video_id TEXT,
+        username TEXT,
+        source_url TEXT NOT NULL,
+        path TEXT NOT NULL,
+        filename TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+    `);
+  } finally {
+    db.close();
+  }
+
+  const store = createStore(dbPath);
+  try {
+    const jobColumns = store.db.prepare('PRAGMA table_info(jobs)').all().map((column) => column.name);
+    const fileColumns = store.db.prepare('PRAGMA table_info(files)').all().map((column) => column.name);
+    assert.ok(jobColumns.includes('requested_by'));
+    assert.ok(fileColumns.includes('requested_by'));
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('store purges download records by requester or globally', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-purge-'));
+  const store = createStore(path.join(dir, 'state.db'));
+  try {
+    const fileId1 = store.createFileRecord({
+      requestedBy: 'user-1',
+      sourceUrl: 'https://www.tiktok.com/@openai/video/1',
+      filePath: path.join(dir, 'one.mp4'),
+      filename: 'one.mp4',
+      sizeBytes: 1,
+    }, 1000);
+    const fileId2 = store.createFileRecord({
+      requestedBy: 'user-2',
+      sourceUrl: 'https://www.tiktok.com/@openai/video/2',
+      filePath: path.join(dir, 'two.mp4'),
+      filename: 'two.mp4',
+      sizeBytes: 2,
+    }, 1000);
+    store.createJob({ type: 'manual', requestedBy: 'user-1', sourceUrl: 'https://www.tiktok.com/@openai/video/1' }, 1000);
+    store.createJob({ type: 'manual', requestedBy: 'user-2', sourceUrl: 'https://www.tiktok.com/@openai/video/2' }, 1000);
+    store.createLinkToken({ token: 'one', fileId: fileId1, expiresAt: 0 }, 1000);
+    store.createLinkToken({ token: 'two', fileId: fileId2, expiresAt: 0 }, 1000);
+
+    assert.deepEqual(store.listFilesForPurge({ requestedBy: 'user-1' }).map((file) => file.filename), ['one.mp4']);
+    assert.deepEqual(store.purgeDownloads({ requestedBy: 'user-1' }), { files: 1, links: 1, jobs: 1 });
+    assert.equal(store.getToken('one'), null);
+    assert.equal(store.getToken('two').filename, 'two.mp4');
+    assert.deepEqual(store.purgeDownloads(), { files: 1, links: 1, jobs: 1 });
+    assert.equal(store.stats().fileCount, 0);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -146,6 +236,15 @@ test('delivery payload includes link-management buttons', async () => {
     payload.components[0].components.map((button) => button.data.custom_id),
     ['link:new:abc', 'link:extend:abc', 'link:permanent:abc'],
   );
+});
+
+test('help keyword works in DMs and scoped guild messages', () => {
+  assert.equal(shouldShowHelp({ content: 'help', inGuild: () => false }), true);
+  assert.equal(shouldShowHelp({ content: 'commands', inGuild: () => false }), true);
+  assert.equal(shouldShowHelp({ content: 'help', inGuild: () => true, client: { user: { id: 'bot-1' } } }), false);
+  assert.equal(shouldShowHelp({ content: 'tiktok help', inGuild: () => true }), true);
+  assert.equal(shouldShowHelp({ content: '!tt help', inGuild: () => true }), true);
+  assert.equal(shouldShowHelp({ content: '<@bot-1> help', inGuild: () => true, client: { user: { id: 'bot-1' } } }), true);
 });
 
 test('link button actions create, extend, and persist links', async () => {

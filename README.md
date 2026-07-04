@@ -25,6 +25,13 @@ Do not commit `.env`; it is ignored by git.
 
 ## Discord Commands
 
+The bot watches every guild channel it can read plus DMs. When someone posts a
+TikTok URL, it downloads the video and replies in that channel or DM. Slash
+commands still work for explicit actions and management.
+
+For message-based help, use `tiktok help` or `!tiktok help` in a guild channel,
+mention the bot with `help`, or DM the bot `help`.
+
 Register slash commands:
 
 ```bash
@@ -40,9 +47,13 @@ Commands:
 - `/watch run username:<username>`
 - `/status`
 - `/history`
+- `/downloads list limit:<1-25>` shows your active download links.
+- `/downloads purge scope:mine|all confirm:PURGE` deletes saved download files,
+  public links, and download history. `scope:all` requires Manage Server.
 
-The bot uses only the `Guilds` intent. It does not require Message Content
-Intent because all interaction is slash-command based.
+The bot requires the `Guilds`, `Guild Messages`, `Direct Messages`, and
+`Message Content` intents. Enable Message Content in the Discord developer
+portal for the application.
 
 ## Docker
 

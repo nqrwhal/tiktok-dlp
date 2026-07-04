@@ -5,9 +5,9 @@ import { commandJson } from '../src/discord/commands.js';
 import { registerCommands } from '../src/discord/register-commands.js';
 
 test('exports the expected slash command manifest', () => {
-  assert.equal(commandJson.length, 4);
+  assert.equal(commandJson.length, 5);
 
-  const [download, watch, status, history] = commandJson;
+  const [download, watch, status, history, downloads] = commandJson;
   const downloadOptions = download.options ?? [];
   const watchOptions = watch.options ?? [];
 
@@ -32,6 +32,14 @@ test('exports the expected slash command manifest', () => {
 
   assert.equal(history.name, 'history');
   assert.deepEqual(history.options ?? [], []);
+
+  assert.equal(downloads.name, 'downloads');
+  assert.deepEqual((downloads.options ?? []).map((option) => option.name), ['list', 'purge']);
+  assert.deepEqual((downloads.options[0].options ?? []).map((option) => option.name), ['limit']);
+  assert.equal((downloads.options[0].options ?? [])[0].required, false);
+  assert.deepEqual((downloads.options[1].options ?? []).map((option) => option.name), ['confirm', 'scope']);
+  assert.equal((downloads.options[1].options ?? [])[0].required, true);
+  assert.equal((downloads.options[1].options ?? [])[1].required, false);
 });
 
 test('registerCommands uses guild command registration with the manifest body', async () => {

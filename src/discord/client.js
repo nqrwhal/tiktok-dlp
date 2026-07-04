@@ -6,9 +6,12 @@ import {
   Client,
   EmbedBuilder,
   GatewayIntentBits,
+  Partials,
+  PermissionFlagsBits,
 } from 'discord.js';
+import { rm, rmdir } from 'node:fs/promises';
 import path from 'node:path';
-import { normalizeUsername, shouldUploadToDiscord, makePublicFileUrl, randomToken } from '../util/files.js';
+import { extractTikTokUrls, normalizeUsername, shouldUploadToDiscord, makePublicFileUrl, randomToken } from '../util/files.js';
 
 const LINK_BUTTON_PREFIX = 'link:';
 const FIFTEEN_DAYS_MS = 15 * 24 * 60 * 60 * 1000;
@@ -18,7 +21,15 @@ export async function startDiscordBot({ config, store, monitor, downloadOne, reg
     await registerCommands(config);
   }
 
-  const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+  const client = new Client({
+    intents: [
+      GatewayIntentBits.Guilds,
+      GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.DirectMessages,
+      GatewayIntentBits.MessageContent,
+    ],
+    partials: [Partials.Channel],
+  });
 
   client.once('clientReady', () => {
     console.log(`[discord] Logged in as ${client.user.tag}`);
@@ -45,6 +56,15 @@ export async function startDiscordBot({ config, store, monitor, downloadOne, reg
     }
   });
 
+  client.on('messageCreate', async (message) => {
+    try {
+      await handleMessageCreate({ message, config, downloadOne });
+    } catch (error) {
+      console.error('[discord] Message handling failed:', error);
+      await message.reply(`Something went wrong: ${error.message ?? error}`).catch(() => {});
+    }
+  });
+
   await client.login(config.discordToken);
   return client;
 }
@@ -56,7 +76,11 @@ export async function handleInteraction({ interaction, config, store, monitor, d
     await interaction.deferReply({ ephemeral: true });
     const url = interaction.options.getString('url', true);
     const delivery = interaction.options.getString('delivery') ?? 'auto';
-    const result = await downloadOne(url, { delivery, type: 'manual' });
+    const result = await downloadOne(url, {
+      delivery,
+      type: 'manual',
+      requestedBy: interaction.user?.id ?? '',
+    });
     await interaction.editReply(await buildDeliveryPayload(result, config, delivery));
     return;
   }
@@ -65,8 +89,9 @@ export async function handleInteraction({ interaction, config, store, monitor, d
     const subcommand = interaction.options.getSubcommand();
     if (subcommand === 'add') {
       const username = normalizeUsername(interaction.options.getString('username', true));
-      const watch = store.addWatch(username, config.discordChannelId);
-      await interaction.reply({ content: `Watching @${watch.username}.`, ephemeral: true });
+      const channelId = interaction.channelId || config.discordChannelId;
+      const watch = store.addWatch(username, channelId);
+      await interaction.reply({ content: `Watching @${watch.username}. Alerts will post in this channel.`, ephemeral: true });
       return;
     }
     if (subcommand === 'remove') {
@@ -96,6 +121,129 @@ export async function handleInteraction({ interaction, config, store, monitor, d
 
   if (command === 'history') {
     await interaction.reply({ content: formatHistory(store.listJobs(10)), ephemeral: true });
+    return;
+  }
+
+  if (command === 'downloads') {
+    await handleDownloadsInteraction({ interaction, config, store });
+  }
+}
+
+export async function handleMessageCreate({ message, config, downloadOne }) {
+  if (!message || message.author?.bot) return false;
+
+  if (shouldShowHelp(message)) {
+    await message.reply(buildHelpMessage());
+    return true;
+  }
+
+  const urls = extractTikTokUrls(message.content, 3);
+  if (!urls.length) return false;
+
+  const status = await message.reply(
+    urls.length === 1
+      ? 'Downloading TikTok link...'
+      : `Downloading ${urls.length} TikTok links...`,
+  );
+
+  for (const [index, url] of urls.entries()) {
+    try {
+      const result = await downloadOne(url, {
+        delivery: 'auto',
+        type: 'message',
+        requestedBy: message.author?.id ?? '',
+      });
+      const payload = await buildDeliveryPayload(result, config, 'auto');
+
+      if (urls.length === 1) {
+        await status.edit(payload);
+      } else {
+        await status.edit(`Downloaded ${index + 1}/${urls.length} TikTok links.`);
+        await message.reply(payload);
+      }
+    } catch (error) {
+      const content = `Could not download ${url}: ${error.message ?? error}`;
+      if (urls.length === 1) {
+        await status.edit({ content, embeds: [], components: [], files: [] });
+      } else {
+        await message.reply(content);
+      }
+    }
+  }
+
+  return true;
+}
+
+export function shouldShowHelp(message) {
+  const content = String(message?.content ?? '').trim();
+  if (!content) return false;
+
+  const normalized = content.toLowerCase();
+  const directHelp = ['help', 'commands', 'tiktok help', '!tiktok help', 'tt help', '!tt help'].includes(normalized);
+  const inGuild = message?.inGuild?.() ?? Boolean(message?.guildId);
+  if (!inGuild) return directHelp;
+  if (/^!?(tiktok|tt)\s+help$/i.test(content)) return true;
+
+  const botId = message?.client?.user?.id;
+  if (!botId) return false;
+  const mentionPattern = new RegExp(`^<@!?${botId}>\\s+help$`, 'i');
+  return mentionPattern.test(content);
+}
+
+export function buildHelpMessage() {
+  return [
+    'Post a TikTok URL in any channel I can read, or DM it to me, and I will download it.',
+    '',
+    'Slash commands:',
+    '`/download url:<tiktok-url> delivery:auto|file|link`',
+    '`/downloads list`',
+    '`/downloads purge scope:mine confirm:PURGE`',
+    '`/watch add|remove|list|run`',
+    '`/status` and `/history`',
+    '',
+    'Help keywords: `tiktok help`, `!tiktok help`, or DM me `help`.',
+  ].join('\n');
+}
+
+export async function handleDownloadsInteraction({ interaction, config, store }) {
+  const subcommand = interaction.options.getSubcommand();
+
+  if (subcommand === 'list') {
+    const limit = interaction.options.getInteger('limit') ?? 10;
+    const userId = interaction.user?.id ?? '';
+    const links = store.listDownloadLinksByRequester(userId, { limit, activeOnly: true });
+    const total = store.countDownloadLinksByRequester(userId, { activeOnly: true });
+    await interaction.reply({
+      content: formatUserDownloadLinks(links, {
+        config,
+        total,
+        limit,
+      }),
+      ephemeral: true,
+    });
+    return;
+  }
+
+  if (subcommand === 'purge') {
+    const scope = interaction.options.getString('scope') ?? 'mine';
+    const confirm = interaction.options.getString('confirm', true);
+
+    if (confirm !== 'PURGE') {
+      await interaction.reply({ content: 'Purge cancelled. Run it again with `confirm:PURGE`.', ephemeral: true });
+      return;
+    }
+
+    if (scope === 'all' && !canPurgeAll(interaction)) {
+      await interaction.reply({ content: 'Only members with Manage Server can purge all downloads.', ephemeral: true });
+      return;
+    }
+
+    await interaction.deferReply({ ephemeral: true });
+    const requestedBy = scope === 'mine' ? interaction.user?.id ?? '' : '';
+    const files = store.listFilesForPurge({ requestedBy });
+    const counts = store.purgeDownloads({ requestedBy });
+    const removal = await removeStoredFiles(files, config);
+    await interaction.editReply(formatPurgeResult({ scope, counts, removal }));
   }
 }
 
@@ -254,6 +402,80 @@ function formatHistory(jobs) {
     const target = job.username ? `@${job.username}` : job.source_url;
     return `#${job.id} ${job.status} ${target} ${when}${job.error ? ` — ${job.error}` : ''}`;
   }).join('\n').slice(0, 1900);
+}
+
+function formatUserDownloadLinks(links, { config, total, limit }) {
+  if (!links.length) return 'You do not have any active download links yet.';
+
+  const rows = links.map((link, index) => {
+    const label = link.title || link.filename || link.source_url || 'download';
+    const url = makePublicFileUrl(config, link.token);
+    return [
+      `${index + 1}. ${label.slice(0, 90)}`,
+      url,
+      `expires: ${formatExpiry(link.expires_at)} • ${formatBytes(link.size_bytes)}`,
+    ].join('\n');
+  });
+  const suffix = total > links.length ? `\n\nShowing ${links.length} of ${total} active links. Use \`limit:${Math.min(25, total)}\` to see more.` : '';
+  return `${rows.join('\n\n')}${suffix}`.slice(0, 1900);
+}
+
+function formatPurgeResult({ scope, counts, removal }) {
+  const target = scope === 'all' ? 'all downloads' : 'your downloads';
+  const failed = removal.failed.length
+    ? ` ${removal.failed.length} file(s) could not be removed from disk.`
+    : '';
+  return `Purged ${target}: ${counts.files} file record(s), ${counts.links} link(s), ${counts.jobs} job(s). Removed ${removal.deleted} file(s) from disk.${failed}`;
+}
+
+async function removeStoredFiles(files, config) {
+  const seen = new Set();
+  const failed = [];
+  let deleted = 0;
+
+  for (const file of files) {
+    const filePath = resolveStoredDownloadPath(config.downloadDir, file.path);
+    if (!filePath || seen.has(filePath)) continue;
+    seen.add(filePath);
+
+    try {
+      await rm(filePath, { force: true });
+      deleted += 1;
+      await removeEmptyParents(path.dirname(filePath), config.downloadDir);
+    } catch (error) {
+      failed.push({ file, error });
+    }
+  }
+
+  return { deleted, failed };
+}
+
+async function removeEmptyParents(startDir, downloadDir) {
+  const root = path.resolve(downloadDir);
+  let current = path.resolve(startDir);
+
+  while (current.startsWith(root) && current !== root) {
+    try {
+      await rmdir(current);
+    } catch {
+      return;
+    }
+    current = path.dirname(current);
+  }
+}
+
+function resolveStoredDownloadPath(downloadDir, filePath) {
+  const root = path.resolve(downloadDir);
+  const resolved = path.isAbsolute(String(filePath ?? ''))
+    ? path.resolve(String(filePath))
+    : path.resolve(root, String(filePath ?? ''));
+  const relative = path.relative(root, resolved);
+  if (relative.startsWith('..') || path.isAbsolute(relative)) return null;
+  return resolved;
+}
+
+function canPurgeAll(interaction) {
+  return Boolean(interaction.memberPermissions?.has?.(PermissionFlagsBits.ManageGuild));
 }
 
 function buildStatusEmbed(stats, monitorStatus) {

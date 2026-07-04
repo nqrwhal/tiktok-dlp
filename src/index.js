@@ -17,11 +17,12 @@ await ensureRuntimeDirs(config);
 const store = createStore(config.stateDbPath);
 let discordClient = null;
 
-async function downloadOne(sourceUrl, { delivery = 'auto', type = 'manual', username = '' } = {}) {
+async function downloadOne(sourceUrl, { delivery = 'auto', type = 'manual', username = '', requestedBy = '' } = {}) {
   const metadata = await fetchVideoMetadata(sourceUrl, config);
   const jobId = store.createJob({
     type,
     status: 'downloading',
+    requestedBy,
     username: username || metadata.uploader || metadata.channel || '',
     sourceUrl,
     videoId: metadata.id || '',
@@ -39,6 +40,7 @@ async function downloadOne(sourceUrl, { delivery = 'auto', type = 'manual', user
     const fileId = store.createFileRecord({
       videoId: metadata.id || downloaded.videoId || '',
       username: username || downloaded.username || metadata.uploader || '',
+      requestedBy,
       sourceUrl,
       filePath: downloaded.filePath,
       filename,
