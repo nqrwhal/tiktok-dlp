@@ -59,7 +59,14 @@ export function buildMetadataArgs(sourceUrl, options = {}) {
 export function buildDownloadArgs(sourceUrl, options = {}) {
   if (!options.outputDir) throw new Error('outputDir is required.');
 
-  const args = [...DOWNLOAD_BASE_ARGS, '--paths', `temp:${path.resolve(options.outputDir)}`];
+  const outputDir = path.resolve(options.outputDir);
+  const args = [
+    ...DOWNLOAD_BASE_ARGS,
+    '--paths',
+    `home:${outputDir}`,
+    '--paths',
+    `temp:${outputDir}`,
+  ];
   if (options.cookiesFile) args.push('--cookies', String(options.cookiesFile));
   if (options.ytdlpCookiesFile) args.push('--cookies', String(options.ytdlpCookiesFile));
   if (options.format) replaceArgValue(args, '--format', String(options.format));
@@ -101,9 +108,12 @@ export async function listProfileVideos(usernameOrUrl, options = {}) {
 export async function downloadVideo(sourceUrl, options = {}) {
   const ytdlpPath = options.ytdlpPath ?? 'yt-dlp';
   const metadata = options.metadata ?? await fetchVideoMetadata(sourceUrl, options);
+  const tempParent = options.downloadDir
+    ? path.join(path.resolve(options.downloadDir), '.tmp')
+    : os.tmpdir();
   const tempDir = options.outputDir
     ? path.resolve(options.outputDir)
-    : await mkdtemp(path.join(os.tmpdir(), 'tiktok-ytdlp-'));
+    : await makeTempDownloadDir(tempParent);
 
   await ensureTempDir(tempDir);
 
@@ -374,6 +384,11 @@ async function ensureTempDir(dir) {
     }
     throw error;
   }
+}
+
+async function makeTempDownloadDir(parentDir) {
+  await ensureTempDir(parentDir);
+  return mkdtemp(path.join(parentDir, 'tiktok-ytdlp-'));
 }
 
 function pickPrimaryFile(files) {
