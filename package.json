@@ -1,0 +1,21 @@
+{
+  "name": "tiktok-discord-downloader",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node src/index.js",
+    "register:commands": "node src/discord/register-commands.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "discord.js": "^14.26.4"
+  },
+  "overrides": {
+    "undici": "6.27.0"
+  },
+  "engines": {
+    "node": ">=22.12"
+  }
+}
