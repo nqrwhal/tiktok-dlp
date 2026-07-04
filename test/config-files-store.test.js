@@ -13,6 +13,7 @@ import {
   slugify,
 } from '../src/util/files.js';
 import { createStore } from '../src/state/store.js';
+import { buildDeliveryPayload, handleLinkButton } from '../src/discord/client.js';
 
 test('loadEnvFile reads simple env files without overriding existing values', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-env-'));
@@ -37,6 +38,8 @@ test('loadConfig resolves paths and upload limits', () => {
   assert.equal(config.dataDir, '/tmp/project/x');
   assert.equal(config.discordUploadLimitBytes, 2 * 1024 * 1024);
   assert.equal(config.httpPort, 9999);
+  assert.equal(config.publicBaseUrl, 'https://example.com');
+  assert.equal(config.downloadLinkTtlHours, 360);
 });
 
 test('parsePositiveInt falls back for invalid input', () => {
@@ -104,12 +107,78 @@ test('store persists watches, seen videos, jobs, files, and link tokens', async 
     }, 4000);
     store.updateJob(jobId, { status: 'complete', file_id: fileId }, 5000);
     store.createLinkToken({ token: 'tok', fileId, expiresAt: 7000 }, 6000);
+    store.createLinkToken({ token: 'tok2', fileId, expiresAt: 9000 }, 6000);
 
     assert.equal(store.getValidToken('tok', 6500).filename, 'video.mp4');
     assert.equal(store.getValidToken('tok', 7500), null);
+    assert.equal(store.getValidToken('tok2', 6500).filename, 'video.mp4');
+    assert.equal(store.extendLinkToken('tok', 1000, 7500).expires_at, 8500);
+    assert.equal(store.getValidToken('tok', 8000).filename, 'video.mp4');
+    assert.equal(store.setLinkTokenPermanent('tok').expires_at, 0);
+    assert.equal(store.getValidToken('tok', 999999999).filename, 'video.mp4');
+    assert.equal(store.deleteExpiredTokens(999999999), 1);
+    assert.equal(store.getToken('tok').expires_at, 0);
+    assert.equal(store.getToken('tok2'), null);
     assert.equal(store.stats().watchCount, 1);
     assert.equal(store.listJobs(1)[0].status, 'complete');
     assert.equal(store.removeWatch('openai'), true);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('delivery payload includes link-management buttons', async () => {
+  const payload = await buildDeliveryPayload({
+    token: 'abc',
+    publicUrl: 'https://example.com/files/abc',
+    title: 'clip',
+    sourceUrl: 'https://www.tiktok.com/@openai/video/1',
+    sizeBytes: 20 * 1024 * 1024,
+  }, {
+    publicBaseUrl: 'https://example.com',
+    discordUploadLimitBytes: 10,
+  }, 'link');
+
+  assert.match(payload.content, /Download ready: https:\/\/tiktok-dlp\.yufei\.dev\/files\/abc/);
+  assert.equal(payload.components.length, 1);
+  assert.deepEqual(
+    payload.components[0].components.map((button) => button.data.custom_id),
+    ['link:new:abc', 'link:extend:abc', 'link:permanent:abc'],
+  );
+});
+
+test('link button actions create, extend, and persist links', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-buttons-'));
+  const store = createStore(path.join(dir, 'state.db'));
+  try {
+    const fileId = store.createFileRecord({
+      videoId: 'v1',
+      username: 'openai',
+      sourceUrl: 'https://www.tiktok.com/@openai/video/v1',
+      filePath: path.join(dir, 'video.mp4'),
+      filename: 'video.mp4',
+      sizeBytes: 123,
+    }, 1000);
+    store.createLinkToken({ token: 'tok', fileId, expiresAt: 2000 }, 1000);
+
+    const replies = [];
+    const makeInteraction = (customId) => ({
+      customId,
+      reply: async (payload) => replies.push(payload),
+    });
+    const config = { publicBaseUrl: 'https://example.com' };
+
+    const beforeExtend = Date.now();
+    await handleLinkButton({ interaction: makeInteraction('link:extend:tok'), config, store });
+    assert.ok(store.getToken('tok').expires_at >= beforeExtend + 15 * 24 * 60 * 60 * 1000);
+
+    await handleLinkButton({ interaction: makeInteraction('link:permanent:tok'), config, store });
+    assert.equal(store.getToken('tok').expires_at, 0);
+
+    await handleLinkButton({ interaction: makeInteraction('link:new:tok'), config, store });
+    assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM link_tokens WHERE file_id = ?').get(fileId).count, 2);
+    assert.equal(replies.length, 3);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });

@@ -164,17 +164,45 @@ export class Store {
     `).run(token, fileId, expiresAt, now);
   }
 
-  getValidToken(token, now = Date.now()) {
+  getToken(token) {
     return this.db.prepare(`
-      SELECT link_tokens.token, link_tokens.expires_at, files.*
+      SELECT link_tokens.token, link_tokens.expires_at, link_tokens.created_at AS token_created_at, files.*
       FROM link_tokens
       JOIN files ON files.id = link_tokens.file_id
-      WHERE link_tokens.token = ? AND link_tokens.expires_at > ?
+      WHERE link_tokens.token = ?
+    `).get(token) ?? null;
+  }
+
+  getValidToken(token, now = Date.now()) {
+    return this.db.prepare(`
+      SELECT link_tokens.token, link_tokens.expires_at, link_tokens.created_at AS token_created_at, files.*
+      FROM link_tokens
+      JOIN files ON files.id = link_tokens.file_id
+      WHERE link_tokens.token = ? AND (link_tokens.expires_at = 0 OR link_tokens.expires_at > ?)
     `).get(token, now) ?? null;
   }
 
+  extendLinkToken(token, additionalMs, now = Date.now()) {
+    const newExpiry = now + additionalMs;
+    const result = this.db.prepare(`
+      UPDATE link_tokens
+      SET expires_at = CASE
+        WHEN expires_at = 0 THEN 0
+        WHEN expires_at > ? THEN expires_at + ?
+        ELSE ?
+      END
+      WHERE token = ?
+    `).run(now, additionalMs, newExpiry, token);
+    return result.changes > 0 ? this.getToken(token) : null;
+  }
+
+  setLinkTokenPermanent(token) {
+    const result = this.db.prepare('UPDATE link_tokens SET expires_at = 0 WHERE token = ?').run(token);
+    return result.changes > 0 ? this.getToken(token) : null;
+  }
+
   deleteExpiredTokens(now = Date.now()) {
-    return this.db.prepare('DELETE FROM link_tokens WHERE expires_at <= ?').run(now).changes;
+    return this.db.prepare('DELETE FROM link_tokens WHERE expires_at > 0 AND expires_at <= ?').run(now).changes;
   }
 
   stats() {
