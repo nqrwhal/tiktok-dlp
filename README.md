@@ -52,6 +52,8 @@ docker compose logs -f
 ```
 
 Persistent state and downloads live in `./data`.
+When using the Cloudflare profile, the app's HTTP server is exposed only inside
+the Docker network; public traffic comes through Cloudflare Tunnel.
 
 ## Cloudflare Tunnel
 
@@ -73,6 +75,9 @@ Then run the app and tunnel together:
 docker compose --profile cloudflare up --build -d
 ```
 
+The tunnel token is copied into `.secrets/cloudflare_tunnel_token` locally and
+mounted read-only into the `cloudflared` container.
+
 If TikTok starts requiring authenticated cookies for your use case, place a
 cookies file under `./cookies/tiktok.txt` and set:
 
@@ -83,7 +88,7 @@ YTDLP_COOKIES_FILE=/app/cookies/tiktok.txt
 ## Health
 
 ```bash
-curl http://localhost:8080/health
+curl https://example.com/health
 ```
 
 ## Notes

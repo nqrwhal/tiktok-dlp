@@ -5,8 +5,8 @@ services:
       dockerfile: Dockerfile
     env_file:
       - .env
-    ports:
-      - "${HTTP_PORT:-8080}:${HTTP_PORT:-8080}"
+    expose:
+      - "${HTTP_PORT:-8080}"
     volumes:
       - ./data:/app/data
       # Optional cookies mount. Set YTDLP_COOKIES_FILE=/app/cookies/tiktok.txt if used.
@@ -17,9 +17,13 @@ services:
     image: cloudflare/cloudflared:latest
     profiles:
       - cloudflare
-    env_file:
-      - .env
-    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    command: tunnel --no-autoupdate run --token-file /run/secrets/cloudflare_tunnel_token
+    secrets:
+      - cloudflare_tunnel_token
     depends_on:
       - tiktok-discord-downloader
     restart: unless-stopped
+
+secrets:
+  cloudflare_tunnel_token:
+    file: ./.secrets/cloudflare_tunnel_token
