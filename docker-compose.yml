@@ -1,0 +1,14 @@
+services:
+  tiktok-discord-downloader:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    ports:
+      - "${HTTP_PORT:-8080}:${HTTP_PORT:-8080}"
+    volumes:
+      - ./data:/app/data
+      # Optional cookies mount. Set YTDLP_COOKIES_FILE=/app/cookies/tiktok.txt if used.
+      - ./cookies:/app/cookies:ro
+    restart: unless-stopped
