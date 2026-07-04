@@ -230,7 +230,7 @@ test('delivery payload includes link-management buttons', async () => {
     discordUploadLimitBytes: 10,
   }, 'link');
 
-  assert.match(payload.content, /Download ready: https:\/\/tiktok-dlp\.yufei\.dev\/files\/abc/);
+  assert.match(payload.content, /Download ready: https:\/\/example\.com\/files\/abc/);
   assert.equal(payload.components.length, 1);
   assert.deepEqual(
     payload.components[0].components.map((button) => button.data.custom_id),

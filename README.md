@@ -14,7 +14,7 @@ cp .env.example .env
 Fill in `.env` with your Discord bot token, application/client ID, guild ID,
 notification channel ID, and `PUBLIC_BASE_URL`.
 
-For this deployment, the intended public download URL is:
+Example public download URL configuration:
 
 ```env
 PUBLIC_BASE_URL=https://example.com
