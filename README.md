@@ -14,6 +14,13 @@ cp .env.example .env
 Fill in `.env` with your Discord bot token, application/client ID, guild ID,
 notification channel ID, and `PUBLIC_BASE_URL`.
 
+For this deployment, the intended public download URL is:
+
+```env
+PUBLIC_BASE_URL=https://tiktok-dlp.yufei.dev
+DOWNLOAD_LINK_TTL_HOURS=360
+```
+
 Do not commit `.env`; it is ignored by git.
 
 ## Discord Commands
@@ -46,6 +53,26 @@ docker compose logs -f
 
 Persistent state and downloads live in `./data`.
 
+## Cloudflare Tunnel
+
+Create a Cloudflare Tunnel public hostname:
+
+```text
+tiktok-dlp.yufei.dev -> http://tiktok-discord-downloader:8080
+```
+
+Put the tunnel token in `.env`:
+
+```env
+CLOUDFLARE_TUNNEL_TOKEN=...
+```
+
+Then run the app and tunnel together:
+
+```bash
+docker compose --profile cloudflare up --build -d
+```
+
 If TikTok starts requiring authenticated cookies for your use case, place a
 cookies file under `./cookies/tiktok.txt` and set:
 
@@ -67,3 +94,6 @@ curl http://localhost:8080/health
   who click them.
 - Small videos are uploaded to Discord when they fit under
   `DISCORD_UPLOAD_LIMIT_MB`; larger videos are linked.
+- Every download gets a 15-day link by default. Discord buttons let you create
+  another 15-day link, extend the current link by 15 days, or keep it
+  permanently.

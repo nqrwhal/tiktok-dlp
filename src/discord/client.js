@@ -1,6 +1,17 @@
-import { AttachmentBuilder, Client, EmbedBuilder, GatewayIntentBits } from 'discord.js';
+import {
+  ActionRowBuilder,
+  AttachmentBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  Client,
+  EmbedBuilder,
+  GatewayIntentBits,
+} from 'discord.js';
 import path from 'node:path';
-import { normalizeUsername, shouldUploadToDiscord, makePublicFileUrl } from '../util/files.js';
+import { normalizeUsername, shouldUploadToDiscord, makePublicFileUrl, randomToken } from '../util/files.js';
+
+const LINK_BUTTON_PREFIX = 'link:';
+const FIFTEEN_DAYS_MS = 15 * 24 * 60 * 60 * 1000;
 
 export async function startDiscordBot({ config, store, monitor, downloadOne, registerCommands }) {
   if (config.registerCommandsOnStart) {
@@ -15,9 +26,13 @@ export async function startDiscordBot({ config, store, monitor, downloadOne, reg
   });
 
   client.on('interactionCreate', async (interaction) => {
-    if (!interaction.isChatInputCommand()) return;
-
     try {
+      if (interaction.isButton()) {
+        await handleLinkButton({ interaction, config, store });
+        return;
+      }
+
+      if (!interaction.isChatInputCommand()) return;
       await handleInteraction({ interaction, config, store, monitor, downloadOne });
     } catch (error) {
       console.error('[discord] Interaction failed:', error);
@@ -113,10 +128,12 @@ export async function buildDeliveryPayload(result, config, requestedDelivery = '
 
   if (wantsFile && canUpload) {
     const attachment = new AttachmentBuilder(result.filePath, { name: result.filename || path.basename(result.filePath) });
+    const link = result.publicUrl || (result.token ? makePublicFileUrl(config, result.token) : '');
     return {
-      content: `${contentPrefix}${options.alert ? 'New TikTok video downloaded.' : 'Download ready.'}`.trim(),
+      content: `${contentPrefix}${options.alert ? 'New TikTok video downloaded.' : 'Download ready.'}${link ? `\n15-day link: ${link}` : ''}`.trim(),
       embeds: [embed],
       files: [attachment],
+      components: buildLinkManagementRows(result.token),
     };
   }
 
@@ -129,9 +146,81 @@ export async function buildDeliveryPayload(result, config, requestedDelivery = '
 
   const link = result.publicUrl || (result.token ? makePublicFileUrl(config, result.token) : '');
   return {
-    content: `${contentPrefix}${link ? `Download ready: ${link}` : 'Download ready, but PUBLIC_BASE_URL is not configured for links.'}`.trim(),
+    content: `${contentPrefix}${link ? `Download ready: ${link}` : 'Download ready, but PUBLIC_BASE_URL is not configured for links.'}\nKeep the link longer? Use the buttons below.`.trim(),
     embeds: [embed],
+    components: buildLinkManagementRows(result.token),
   };
+}
+
+export async function handleLinkButton({ interaction, config, store }) {
+  const customId = String(interaction.customId ?? '');
+  if (!customId.startsWith(LINK_BUTTON_PREFIX)) return false;
+
+  const [, action, token] = customId.split(':');
+  if (!token) {
+    await interaction.reply({ content: 'That link action is missing its token.', ephemeral: true });
+    return true;
+  }
+
+  const record = store.getToken(token);
+  if (!record) {
+    await interaction.reply({ content: 'I cannot find that download anymore.', ephemeral: true });
+    return true;
+  }
+
+  if (action === 'new') {
+    const newToken = randomToken();
+    const expiresAt = Date.now() + FIFTEEN_DAYS_MS;
+    store.createLinkToken({ token: newToken, fileId: record.id, expiresAt });
+    await interaction.reply({
+      content: `New 15-day link: ${makePublicFileUrl(config, newToken)}`,
+      ephemeral: true,
+    });
+    return true;
+  }
+
+  if (action === 'extend') {
+    const updated = store.extendLinkToken(token, FIFTEEN_DAYS_MS);
+    await interaction.reply({
+      content: updated?.expires_at === 0
+        ? `This link is already permanent: ${makePublicFileUrl(config, token)}`
+        : `Extended by 15 days. New expiry: ${formatExpiry(updated?.expires_at)}\n${makePublicFileUrl(config, token)}`,
+      ephemeral: true,
+    });
+    return true;
+  }
+
+  if (action === 'permanent') {
+    store.setLinkTokenPermanent(token);
+    await interaction.reply({
+      content: `Permanent link kept: ${makePublicFileUrl(config, token)}`,
+      ephemeral: true,
+    });
+    return true;
+  }
+
+  await interaction.reply({ content: 'Unknown link action.', ephemeral: true });
+  return true;
+}
+
+function buildLinkManagementRows(token) {
+  if (!token) return [];
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`${LINK_BUTTON_PREFIX}new:${token}`)
+        .setLabel('New 15-day link')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(`${LINK_BUTTON_PREFIX}extend:${token}`)
+        .setLabel('Extend 15d')
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId(`${LINK_BUTTON_PREFIX}permanent:${token}`)
+        .setLabel('Keep permanently')
+        .setStyle(ButtonStyle.Success),
+    ),
+  ];
 }
 
 export function buildVideoEmbed(result, video = {}) {
@@ -193,4 +282,9 @@ function formatBytes(bytes) {
   if (value < 1024) return `${value} B`;
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
   return `${(value / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function formatExpiry(value) {
+  if (Number(value) === 0) return 'never';
+  return value ? new Date(value).toISOString() : 'unknown';
 }

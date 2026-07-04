@@ -12,3 +12,14 @@ services:
       # Optional cookies mount. Set YTDLP_COOKIES_FILE=/app/cookies/tiktok.txt if used.
       - ./cookies:/app/cookies:ro
     restart: unless-stopped
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    profiles:
+      - cloudflare
+    env_file:
+      - .env
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - tiktok-discord-downloader
+    restart: unless-stopped
