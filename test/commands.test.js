@@ -35,8 +35,9 @@ test('exports the expected slash command manifest', () => {
 
   assert.equal(downloads.name, 'downloads');
   assert.deepEqual((downloads.options ?? []).map((option) => option.name), ['list', 'purge']);
-  assert.deepEqual((downloads.options[0].options ?? []).map((option) => option.name), ['limit']);
+  assert.deepEqual((downloads.options[0].options ?? []).map((option) => option.name), ['limit', 'username']);
   assert.equal((downloads.options[0].options ?? [])[0].required, false);
+  assert.equal((downloads.options[0].options ?? [])[1].required, false);
   assert.deepEqual((downloads.options[1].options ?? []).map((option) => option.name), ['confirm', 'scope']);
   assert.equal((downloads.options[1].options ?? [])[0].required, true);
   assert.equal((downloads.options[1].options ?? [])[1].required, false);

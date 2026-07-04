@@ -40,6 +40,26 @@ async function downloadOne(sourceUrl, { delivery = 'auto', type = 'manual', user
   });
 
   try {
+    const existing = await findReusableDownload(metadata);
+    if (existing) {
+      const result = createDownloadResultFromFile({
+        metadata,
+        sourceUrl,
+        delivery,
+        jobId,
+        fileRecord: existing,
+        username,
+      });
+      store.updateJob(jobId, {
+        status: 'complete',
+        file_id: result.fileId,
+        video_id: result.videoId,
+        username: result.username,
+        title: result.title,
+      });
+      return result;
+    }
+
     const downloaded = await downloadVideo(sourceUrl, {
       ...config,
       metadata,
@@ -91,6 +111,45 @@ async function downloadOne(sourceUrl, { delivery = 'auto', type = 'manual', user
     store.updateJob(jobId, { status: 'failed', error: error.message ?? String(error) });
     throw error;
   }
+}
+
+async function findReusableDownload(metadata) {
+  const videoId = metadata.id || metadata.videoId || '';
+  const existing = store.getLatestFileByVideoId(videoId);
+  if (!existing) return null;
+
+  try {
+    const sizeBytes = await fileSize(existing.path);
+    return { ...existing, size_bytes: sizeBytes };
+  } catch {
+    return null;
+  }
+}
+
+function createDownloadResultFromFile({ metadata, sourceUrl, delivery, jobId, fileRecord, username = '' }) {
+  const token = randomToken();
+  const expiresAt = Date.now() + config.downloadLinkTtlHours * 60 * 60 * 1000;
+  store.createLinkToken({ token, fileId: fileRecord.id, expiresAt });
+
+  return {
+    ...metadata,
+    jobId,
+    fileId: fileRecord.id,
+    token,
+    publicUrl: makePublicFileUrl(config, token),
+    sourceUrl,
+    filePath: fileRecord.path,
+    primaryFile: fileRecord.path,
+    filename: fileRecord.filename || path.basename(fileRecord.path),
+    sizeBytes: Number(fileRecord.size_bytes || 0),
+    videoId: metadata.id || fileRecord.video_id || '',
+    username: username || metadata.uploader || metadata.channel || fileRecord.username || '',
+    title: metadata.title || '',
+    description: metadata.description || '',
+    thumbnailUrl: metadata.thumbnail || '',
+    delivery,
+    reused: true,
+  };
 }
 
 const monitor = new TikTokMonitor({
