@@ -9,7 +9,6 @@ function assertRegistrationConfig(config) {
 
   if (!config.discordToken) missing.push('DISCORD_TOKEN');
   if (!config.discordClientId) missing.push('DISCORD_CLIENT_ID');
-  if (!config.discordGuildId) missing.push('DISCORD_GUILD_ID');
 
   if (missing.length) {
     throw new Error(`Missing required environment variables for command registration: ${missing.join(', ')}`);
@@ -20,7 +19,7 @@ export async function registerCommands(config) {
   assertRegistrationConfig(config);
 
   const rest = new REST({ version: '10' }).setToken(config.discordToken);
-  const route = Routes.applicationGuildCommands(config.discordClientId, config.discordGuildId);
+  const route = Routes.applicationCommands(config.discordClientId);
   return rest.put(route, { body: commandJson });
 }
 
@@ -30,5 +29,5 @@ if (isDirectRun) {
   await loadEnvFile();
   const config = loadConfig();
   await registerCommands(config);
-  console.log(`Registered ${commandJson.length} slash commands for guild ${config.discordGuildId}.`);
+  console.log(`Registered ${commandJson.length} global slash commands.`);
 }

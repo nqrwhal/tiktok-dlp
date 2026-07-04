@@ -74,7 +74,6 @@ export function validateRuntimeConfig(config, { requireDiscord = true } = {}) {
   if (requireDiscord) {
     if (!config.discordToken) missing.push('DISCORD_TOKEN');
     if (!config.discordClientId) missing.push('DISCORD_CLIENT_ID');
-    if (!config.discordGuildId) missing.push('DISCORD_GUILD_ID');
     if (!config.discordChannelId) missing.push('DISCORD_CHANNEL_ID');
   }
   if (config.pingMode === 'role' && !config.pingRoleId) missing.push('PING_ROLE_ID');

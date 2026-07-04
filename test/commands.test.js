@@ -42,7 +42,7 @@ test('exports the expected slash command manifest', () => {
   assert.equal((downloads.options[1].options ?? [])[1].required, false);
 });
 
-test('registerCommands uses guild command registration with the manifest body', async () => {
+test('registerCommands uses global command registration with the manifest body', async () => {
   const putCalls = [];
 
   mock.method(REST.prototype, 'put', async function put(route, body) {
@@ -54,12 +54,11 @@ test('registerCommands uses guild command registration with the manifest body', 
     const result = await registerCommands({
       discordToken: 'token',
       discordClientId: 'app-123',
-      discordGuildId: 'guild-456',
     });
 
     assert.deepEqual(result, { ok: true });
     assert.equal(putCalls.length, 1);
-    assert.equal(putCalls[0].route, Routes.applicationGuildCommands('app-123', 'guild-456'));
+    assert.equal(putCalls[0].route, Routes.applicationCommands('app-123'));
     assert.deepEqual(putCalls[0].body, { body: commandJson });
   } finally {
     mock.restoreAll();

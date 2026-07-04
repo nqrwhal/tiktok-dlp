@@ -11,7 +11,7 @@ npm install
 cp .env.example .env
 ```
 
-Fill in `.env` with your Discord bot token, application/client ID, guild ID,
+Fill in `.env` with your Discord bot token, application/client ID,
 notification channel ID, and `PUBLIC_BASE_URL`.
 
 Example public download URL configuration:
@@ -26,8 +26,9 @@ Do not commit `.env`; it is ignored by git.
 ## Discord Commands
 
 The bot watches every guild channel it can read plus DMs. When someone posts a
-TikTok URL, it downloads the video and replies in that channel or DM. Slash
-commands still work for explicit actions and management.
+TikTok URL, it downloads the video and replies in that channel or DM. Global
+slash commands work in guild channels and bot DMs for explicit actions and
+management.
 
 For message-based help, use `tiktok help` or `!tiktok help` in a guild channel,
 mention the bot with `help`, or DM the bot `help`.
