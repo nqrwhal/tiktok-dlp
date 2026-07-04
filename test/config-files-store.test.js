@@ -15,7 +15,7 @@ import {
   slugify,
 } from '../src/util/files.js';
 import { createStore } from '../src/state/store.js';
-import { buildDeliveryPayload, handleLinkButton, shouldShowHelp } from '../src/discord/client.js';
+import { buildDeliveryPayload, handleLinkButton, shouldIgnoreMessage, shouldShowHelp } from '../src/discord/client.js';
 
 test('loadEnvFile reads simple env files without overriding existing values', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-env-'));
@@ -218,6 +218,48 @@ test('store purges download records by requester or globally', async () => {
   }
 });
 
+test('download link listing can include monitored downloads', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-monitored-links-'));
+  const store = createStore(path.join(dir, 'state.db'));
+  try {
+    const userFileId = store.createFileRecord({
+      requestedBy: 'user-1',
+      sourceUrl: 'https://www.tiktok.com/@openai/video/1',
+      filePath: path.join(dir, 'one.mp4'),
+      filename: 'one.mp4',
+      sizeBytes: 1,
+    }, 1000);
+    const monitorFileId = store.createFileRecord({
+      username: 'openai',
+      sourceUrl: 'https://www.tiktok.com/@openai/video/2',
+      filePath: path.join(dir, 'two.mp4'),
+      filename: 'two.mp4',
+      sizeBytes: 2,
+    }, 2000);
+    const monitorJobId = store.createJob({
+      type: 'monitor',
+      sourceUrl: 'https://www.tiktok.com/@openai/video/2',
+      title: 'monitored video',
+    }, 2000);
+    store.updateJob(monitorJobId, { status: 'complete', file_id: monitorFileId }, 2100);
+    store.createLinkToken({ token: 'user-token', fileId: userFileId, expiresAt: 0 }, 1000);
+    store.createLinkToken({ token: 'monitor-token', fileId: monitorFileId, expiresAt: 0 }, 2000);
+
+    assert.deepEqual(
+      store.listDownloadLinksByRequester('user-1').map((link) => link.token),
+      ['user-token'],
+    );
+    assert.deepEqual(
+      store.listDownloadLinksByRequester('user-1', { includeMonitored: true }).map((link) => link.token),
+      ['monitor-token', 'user-token'],
+    );
+    assert.equal(store.countDownloadLinksByRequester('user-1', { includeMonitored: true }), 2);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('delivery payload includes link-management buttons', async () => {
   const payload = await buildDeliveryPayload({
     token: 'abc',
@@ -245,6 +287,15 @@ test('help keyword works in DMs and scoped guild messages', () => {
   assert.equal(shouldShowHelp({ content: 'tiktok help', inGuild: () => true }), true);
   assert.equal(shouldShowHelp({ content: '!tt help', inGuild: () => true }), true);
   assert.equal(shouldShowHelp({ content: '<@bot-1> help', inGuild: () => true, client: { user: { id: 'bot-1' } } }), true);
+});
+
+test('message handler ignores bot, webhook, system, and own messages', () => {
+  assert.equal(shouldIgnoreMessage(null), true);
+  assert.equal(shouldIgnoreMessage({ author: { bot: true } }), true);
+  assert.equal(shouldIgnoreMessage({ webhookId: 'webhook-1', author: { bot: false } }), true);
+  assert.equal(shouldIgnoreMessage({ system: true, author: { bot: false } }), true);
+  assert.equal(shouldIgnoreMessage({ author: { id: 'bot-1', bot: false }, client: { user: { id: 'bot-1' } } }), true);
+  assert.equal(shouldIgnoreMessage({ author: { id: 'user-1', bot: false }, client: { user: { id: 'bot-1' } } }), false);
 });
 
 test('link button actions create, extend, and persist links', async () => {

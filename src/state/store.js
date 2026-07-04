@@ -219,7 +219,18 @@ export class Store {
     return this.db.prepare('DELETE FROM link_tokens WHERE expires_at > 0 AND expires_at <= ?').run(now).changes;
   }
 
-  listDownloadLinksByRequester(requestedBy, { limit = 25, activeOnly = true, now = Date.now() } = {}) {
+  listDownloadLinksByRequester(requestedBy, { limit = 25, activeOnly = true, includeMonitored = false, now = Date.now() } = {}) {
+    const ownerClause = includeMonitored
+      ? `(
+          files.requested_by = ?
+          OR EXISTS (
+            SELECT 1
+            FROM jobs
+            WHERE jobs.file_id = files.id
+              AND jobs.type = 'monitor'
+          )
+        )`
+      : 'files.requested_by = ?';
     const sql = `
       SELECT
         link_tokens.token,
@@ -229,12 +240,20 @@ export class Store {
         files.video_id,
         files.username,
         files.source_url,
+        files.requested_by,
         files.filename,
         files.size_bytes,
-        files.created_at AS file_created_at
+        files.created_at AS file_created_at,
+        (
+          SELECT jobs.title
+          FROM jobs
+          WHERE jobs.file_id = files.id
+          ORDER BY jobs.created_at DESC
+          LIMIT 1
+        ) AS title
       FROM link_tokens
       JOIN files ON files.id = link_tokens.file_id
-      WHERE files.requested_by = ?
+      WHERE ${ownerClause}
         ${activeOnly ? 'AND (link_tokens.expires_at = 0 OR link_tokens.expires_at > ?)' : ''}
       ORDER BY link_tokens.created_at DESC
       LIMIT ?
@@ -245,12 +264,23 @@ export class Store {
     return this.db.prepare(sql).all(...params);
   }
 
-  countDownloadLinksByRequester(requestedBy, { activeOnly = true, now = Date.now() } = {}) {
+  countDownloadLinksByRequester(requestedBy, { activeOnly = true, includeMonitored = false, now = Date.now() } = {}) {
+    const ownerClause = includeMonitored
+      ? `(
+          files.requested_by = ?
+          OR EXISTS (
+            SELECT 1
+            FROM jobs
+            WHERE jobs.file_id = files.id
+              AND jobs.type = 'monitor'
+          )
+        )`
+      : 'files.requested_by = ?';
     const sql = `
       SELECT COUNT(*) AS count
       FROM link_tokens
       JOIN files ON files.id = link_tokens.file_id
-      WHERE files.requested_by = ?
+      WHERE ${ownerClause}
         ${activeOnly ? 'AND (link_tokens.expires_at = 0 OR link_tokens.expires_at > ?)' : ''}
     `;
     const params = activeOnly ? [String(requestedBy ?? ''), now] : [String(requestedBy ?? '')];

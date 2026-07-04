@@ -48,7 +48,8 @@ Commands:
 - `/watch run username:<username>`
 - `/status`
 - `/history`
-- `/downloads list limit:<1-25>` shows your active download links.
+- `/downloads list limit:<1-25>` shows your active download links plus
+  monitored downloads.
 - `/downloads purge scope:mine|all confirm:PURGE` deletes saved download files,
   public links, and download history. `scope:all` requires Manage Server.
 

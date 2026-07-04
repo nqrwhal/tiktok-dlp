@@ -130,7 +130,7 @@ export async function handleInteraction({ interaction, config, store, monitor, d
 }
 
 export async function handleMessageCreate({ message, config, downloadOne }) {
-  if (!message || message.author?.bot) return false;
+  if (shouldIgnoreMessage(message)) return false;
 
   if (shouldShowHelp(message)) {
     await message.reply(buildHelpMessage());
@@ -174,6 +174,18 @@ export async function handleMessageCreate({ message, config, downloadOne }) {
   return true;
 }
 
+export function shouldIgnoreMessage(message) {
+  if (!message) return true;
+  const authorId = message.author?.id;
+  const botId = message.client?.user?.id;
+  return Boolean(
+    message.author?.bot
+      || message.system
+      || message.webhookId
+      || (authorId && botId && authorId === botId),
+  );
+}
+
 export function shouldShowHelp(message) {
   const content = String(message?.content ?? '').trim();
   if (!content) return false;
@@ -211,8 +223,8 @@ export async function handleDownloadsInteraction({ interaction, config, store })
   if (subcommand === 'list') {
     const limit = interaction.options.getInteger('limit') ?? 10;
     const userId = interaction.user?.id ?? '';
-    const links = store.listDownloadLinksByRequester(userId, { limit, activeOnly: true });
-    const total = store.countDownloadLinksByRequester(userId, { activeOnly: true });
+    const links = store.listDownloadLinksByRequester(userId, { limit, activeOnly: true, includeMonitored: true });
+    const total = store.countDownloadLinksByRequester(userId, { activeOnly: true, includeMonitored: true });
     await interaction.reply({
       content: formatUserDownloadLinks(links, {
         config,
