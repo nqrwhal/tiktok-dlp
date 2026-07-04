@@ -35,7 +35,7 @@ export function loadConfig(env = process.env, cwd = process.cwd()) {
   const dataDir = resolvePath(env.DATA_DIR ?? './data', cwd);
   const downloadDir = resolvePath(env.DOWNLOAD_DIR ?? path.join(dataDir, 'downloads'), cwd);
   const stateDbPath = resolvePath(env.STATE_DB ?? path.join(dataDir, 'state.db'), cwd);
-  const publicBaseUrl = String(env.PUBLIC_BASE_URL ?? '').replace(/\/+$/, '');
+  const publicBaseUrl = String(env.PUBLIC_BASE_URL ?? 'https://tiktok-dlp.yufei.dev').replace(/\/+$/, '');
   const uploadLimitMb = parsePositiveInt(env.DISCORD_UPLOAD_LIMIT_MB, 10);
   const httpPort = parsePositiveInt(env.HTTP_PORT, 8080);
 
@@ -52,7 +52,7 @@ export function loadConfig(env = process.env, cwd = process.cwd()) {
     pollIntervalSeconds: parsePositiveInt(env.POLL_INTERVAL_SECONDS, 300),
     profileScanLimit: parsePositiveInt(env.PROFILE_SCAN_LIMIT, 20),
     discordUploadLimitBytes: uploadLimitMb * 1024 * 1024,
-    downloadLinkTtlHours: parsePositiveInt(env.DOWNLOAD_LINK_TTL_HOURS, 168),
+    downloadLinkTtlHours: parsePositiveInt(env.DOWNLOAD_LINK_TTL_HOURS, 360),
     retentionDays: parsePositiveInt(env.RETENTION_DAYS, 30),
     maxConcurrentDownloads: parsePositiveInt(env.MAX_CONCURRENT_DOWNLOADS, 1),
     pingMode: String(env.PING_MODE ?? 'none').toLowerCase(),
