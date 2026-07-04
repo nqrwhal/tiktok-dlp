@@ -37,7 +37,7 @@ test('buildMetadataArgs builds a conservative metadata command', () => {
   ]);
 });
 
-test('buildDownloadArgs points yt-dlp at a temp output dir', () => {
+test('buildDownloadArgs points yt-dlp at explicit output dirs', () => {
   const args = buildDownloadArgs('https://www.tiktok.com/@user/video/123', {
     outputDir: '/tmp/out',
     cookiesFile: '/tmp/cookies.txt',
@@ -73,6 +73,8 @@ test('buildDownloadArgs points yt-dlp at a temp output dir', () => {
     '--output',
     '%(id)s.%(ext)s',
     '--paths',
+    'home:/tmp/out',
+    '--paths',
     'temp:/tmp/out',
     '--cookies',
     '/tmp/cookies.txt',
@@ -107,6 +109,13 @@ test('fetchVideoMetadata, listProfileVideos, and downloadVideo work with a fake 
   assert.equal(download.files.length, 1);
   assert.equal(path.basename(download.primaryFile), 'downloaded.mp4');
   assert.ok(download.downloadDir.startsWith(os.tmpdir()));
+
+  const finalRoot = await mkdtemp(path.join(os.tmpdir(), 'tiktok-downloads-'));
+  const movedDownload = await downloadVideo(url, { ytdlpPath: fake, downloadDir: finalRoot });
+  assert.equal(movedDownload.files.length, 1);
+  assert.equal(path.basename(movedDownload.primaryFile), 'downloaded.mp4');
+  assert.ok(movedDownload.primaryFile.startsWith(finalRoot));
+  assert.equal(path.relative(finalRoot, movedDownload.primaryFile).startsWith('.tmp'), false);
 });
 
 async function createFakeYtDlp() {
@@ -118,10 +127,7 @@ const path = require('node:path');
 
 const args = process.argv.slice(2);
 const has = (flag) => args.includes(flag);
-const valueAfter = (flag) => {
-  const index = args.indexOf(flag);
-  return index >= 0 ? args[index + 1] : '';
-};
+const valuesAfter = (flag) => args.flatMap((arg, index) => arg === flag ? [args[index + 1]] : []);
 
 if (has('--dump-single-json')) {
   if (has('--flat-playlist')) {
@@ -146,8 +152,9 @@ if (has('--dump-single-json')) {
   process.exit(0);
 }
 
-const pathsArg = valueAfter('--paths');
-const downloadDir = pathsArg.startsWith('temp:') ? pathsArg.slice(5) : pathsArg;
+const pathsArgs = valuesAfter('--paths');
+const pathsArg = pathsArgs.find((entry) => entry.startsWith('home:')) ?? pathsArgs.find((entry) => entry.startsWith('temp:')) ?? '';
+const downloadDir = pathsArg.includes(':') ? pathsArg.slice(pathsArg.indexOf(':') + 1) : pathsArg;
 if (!downloadDir) {
   process.stderr.write('missing download dir');
   process.exit(2);

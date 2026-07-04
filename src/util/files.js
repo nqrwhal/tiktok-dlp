@@ -1,4 +1,4 @@
-import { mkdir, readdir, rename, rm, stat } from 'node:fs/promises';
+import { cp, mkdir, readdir, rename, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
@@ -87,7 +87,7 @@ export async function moveDirectoryContents(fromDir, toDir) {
   for (const entry of entries) {
     const fromPath = path.join(fromDir, entry);
     const toPath = path.join(toDir, entry);
-    await rename(fromPath, toPath);
+    await movePath(fromPath, toPath);
     moved.push(toPath);
   }
   await rm(fromDir, { recursive: true, force: true });
@@ -125,4 +125,14 @@ function parseUploadDate(value) {
   const mm = Number(text.slice(4, 6));
   const dd = Number(text.slice(6, 8));
   return new Date(Date.UTC(yyyy, mm - 1, dd));
+}
+
+async function movePath(fromPath, toPath) {
+  try {
+    await rename(fromPath, toPath);
+  } catch (error) {
+    if (error.code !== 'EXDEV') throw error;
+    await cp(fromPath, toPath, { recursive: true });
+    await rm(fromPath, { recursive: true, force: true });
+  }
 }
