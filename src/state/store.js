@@ -219,6 +219,32 @@ export class Store {
     return this.db.prepare('DELETE FROM link_tokens WHERE expires_at > 0 AND expires_at <= ?').run(now).changes;
   }
 
+  listFilesWithoutActiveLinks(now = Date.now()) {
+    return this.db.prepare(`
+      SELECT files.id, files.path, files.filename
+      FROM files
+      WHERE EXISTS (
+          SELECT 1
+          FROM link_tokens
+          WHERE link_tokens.file_id = files.id
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM link_tokens
+          WHERE link_tokens.file_id = files.id
+            AND (link_tokens.expires_at = 0 OR link_tokens.expires_at > ?)
+        )
+      ORDER BY files.created_at ASC
+    `).all(now);
+  }
+
+  deleteFileRecords(ids = []) {
+    const uniqueIds = [...new Set(ids.map((id) => Number(id)).filter(Number.isFinite))];
+    if (!uniqueIds.length) return 0;
+    const placeholders = uniqueIds.map(() => '?').join(', ');
+    return this.db.prepare(`DELETE FROM files WHERE id IN (${placeholders})`).run(...uniqueIds).changes;
+  }
+
   listDownloadLinksByRequester(requestedBy, { limit = 25, activeOnly = true, includeMonitored = false, now = Date.now() } = {}) {
     const ownerClause = includeMonitored
       ? `(

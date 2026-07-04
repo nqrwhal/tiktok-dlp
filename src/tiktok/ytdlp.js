@@ -2,7 +2,7 @@ import { spawn as defaultSpawn } from 'node:child_process';
 import { mkdir, mkdtemp, readdir, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { fileSize, isTikTokUrl, makeDownloadLayout, moveDirectoryContents, pickPrimaryVideo, profileUrl as makeProfileUrl } from '../util/files.js';
+import { fileSize, isTikTokUrl, makeDownloadLayout, moveDirectoryContents, pickPrimaryVideo, profileUrl as makeProfileUrl, slugify } from '../util/files.js';
 
 const METADATA_BASE_ARGS = [
   '--ignore-config',
@@ -460,7 +460,7 @@ async function downloadPhotoPost(sourceUrl, metadata, tempDir, options = {}) {
   }
 
   const videoId = normalized.videoId || normalized.id || 'slideshow';
-  const zipFilename = `${videoId}.zip`;
+  const zipFilename = makeSlideshowZipFilename(normalized);
   const zipPath = path.join(tempDir, zipFilename);
   const infoJson = `${videoId}.info.json`;
   const descriptionFile = `${videoId}.description`;
@@ -522,6 +522,25 @@ async function downloadPhotoPost(sourceUrl, metadata, tempDir, options = {}) {
     stdout: '',
     stderr: '',
   };
+}
+
+function makeSlideshowZipFilename(metadata) {
+  const videoId = slugify(metadata.videoId || metadata.id || 'slideshow', 'slideshow');
+  const username = slugify(metadata.uploader || metadata.channel || metadata.creator || metadata.username || 'unknown', 'unknown');
+  const timestamp = metadata.timestamp
+    ? new Date(Number(metadata.timestamp) * 1000)
+    : parseUploadDate(metadata.upload_date) ?? new Date();
+  const stamp = timestamp.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+  return `${stamp}__${username}__${videoId}.zip`;
+}
+
+function parseUploadDate(value) {
+  const text = String(value ?? '');
+  if (!/^\d{8}$/.test(text)) return null;
+  const yyyy = Number(text.slice(0, 4));
+  const mm = Number(text.slice(4, 6));
+  const dd = Number(text.slice(6, 8));
+  return new Date(Date.UTC(yyyy, mm - 1, dd));
 }
 
 async function collectFiles(dir) {

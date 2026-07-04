@@ -9,8 +9,8 @@ import {
   Partials,
   PermissionFlagsBits,
 } from 'discord.js';
-import { rm, rmdir } from 'node:fs/promises';
 import path from 'node:path';
+import { removeStoredFiles } from '../cleanup/downloads.js';
 import { extractTikTokUrls, normalizeUsername, shouldUploadToDiscord, makePublicFileUrl, randomToken } from '../util/files.js';
 
 const LINK_BUTTON_PREFIX = 'link:';
@@ -290,7 +290,7 @@ export async function buildDeliveryPayload(result, config, requestedDelivery = '
     const attachment = new AttachmentBuilder(result.filePath, { name: result.filename || path.basename(result.filePath) });
     const link = result.publicUrl || (result.token ? makePublicFileUrl(config, result.token) : '');
     return {
-      content: `${contentPrefix}${options.alert ? `New TikTok ${mediaLabel(result)} downloaded.` : 'Download ready.'}${link ? `\n15-day link: ${link}` : ''}`.trim(),
+      content: `${contentPrefix}${options.alert ? `New TikTok ${mediaLabel(result)} downloaded.` : 'Download ready.'}${link ? `\n15-day server copy: ${link}` : ''}`.trim(),
       embeds: [embed],
       files: [attachment],
       components: buildLinkManagementRows(result.token),
@@ -377,7 +377,7 @@ function buildLinkManagementRows(token) {
         .setStyle(ButtonStyle.Primary),
       new ButtonBuilder()
         .setCustomId(`${LINK_BUTTON_PREFIX}permanent:${token}`)
-        .setLabel('Keep permanently')
+        .setLabel('Keep on server')
         .setStyle(ButtonStyle.Success),
     ),
   ];
@@ -438,52 +438,6 @@ function formatPurgeResult({ scope, counts, removal }) {
     ? ` ${removal.failed.length} file(s) could not be removed from disk.`
     : '';
   return `Purged ${target}: ${counts.files} file record(s), ${counts.links} link(s), ${counts.jobs} job(s). Removed ${removal.deleted} file(s) from disk.${failed}`;
-}
-
-async function removeStoredFiles(files, config) {
-  const seen = new Set();
-  const failed = [];
-  let deleted = 0;
-
-  for (const file of files) {
-    const filePath = resolveStoredDownloadPath(config.downloadDir, file.path);
-    if (!filePath || seen.has(filePath)) continue;
-    seen.add(filePath);
-
-    try {
-      await rm(filePath, { force: true });
-      deleted += 1;
-      await removeEmptyParents(path.dirname(filePath), config.downloadDir);
-    } catch (error) {
-      failed.push({ file, error });
-    }
-  }
-
-  return { deleted, failed };
-}
-
-async function removeEmptyParents(startDir, downloadDir) {
-  const root = path.resolve(downloadDir);
-  let current = path.resolve(startDir);
-
-  while (current.startsWith(root) && current !== root) {
-    try {
-      await rmdir(current);
-    } catch {
-      return;
-    }
-    current = path.dirname(current);
-  }
-}
-
-function resolveStoredDownloadPath(downloadDir, filePath) {
-  const root = path.resolve(downloadDir);
-  const resolved = path.isAbsolute(String(filePath ?? ''))
-    ? path.resolve(String(filePath))
-    : path.resolve(root, String(filePath ?? ''));
-  const relative = path.relative(root, resolved);
-  if (relative.startsWith('..') || path.isAbsolute(relative)) return null;
-  return resolved;
 }
 
 function canPurgeAll(interaction) {

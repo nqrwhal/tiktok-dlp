@@ -7,6 +7,7 @@ import { registerCommands } from './discord/register-commands.js';
 import { TikTokMonitor } from './tiktok/monitor.js';
 import { downloadVideo, fetchVideoMetadata } from './tiktok/ytdlp.js';
 import { fileSize, makePublicFileUrl, randomToken } from './util/files.js';
+import { cleanupExpiredDownloads } from './cleanup/downloads.js';
 
 await loadEnvFile();
 
@@ -16,6 +17,15 @@ await ensureRuntimeDirs(config);
 
 const store = createStore(config.stateDbPath);
 let discordClient = null;
+const cleanupTimer = setInterval(() => {
+  cleanupExpiredDownloads({ config, store }).catch((error) => {
+    console.error('[cleanup] Expired download cleanup failed:', error);
+  });
+}, 60 * 60 * 1000);
+cleanupTimer.unref?.();
+cleanupExpiredDownloads({ config, store }).catch((error) => {
+  console.error('[cleanup] Initial expired download cleanup failed:', error);
+});
 
 async function downloadOne(sourceUrl, { delivery = 'auto', type = 'manual', username = '', requestedBy = '' } = {}) {
   const metadata = await fetchVideoMetadata(sourceUrl, config);
@@ -108,6 +118,7 @@ discordClient = await startDiscordBot({ config, store, monitor, downloadOne, reg
 async function shutdown(signal) {
   console.log(`[shutdown] Received ${signal}`);
   monitor.stop();
+  clearInterval(cleanupTimer);
   await discordClient?.destroy?.();
   await new Promise((resolve) => httpService.server.close(resolve));
   store.close();

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { DatabaseSync } from 'node:sqlite';
 import os from 'node:os';
 import path from 'node:path';
@@ -16,6 +16,7 @@ import {
 } from '../src/util/files.js';
 import { createStore } from '../src/state/store.js';
 import { buildDeliveryPayload, handleLinkButton, shouldIgnoreMessage, shouldShowHelp } from '../src/discord/client.js';
+import { cleanupExpiredDownloads } from '../src/cleanup/downloads.js';
 
 test('loadEnvFile reads simple env files without overriding existing values', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-env-'));
@@ -131,6 +132,52 @@ test('store persists watches, seen videos, jobs, files, and link tokens', async 
     assert.equal(store.stats().watchCount, 1);
     assert.equal(store.listJobs(1)[0].status, 'complete');
     assert.equal(store.removeWatch('openai'), true);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('expired downloads remove both file records and disk files', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-expiry-'));
+  const store = createStore(path.join(dir, 'state.db'));
+  try {
+    const filePath = path.join(dir, 'expired.mp4');
+    await writeFile(filePath, 'expired');
+    const expiredFileId = store.createFileRecord({
+      videoId: 'expired',
+      username: 'openai',
+      sourceUrl: 'https://www.tiktok.com/@openai/video/expired',
+      filePath,
+      filename: 'expired.mp4',
+      sizeBytes: 7,
+    }, 1000);
+    store.createLinkToken({ token: 'expired', fileId: expiredFileId, expiresAt: 2000 }, 1000);
+
+    const keptPath = path.join(dir, 'kept.mp4');
+    await writeFile(keptPath, 'kept');
+    const keptFileId = store.createFileRecord({
+      videoId: 'kept',
+      username: 'openai',
+      sourceUrl: 'https://www.tiktok.com/@openai/video/kept',
+      filePath: keptPath,
+      filename: 'kept.mp4',
+      sizeBytes: 4,
+    }, 1000);
+    store.createLinkToken({ token: 'kept', fileId: keptFileId, expiresAt: 0 }, 1000);
+
+    const result = await cleanupExpiredDownloads({
+      config: { downloadDir: dir },
+      store,
+      now: 3000,
+      log: { warn() {} },
+    });
+
+    assert.deepEqual(result, { files: 1, deleted: 1, failed: 0 });
+    assert.equal(store.getToken('expired'), null);
+    assert.equal(store.getToken('kept').filename, 'kept.mp4');
+    await assert.rejects(access(filePath));
+    await access(keptPath);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -278,6 +325,7 @@ test('delivery payload includes link-management buttons', async () => {
     payload.components[0].components.map((button) => button.data.custom_id),
     ['link:new:abc', 'link:extend:abc', 'link:permanent:abc'],
   );
+  assert.equal(payload.components[0].components[2].data.label, 'Keep on server');
 });
 
 test('help keyword works in DMs and scoped guild messages', () => {

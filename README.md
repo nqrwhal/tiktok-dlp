@@ -117,6 +117,7 @@ curl https://example.com/health
   who click them.
 - Small videos are uploaded to Discord when they fit under
   `DISCORD_UPLOAD_LIMIT_MB`; larger videos and slideshow ZIPs are linked.
-- Every download gets a 15-day link by default. Discord buttons let you create
-  another 15-day link, extend the current link by 15 days, or keep it
-  permanently.
+- Every download gets a 15-day server copy by default. When every link for a
+  file expires, the local file and file record are removed. Discord buttons let
+  you create another 15-day link, extend the current link by 15 days, or keep
+  the file permanently on the server.

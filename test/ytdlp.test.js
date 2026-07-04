@@ -134,7 +134,7 @@ test('photo post fallback parses and packages slideshow images', async () => {
   const download = await downloadVideo(url, { ytdlpPath: fake, fetchImpl, downloadDir: finalRoot });
   assert.equal(download.mediaType, 'slideshow');
   assert.equal(download.imageCount, 2);
-  assert.equal(download.filename, '7640994586499878174.zip');
+  assert.equal(download.filename, '20260517T224146Z__user400567892112__7640994586499878174.zip');
   assert.equal(path.extname(download.primaryFile), '.zip');
   assert.ok(download.primaryFile.startsWith(finalRoot));
 
