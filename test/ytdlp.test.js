@@ -143,6 +143,21 @@ test('photo post fallback parses and packages slideshow images', async () => {
   assert.ok(archive.includes(Buffer.from('001.jpg')));
   assert.ok(archive.includes(Buffer.from('002.jpg')));
   assert.ok(archive.includes(Buffer.from('manifest.json')));
+
+  const galleryRoot = await mkdtemp(path.join(os.tmpdir(), 'tiktok-photo-gallery-downloads-'));
+  const galleryDownload = await downloadVideo(url, {
+    ytdlpPath: fake,
+    fetchImpl,
+    downloadDir: galleryRoot,
+    keepSlideshowImages: true,
+  });
+  assert.deepEqual(
+    galleryDownload.slideshowImagePaths.map((filePath) => path.basename(filePath)),
+    [
+      '20260517T224146Z__user400567892112__7640994586499878174__001.jpg',
+      '20260517T224146Z__user400567892112__7640994586499878174__002.jpg',
+    ],
+  );
 });
 
 test('parsePhotoPostMetadata rejects HTML without image data', () => {

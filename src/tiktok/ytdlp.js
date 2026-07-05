@@ -461,9 +461,16 @@ async function downloadPhotoPost(sourceUrl, metadata, tempDir, options = {}) {
 
   const videoId = normalized.videoId || normalized.id || 'slideshow';
   const zipFilename = makeSlideshowZipFilename(normalized);
+  const zipBase = path.basename(zipFilename, '.zip');
   const zipPath = path.join(tempDir, zipFilename);
   const infoJson = `${videoId}.info.json`;
   const descriptionFile = `${videoId}.description`;
+  const galleryImageEntries = options.keepSlideshowImages && imageEntries.length <= 10
+    ? imageEntries.map((entry) => ({
+        ...entry,
+        name: `${zipBase}__${entry.name}`,
+      }))
+    : [];
   const manifest = {
     id: videoId,
     sourceUrl: String(sourceUrl),
@@ -492,6 +499,9 @@ async function downloadPhotoPost(sourceUrl, metadata, tempDir, options = {}) {
   if (normalized.description) {
     await writeFile(path.join(tempDir, descriptionFile), String(normalized.description));
   }
+  for (const entry of galleryImageEntries) {
+    await writeFile(path.join(tempDir, entry.name), entry.data);
+  }
 
   let downloadDir = tempDir;
   let files = await collectFiles(tempDir);
@@ -502,6 +512,10 @@ async function downloadPhotoPost(sourceUrl, metadata, tempDir, options = {}) {
   }
 
   const primaryFile = pickPrimaryFile(files);
+  const galleryImageNames = new Set(galleryImageEntries.map((entry) => entry.name));
+  const slideshowImagePaths = files
+    .filter((file) => galleryImageNames.has(path.basename(file)))
+    .sort();
   const sizeBytes = primaryFile ? await fileSize(primaryFile) : 0;
   return {
     sourceUrl: String(sourceUrl),
@@ -519,6 +533,7 @@ async function downloadPhotoPost(sourceUrl, metadata, tempDir, options = {}) {
     thumbnailUrl: normalized.thumbnail || '',
     mediaType: 'slideshow',
     imageCount: imageEntries.length,
+    slideshowImagePaths,
     stdout: '',
     stderr: '',
   };

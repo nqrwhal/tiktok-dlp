@@ -1,11 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { access, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {
   buildDownloadsListPayload,
   buildLinkHistoryEmbed,
+  buildMonitorAlertPayload,
   handleButtonInteraction,
 } from '../src/discord/client.js';
 import { createStore } from '../src/state/store.js';
@@ -121,6 +122,152 @@ test('downloads list buttons are scoped to the requesting user', async () => {
   assert.equal(replies.length, 1);
   assert.equal(replies[0].embeds[0].data.title, 'Not Your List');
   assert.equal(replies[0].ephemeral, true);
+});
+
+test('monitor alert payload is embed-first with monitor-only buttons', async () => {
+  const now = 1_700_000_120_000;
+  const payload = await buildMonitorAlertPayload({
+    token: 'monitor-token',
+    publicUrl: 'https://example.com/files/monitor-token',
+    filePath: '/tmp/video.mp4',
+    filename: 'video.mp4',
+    title: 'fresh post',
+    sourceUrl: 'https://www.tiktok.com/@creator/video/123',
+    sizeBytes: 1024,
+    videoId: '123',
+    username: 'creator',
+    timestamp: 1_700_000_000,
+    linkPermanent: true,
+  }, {
+    publicBaseUrl: 'https://example.com',
+    discordUploadLimitBytes: 10 * 1024 * 1024,
+  }, {
+    watch: { username: 'creator' },
+    now,
+  });
+
+  assert.equal(payload.content, undefined);
+  assert.equal(payload.embeds[0].data.title, 'New post by @creator - 2m old');
+  assert.equal(payload.files.length, 1);
+  assert.deepEqual(
+    payload.components[0].components.map((button) => button.data.label),
+    ['Download video', 'Delete post'],
+  );
+  assert.equal(payload.components[0].components[0].data.url, 'https://example.com/files/monitor-token');
+  assert.equal(payload.components[0].components[1].data.custom_id, 'monitor:delete:monitor-token');
+});
+
+test('monitor slideshow alerts attach galleries only when Discord can show all images', async () => {
+  const galleryPayload = await buildMonitorAlertPayload({
+    token: 'zip-token',
+    publicUrl: 'https://example.com/files/zip-token',
+    filePath: '/tmp/slideshow.zip',
+    filename: 'slideshow.zip',
+    title: 'photo post',
+    sizeBytes: 2048,
+    videoId: 'photo-1',
+    username: 'creator',
+    mediaType: 'slideshow',
+    imageCount: 2,
+    slideshowImagePaths: ['/tmp/slideshow__001.jpg', '/tmp/slideshow__002.jpg'],
+  }, {
+    publicBaseUrl: 'https://example.com',
+    discordUploadLimitBytes: 10 * 1024 * 1024,
+  }, {
+    watch: { username: 'creator' },
+    now: 1_700_000_000_000,
+  });
+
+  assert.deepEqual(galleryPayload.files.map((file) => file.name), ['slideshow__001.jpg', 'slideshow__002.jpg']);
+  assert.equal(galleryPayload.components[0].components[0].data.label, 'Download ZIP');
+  assert.match(galleryPayload.embeds[0].data.fields.find((field) => field.name === 'Slideshow').value, /attached below/);
+
+  const zipPayload = await buildMonitorAlertPayload({
+    token: 'large-zip-token',
+    publicUrl: 'https://example.com/files/large-zip-token',
+    filePath: '/tmp/large-slideshow.zip',
+    filename: 'large-slideshow.zip',
+    title: 'large photo post',
+    sizeBytes: 2048,
+    videoId: 'photo-2',
+    username: 'creator',
+    mediaType: 'slideshow',
+    imageCount: 12,
+    slideshowImagePaths: [],
+  }, {
+    publicBaseUrl: 'https://example.com',
+    discordUploadLimitBytes: 10 * 1024 * 1024,
+  }, {
+    watch: { username: 'creator' },
+    now: 1_700_000_000_000,
+  });
+
+  assert.deepEqual(zipPayload.files.map((file) => file.name), ['large-slideshow.zip']);
+  assert.match(zipPayload.embeds[0].data.fields.find((field) => field.name === 'Slideshow').value, /up to 10 attachments/);
+});
+
+test('monitor delete button removes saved post records and slideshow sidecars', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-monitor-delete-'));
+  const store = createStore(path.join(dir, 'state.db'));
+  try {
+    const zipPath = path.join(dir, 'slideshow.zip');
+    const sidecarPath = path.join(dir, 'slideshow__001.jpg');
+    await writeFile(zipPath, 'zip');
+    await writeFile(sidecarPath, 'image');
+
+    const fileId = store.createFileRecord({
+      videoId: 'photo-1',
+      username: 'creator',
+      sourceUrl: 'https://www.tiktok.com/@creator/photo/photo-1',
+      filePath: zipPath,
+      filename: 'slideshow.zip',
+      sizeBytes: 3,
+    }, 1000);
+    const jobId = store.createJob({
+      type: 'monitor',
+      username: 'creator',
+      sourceUrl: 'https://www.tiktok.com/@creator/photo/photo-1',
+      videoId: 'photo-1',
+      title: 'photo post',
+    }, 1000);
+    store.updateJob(jobId, { status: 'complete', file_id: fileId }, 1000);
+    store.createLinkToken({ token: 'monitor-token', fileId, expiresAt: 0 }, 1000);
+    store.markVideoSeen({
+      videoId: 'photo-1',
+      username: 'creator',
+      sourceUrl: 'https://www.tiktok.com/@creator/photo/photo-1',
+      title: 'photo post',
+      alertedAt: 1000,
+    }, 1000);
+    store.scheduleVideoDeletionCheck('photo-1', 5000);
+
+    const updates = [];
+    const followUps = [];
+    const handled = await handleButtonInteraction({
+      config: { downloadDir: dir, publicBaseUrl: 'https://example.com' },
+      store,
+      interaction: {
+        customId: 'monitor:delete:monitor-token',
+        guildId: 'guild-1',
+        memberPermissions: { has: () => true },
+        update: async (payload) => updates.push(payload),
+        followUp: async (payload) => followUps.push(payload),
+        reply: async (payload) => followUps.push(payload),
+      },
+    });
+
+    assert.equal(handled, true);
+    assert.equal(store.getToken('monitor-token'), null);
+    assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM jobs WHERE file_id = ?').get(fileId).count, 0);
+    assert.equal(store.db.prepare('SELECT next_deletion_check_at FROM seen_videos WHERE video_id = ?').get('photo-1').next_deletion_check_at, null);
+    await assert.rejects(access(zipPath));
+    await assert.rejects(access(sidecarPath));
+    assert.deepEqual(updates[0], { components: [] });
+    assert.equal(followUps[0].embeds[0].data.title, 'Saved Post Deleted');
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('link history embed shows temporary, permanent, and expired states', async () => {
