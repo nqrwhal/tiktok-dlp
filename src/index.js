@@ -72,7 +72,7 @@ async function downloadOne(sourceUrl, { delivery = 'auto', type = 'manual', user
       ...config,
       metadata: downloadMetadata,
       downloadDir: config.downloadDir,
-      keepSlideshowImages: type === 'monitor',
+      keepSlideshowImages: true,
     });
     const sizeBytes = downloaded.sizeBytes ?? await fileSize(downloaded.filePath);
     const filename = downloaded.filename || path.basename(downloaded.filePath);

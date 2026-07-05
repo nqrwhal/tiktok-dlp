@@ -448,49 +448,18 @@ export async function buildMonitorAlertPayload(result, config, { video = {}, wat
 export async function buildDeliveryPayload(result, config, requestedDelivery = 'auto', options = {}) {
   const canUpload = shouldUploadToDiscord(result.sizeBytes, config);
   const wantsFile = requestedDelivery === 'file' || (requestedDelivery === 'auto' && canUpload && !result.reused);
-  const embed = buildVideoEmbed(result, options.video);
-  const contentPrefix = options.contentPrefix ?? '';
-  const linkPermanent = Boolean(result.linkPermanent);
-  const readyText = result.reused ? 'Download ready (cache hit).' : 'Download ready.';
-  const readyLinkText = result.reused ? 'Download ready (cache hit)' : 'Download ready';
+  const attachments = wantsFile
+    ? buildMonitorAlertAttachments(result, config)
+    : { files: [], mode: 'link' };
+  const embed = buildStandardDownloadEmbed(result, config, {
+    video: options.video,
+    attachmentMode: attachments.mode,
+    now: options.now ?? Date.now(),
+  });
 
-  if (wantsFile && canUpload) {
-    const attachment = new AttachmentBuilder(result.filePath, { name: result.filename || path.basename(result.filePath) });
-    const link = result.publicUrl || (result.token ? makePublicFileUrl(config, result.token) : '');
-    const serverCopy = link
-      ? linkPermanent
-        ? `\nPermanent server copy: ${link}`
-        : `\nServer copy expires in ${formatTtlLong(config)}: ${link}`
-      : '';
-    return {
-      content: `${contentPrefix}${options.alert ? alertReadyText(result) : readyText}${serverCopy}`.trim(),
-      embeds: [embed],
-      files: [attachment],
-      components: buildLinkManagementRows(result.token, config),
-    };
-  }
-
-  if (requestedDelivery === 'file' && !canUpload) {
-    return {
-      embeds: [
-        embed,
-        buildNoticePayload({
-          title: 'File Too Large',
-          description: `File is too large for Discord upload (${formatBytes(result.sizeBytes)}). Use delivery:link or auto.`,
-          color: UI_COLORS.warning,
-          ephemeral: false,
-        }).embeds[0],
-      ],
-    };
-  }
-
-  const link = result.publicUrl || (result.token ? makePublicFileUrl(config, result.token) : '');
-  const retention = linkPermanent
-    ? 'This server copy is permanent.'
-    : `Temporary links expire after ${formatTtlLong(config)}. Use the buttons below to save or renew the server copy.`;
   return {
-    content: `${contentPrefix}${link ? `${readyLinkText}: ${link}` : `${readyText} PUBLIC_BASE_URL is not configured for links.`}\n${retention}`.trim(),
     embeds: [embed],
+    files: attachments.files,
     components: buildLinkManagementRows(result.token, config),
   };
 }
@@ -829,6 +798,50 @@ export function buildVideoEmbed(result, video = {}) {
   return embed;
 }
 
+function buildStandardDownloadEmbed(result, config, { video = {}, attachmentMode = 'link', now = Date.now() } = {}) {
+  const username = result?.username || video?.username || video?.uploader || 'unknown';
+  const sourceUrl = result?.sourceUrl || video?.sourceUrl || video?.url || video?.webpage_url || '';
+  const link = result?.publicUrl || (result?.token ? makePublicFileUrl(config, result.token) : '');
+  const fields = [
+    {
+      name: 'Download',
+      value: link ? `[Click](${link})` : 'Unavailable',
+      inline: true,
+    },
+    {
+      name: 'Retention',
+      value: result?.linkPermanent ? 'Permanent' : formatTtlShort(config),
+      inline: true,
+    },
+    {
+      name: 'Cache',
+      value: result?.reused ? 'Y' : 'N',
+      inline: true,
+    },
+  ];
+
+  if (result?.mediaType === 'slideshow') {
+    fields.push({
+      name: 'Slideshow',
+      value: formatStandardSlideshowNote(result, attachmentMode),
+      inline: true,
+    });
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(UI_COLORS.info)
+    .setTitle(buildStandardDownloadTitle(username, result, video, now))
+    .setTimestamp(new Date(now))
+    .setFooter({ text: `${result?.videoId || video?.id || 'unknown'} - ${formatBytes(result?.sizeBytes || 0)}` });
+
+  const description = truncateText(result?.description || result?.title || video?.title || '', 4000);
+  if (description) embed.setDescription(description);
+  embed.addFields(...fields);
+  if (sourceUrl) embed.setURL(sourceUrl);
+  if (result?.thumbnailUrl || video?.thumbnail) embed.setThumbnail(result.thumbnailUrl || video.thumbnail);
+  return embed;
+}
+
 function buildMonitorActionRows(result, config = {}) {
   const link = result?.publicUrl || (result?.token ? makePublicFileUrl(config, result.token) : '');
   const components = [];
@@ -894,6 +907,19 @@ function formatSlideshowAlertNote(result, attachmentMode) {
     return 'Gallery images were not available, so the ZIP is attached below.';
   }
   return 'Use the Download ZIP button for the saved slideshow.';
+}
+
+function formatStandardSlideshowNote(result, attachmentMode) {
+  const imageCount = Number(result?.imageCount ?? 0);
+  if (attachmentMode === 'gallery') return imageCount ? `${imageCount} images` : 'Gallery';
+  if (imageCount > 10) return `ZIP (${imageCount} images)`;
+  return 'ZIP';
+}
+
+function buildStandardDownloadTitle(username, result, video, now) {
+  const uploadAt = resolveUploadTimestampMs(result, video);
+  const age = uploadAt ? ` - ${formatCompactDuration(Math.max(0, now - uploadAt))} old` : '';
+  return truncateText(`Downloaded post by @${username}${age}`, 256);
 }
 
 function buildMonitorAlertTitle(username, result, video, now) {

@@ -578,14 +578,24 @@ test('delivery payload includes link-management buttons', async () => {
     publicUrl: 'https://example.com/files/abc',
     title: 'clip',
     sourceUrl: 'https://www.tiktok.com/@openai/video/1',
+    username: 'openai',
+    timestamp: 1_700_000_000,
     sizeBytes: 20 * 1024 * 1024,
   }, {
     publicBaseUrl: 'https://example.com',
     discordUploadLimitBytes: 10,
     downloadLinkTtlMinutes: 30,
-  }, 'link');
+  }, 'link', {
+    now: 1_700_000_120_000,
+  });
 
-  assert.match(payload.content, /Download ready: https:\/\/example\.com\/files\/abc/);
+  const fields = Object.fromEntries(payload.embeds[0].data.fields.map((field) => [field.name, field.value]));
+  assert.equal(payload.content, undefined);
+  assert.equal(payload.embeds[0].data.title, 'Downloaded post by @openai - 2m old');
+  assert.equal(payload.embeds[0].data.description, 'clip');
+  assert.equal(fields.Download, '[Click](https://example.com/files/abc)');
+  assert.equal(fields.Retention, '30m');
+  assert.equal(fields.Cache, 'N');
   assert.equal(payload.components.length, 1);
   assert.deepEqual(
     payload.components[0].components.map((button) => button.data.custom_id),
@@ -610,9 +620,11 @@ test('delivery payload distinguishes permanent server copies', async () => {
     downloadLinkTtlMinutes: 30,
   }, 'link');
 
-  assert.match(payload.content, /Download ready: https:\/\/example\.com\/files\/abc/);
-  assert.match(payload.content, /server copy is permanent/i);
-  assert.doesNotMatch(payload.content, /Temporary links expire/);
+  const fields = Object.fromEntries(payload.embeds[0].data.fields.map((field) => [field.name, field.value]));
+  assert.equal(payload.content, undefined);
+  assert.equal(fields.Download, '[Click](https://example.com/files/abc)');
+  assert.equal(fields.Retention, 'Permanent');
+  assert.equal(fields.Cache, 'N');
 });
 
 test('reused downloads use links for auto delivery', async () => {
@@ -631,9 +643,12 @@ test('reused downloads use links for auto delivery', async () => {
     downloadLinkTtlMinutes: 30,
   }, 'auto');
 
-  assert.equal(payload.files, undefined);
-  assert.match(payload.content, /Download ready \(cache hit\): https:\/\/example\.com\/files\/abc/);
-  assert.match(payload.content, /Temporary links expire after 30 minutes/);
+  const fields = Object.fromEntries(payload.embeds[0].data.fields.map((field) => [field.name, field.value]));
+  assert.equal(payload.content, undefined);
+  assert.equal(payload.files.length, 0);
+  assert.equal(fields.Download, '[Click](https://example.com/files/abc)');
+  assert.equal(fields.Retention, '30m');
+  assert.equal(fields.Cache, 'Y');
 });
 
 test('help keyword works in DMs and scoped guild messages', () => {
