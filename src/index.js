@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { readdir } from 'node:fs/promises';
 import { loadConfig, loadEnvFile, ensureRuntimeDirs, validateRuntimeConfig } from './config.js';
 import { createStore } from './state/store.js';
 import { startHttpServer } from './http/server.js';
@@ -48,7 +49,7 @@ async function downloadOne(sourceUrl, { delivery = 'auto', type = 'manual', user
   try {
     const existing = await findReusableDownload(downloadMetadata);
     if (existing) {
-      const result = createDownloadResultFromFile({
+      const result = await createDownloadResultFromFile({
         metadata: downloadMetadata,
         sourceUrl,
         delivery,
@@ -71,6 +72,7 @@ async function downloadOne(sourceUrl, { delivery = 'auto', type = 'manual', user
       ...config,
       metadata: downloadMetadata,
       downloadDir: config.downloadDir,
+      keepSlideshowImages: type === 'monitor',
     });
     const sizeBytes = downloaded.sizeBytes ?? await fileSize(downloaded.filePath);
     const filename = downloaded.filename || path.basename(downloaded.filePath);
@@ -134,7 +136,7 @@ async function findReusableDownload(metadata) {
   }
 }
 
-function createDownloadResultFromFile({ metadata, sourceUrl, delivery, jobId, fileRecord, username = '', permanent = false }) {
+async function createDownloadResultFromFile({ metadata, sourceUrl, delivery, jobId, fileRecord, username = '', permanent = false }) {
   const token = randomToken();
   const expiresAt = permanent ? 0 : Date.now() + downloadLinkTtlMs();
   store.createLinkToken({ token, fileId: fileRecord.id, expiresAt });
@@ -155,10 +157,34 @@ function createDownloadResultFromFile({ metadata, sourceUrl, delivery, jobId, fi
     title: metadata.title || '',
     description: metadata.description || '',
     thumbnailUrl: metadata.thumbnail || '',
+    mediaType: metadata.mediaType,
+    imageCount: metadata.imageCount,
+    slideshowImagePaths: await findSlideshowImagePaths(fileRecord.path, metadata),
     delivery,
     reused: true,
     linkPermanent: expiresAt === 0,
   };
+}
+
+async function findSlideshowImagePaths(filePath, metadata = {}) {
+  if (metadata?.mediaType !== 'slideshow') return [];
+  const imageCount = Number(metadata?.imageCount ?? 0);
+  if (!Number.isFinite(imageCount) || imageCount <= 0 || imageCount > 10) return [];
+
+  const dir = path.dirname(filePath);
+  const prefix = `${path.basename(filePath, path.extname(filePath))}__`;
+  try {
+    const entries = await readdir(dir, { withFileTypes: true });
+    return entries
+      .filter((entry) => entry.isFile())
+      .map((entry) => entry.name)
+      .filter((name) => name.startsWith(prefix) && /\.(jpe?g|png|webp|gif|heic)$/i.test(name))
+      .sort()
+      .slice(0, 10)
+      .map((name) => path.join(dir, name));
+  } catch {
+    return [];
+  }
 }
 
 function downloadLinkTtlMs() {

@@ -360,6 +360,26 @@ export class Store {
     `).get(token) ?? null;
   }
 
+  getMonitorFileByToken(token) {
+    return this.db.prepare(`
+      SELECT
+        link_tokens.token,
+        link_tokens.expires_at,
+        link_tokens.created_at AS token_created_at,
+        files.*,
+        files.id AS file_id
+      FROM link_tokens
+      JOIN files ON files.id = link_tokens.file_id
+      WHERE link_tokens.token = ?
+        AND EXISTS (
+          SELECT 1
+          FROM jobs
+          WHERE jobs.file_id = files.id
+            AND jobs.type = 'monitor'
+        )
+    `).get(String(token ?? '')) ?? null;
+  }
+
   getValidToken(token, now = Date.now()) {
     return this.db.prepare(`
       SELECT link_tokens.token, link_tokens.expires_at, link_tokens.created_at AS token_created_at, files.*
@@ -440,6 +460,37 @@ export class Store {
     if (!uniqueIds.length) return 0;
     const placeholders = uniqueIds.map(() => '?').join(', ');
     return this.db.prepare(`DELETE FROM files WHERE id IN (${placeholders})`).run(...uniqueIds).changes;
+  }
+
+  deleteMonitorDownloadByFileId(fileId) {
+    const id = Number(fileId);
+    if (!Number.isFinite(id)) return { files: 0, links: 0, jobs: 0 };
+    const file = this.db.prepare('SELECT id, video_id FROM files WHERE id = ?').get(id);
+    if (!file) return { files: 0, links: 0, jobs: 0 };
+    const monitorJob = this.db.prepare("SELECT 1 FROM jobs WHERE file_id = ? AND type = 'monitor'").get(id);
+    if (!monitorJob) return { files: 0, links: 0, jobs: 0 };
+
+    const counts = {
+      files: 1,
+      links: this.db.prepare('SELECT COUNT(*) AS count FROM link_tokens WHERE file_id = ?').get(id).count,
+      jobs: this.db.prepare('SELECT COUNT(*) AS count FROM jobs WHERE file_id = ?').get(id).count,
+    };
+
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare('DELETE FROM link_tokens WHERE file_id = ?').run(id);
+      this.db.prepare('DELETE FROM jobs WHERE file_id = ?').run(id);
+      this.db.prepare('DELETE FROM files WHERE id = ?').run(id);
+      if (file.video_id) {
+        this.db.prepare('UPDATE seen_videos SET next_deletion_check_at = NULL WHERE video_id = ?').run(file.video_id);
+      }
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+
+    return counts;
   }
 
   listDownloadLinksByRequester(requestedBy, { limit = 25, offset = 0, activeOnly = true, includeMonitored = false, username = '', now = Date.now() } = {}) {

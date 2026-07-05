@@ -25,6 +25,7 @@ import {
 
 const LINK_BUTTON_PREFIX = 'link:';
 const DOWNLOADS_BUTTON_PREFIX = 'downloads:list:';
+const MONITOR_BUTTON_PREFIX = 'monitor:';
 
 export async function startDiscordBot({ config, store, monitor, downloadOne, registerCommands }) {
   if (config.registerCommandsOnStart) {
@@ -337,17 +338,20 @@ export async function handleButtonInteraction({ interaction, config, store }) {
   if (customId.startsWith(DOWNLOADS_BUTTON_PREFIX)) {
     return handleDownloadsListButton({ interaction, config, store });
   }
+  if (customId.startsWith(MONITOR_BUTTON_PREFIX)) {
+    return handleMonitorButton({ interaction, config, store });
+  }
   return false;
 }
 
 export async function sendVideoAlert({ client, config, store, result, video, watch }) {
   const channelId = watch?.channel_id || config.discordChannelId;
   const channel = await client.channels.fetch(channelId);
-  const delivery = 'auto';
-  const payload = await buildDeliveryPayload(result, config, delivery, {
-    contentPrefix: pingPrefix(config),
-    alert: true,
+  const now = Date.now();
+  const payload = await buildMonitorAlertPayload(result, config, {
     video,
+    watch,
+    now,
   });
   await channel.send(payload);
   if (video?.id) {
@@ -356,7 +360,7 @@ export async function sendVideoAlert({ client, config, store, result, video, wat
       username: watch?.username || video.username || result.username,
       sourceUrl: video.url || result.sourceUrl,
       title: video.title || result.title,
-      alertedAt: Date.now(),
+      alertedAt: now,
     });
   }
 }
@@ -395,6 +399,50 @@ export async function sendUsernameChangeAlert({ client, config, change, watch })
     embed.addFields({ name: 'Creator ID', value: truncateText(change.creatorId, 100), inline: true });
   }
   await channel.send({ embeds: [embed] });
+}
+
+export async function buildMonitorAlertPayload(result, config, { video = {}, watch = {}, now = Date.now() } = {}) {
+  const username = watch?.username || result?.username || video?.username || video?.uploader || 'unknown';
+  const sourceUrl = result?.sourceUrl || video?.sourceUrl || video?.url || video?.webpage_url || '';
+  const link = result?.publicUrl || (result?.token ? makePublicFileUrl(config, result.token) : '');
+  const attachments = buildMonitorAlertAttachments(result, config);
+  const fields = [
+    {
+      name: 'Saved Copy',
+      value: link ? `[Permanent server copy](${link})` : 'Saved permanently on the server.',
+      inline: false,
+    },
+  ];
+
+  if (result?.reused) {
+    fields.push({ name: 'Cache', value: 'Delivered from cache.', inline: true });
+  }
+
+  if (result?.mediaType === 'slideshow') {
+    fields.push({
+      name: 'Slideshow',
+      value: formatSlideshowAlertNote(result, attachments.mode),
+      inline: false,
+    });
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(UI_COLORS.success)
+    .setTitle(buildMonitorAlertTitle(username, result, video, now))
+    .setTimestamp(new Date(now))
+    .setFooter({ text: `${result?.videoId || video?.id || 'unknown'} - ${formatBytes(result?.sizeBytes || 0)}` })
+    .addFields(...fields);
+
+  const description = truncateText(result?.title || video?.title || result?.description || '', 4000);
+  if (description) embed.setDescription(description);
+  if (sourceUrl) embed.setURL(sourceUrl);
+  if (result?.thumbnailUrl || video?.thumbnail) embed.setThumbnail(result.thumbnailUrl || video.thumbnail);
+
+  return {
+    embeds: [embed],
+    files: attachments.files,
+    components: buildMonitorActionRows(result, config),
+  };
 }
 
 export async function buildDeliveryPayload(result, config, requestedDelivery = 'auto', options = {}) {
@@ -445,6 +493,59 @@ export async function buildDeliveryPayload(result, config, requestedDelivery = '
     embeds: [embed],
     components: buildLinkManagementRows(result.token, config),
   };
+}
+
+export async function handleMonitorButton({ interaction, config, store }) {
+  const customId = String(interaction.customId ?? '');
+  if (!customId.startsWith(MONITOR_BUTTON_PREFIX)) return false;
+
+  const [, action, token] = customId.split(':');
+  if (action !== 'delete' || !token) {
+    await interaction.reply(buildNoticePayload({
+      title: 'Unknown Monitor Action',
+      description: 'Unknown monitored post action.',
+      color: UI_COLORS.error,
+    }));
+    return true;
+  }
+
+  if (!canDeleteMonitorPost(interaction)) {
+    await interaction.reply(buildNoticePayload({
+      title: 'Permission Required',
+      description: 'Only members with Manage Messages or Manage Server can delete monitored saved posts.',
+      color: UI_COLORS.error,
+    }));
+    return true;
+  }
+
+  const record = store.getMonitorFileByToken?.(token);
+  if (!record) {
+    await interaction.reply(buildNoticePayload({
+      title: 'Saved Post Not Found',
+      description: 'I cannot find a monitored saved post for that button anymore.',
+      color: UI_COLORS.error,
+    }));
+    return true;
+  }
+
+  const removal = await removeStoredFiles([{ id: record.id, path: record.path, filename: record.filename }], config);
+  if (removal.failed.length) {
+    await interaction.reply(buildNoticePayload({
+      title: 'Delete Failed',
+      description: 'The saved file could not be removed from disk, so I left its database records intact.',
+      color: UI_COLORS.error,
+    }));
+    return true;
+  }
+
+  const counts = store.deleteMonitorDownloadByFileId?.(record.file_id ?? record.id) ?? { files: 0, links: 0, jobs: 0 };
+  await acknowledgeMonitorDelete(interaction, buildNoticePayload({
+    title: counts.files ? 'Saved Post Deleted' : 'Saved Post Not Found',
+    description: counts.files
+      ? `Deleted ${record.filename || 'the saved post'} from this server.`
+      : 'That monitored saved post had already been deleted.',
+  }));
+  return true;
 }
 
 export async function handleLinkButton({ interaction, config, store }) {
@@ -726,6 +827,148 @@ export function buildVideoEmbed(result, video = {}) {
   if (result.description) embed.setDescription(String(result.description).slice(0, 4000));
   if (result.thumbnailUrl || video.thumbnail) embed.setThumbnail(result.thumbnailUrl || video.thumbnail);
   return embed;
+}
+
+function buildMonitorActionRows(result, config = {}) {
+  const link = result?.publicUrl || (result?.token ? makePublicFileUrl(config, result.token) : '');
+  const components = [];
+  if (link) {
+    components.push(
+      new ButtonBuilder()
+        .setLabel(result?.mediaType === 'slideshow' ? 'Download ZIP' : 'Download video')
+        .setStyle(ButtonStyle.Link)
+        .setURL(link),
+    );
+  }
+  if (result?.token) {
+    components.push(
+      new ButtonBuilder()
+        .setCustomId(`${MONITOR_BUTTON_PREFIX}delete:${result.token}`)
+        .setLabel('Delete post')
+        .setStyle(ButtonStyle.Danger),
+    );
+  }
+  return components.length ? [new ActionRowBuilder().addComponents(...components)] : [];
+}
+
+function buildMonitorAlertAttachments(result, config = {}) {
+  if (!result?.filePath) return { files: [], mode: 'link' };
+
+  if (result?.mediaType === 'slideshow') {
+    const imageCount = Number(result.imageCount ?? 0);
+    const imagePaths = Array.isArray(result.slideshowImagePaths)
+      ? result.slideshowImagePaths.filter(Boolean).slice(0, 10)
+      : [];
+    const hasCompleteGallery = imagePaths.length > 0 && (!imageCount || imagePaths.length >= imageCount);
+    if (imageCount <= 10 && hasCompleteGallery) {
+      return {
+        mode: 'gallery',
+        files: imagePaths.map((filePath) => new AttachmentBuilder(filePath, { name: path.basename(filePath) })),
+      };
+    }
+    if (shouldUploadToDiscord(result.sizeBytes, config)) {
+      return {
+        mode: 'zip',
+        files: [new AttachmentBuilder(result.filePath, { name: result.filename || path.basename(result.filePath) })],
+      };
+    }
+    return { files: [], mode: 'link' };
+  }
+
+  if (!shouldUploadToDiscord(result.sizeBytes, config)) return { files: [], mode: 'link' };
+  return {
+    mode: 'video',
+    files: [new AttachmentBuilder(result.filePath, { name: result.filename || path.basename(result.filePath) })],
+  };
+}
+
+function formatSlideshowAlertNote(result, attachmentMode) {
+  const imageCount = Number(result?.imageCount ?? 0);
+  if (imageCount > 10) {
+    return `${imageCount} images. Using the ZIP because Discord galleries support up to 10 attachments.`;
+  }
+  if (attachmentMode === 'gallery') {
+    return `${imageCount || result?.slideshowImagePaths?.length || 'Multiple'} images attached below. The ZIP is saved permanently.`;
+  }
+  if (attachmentMode === 'zip') {
+    return 'Gallery images were not available, so the ZIP is attached below.';
+  }
+  return 'Use the Download ZIP button for the saved slideshow.';
+}
+
+function buildMonitorAlertTitle(username, result, video, now) {
+  const uploadAt = resolveUploadTimestampMs(result, video);
+  const age = uploadAt ? ` - ${formatCompactDuration(Math.max(0, now - uploadAt))} old` : '';
+  return truncateText(`New post by @${username}${age}`, 256);
+}
+
+function resolveUploadTimestampMs(result = {}, video = {}) {
+  for (const value of [
+    result.timestamp,
+    video.timestamp,
+    result.release_timestamp,
+    video.release_timestamp,
+  ]) {
+    const numeric = Number(value ?? 0);
+    if (Number.isFinite(numeric) && numeric > 0) {
+      return numeric > 10_000_000_000 ? numeric : numeric * 1000;
+    }
+  }
+
+  for (const value of [result.upload_date, video.upload_date]) {
+    const parsed = parseCompactUploadDate(value);
+    if (parsed) return parsed;
+  }
+
+  for (const value of [result.created_at, video.created_at, result.uploadDate, video.uploadDate]) {
+    const parsed = Date.parse(String(value ?? ''));
+    if (Number.isFinite(parsed)) return parsed;
+  }
+
+  return null;
+}
+
+function parseCompactUploadDate(value) {
+  const text = String(value ?? '');
+  if (!/^\d{8}$/.test(text)) return null;
+  const yyyy = Number(text.slice(0, 4));
+  const mm = Number(text.slice(4, 6));
+  const dd = Number(text.slice(6, 8));
+  return Date.UTC(yyyy, mm - 1, dd);
+}
+
+function formatCompactDuration(ms) {
+  const minutes = Math.max(0, Math.round(Number(ms || 0) / 60_000));
+  if (minutes < 1) return 'under 1m';
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+  const days = Math.round(hours / 24);
+  return `${days}d`;
+}
+
+function canDeleteMonitorPost(interaction) {
+  const inGuild = interaction?.inGuild?.() ?? Boolean(interaction?.guildId);
+  if (!inGuild) return true;
+  return Boolean(
+    interaction.memberPermissions?.has?.(PermissionFlagsBits.ManageMessages)
+      || interaction.memberPermissions?.has?.(PermissionFlagsBits.ManageGuild),
+  );
+}
+
+async function acknowledgeMonitorDelete(interaction, payload) {
+  if (typeof interaction.update === 'function') {
+    try {
+      await interaction.update({ components: [] });
+      if (typeof interaction.followUp === 'function') {
+        await interaction.followUp(payload).catch(() => {});
+      }
+      return;
+    } catch {
+      // Fall back to a normal ephemeral reply.
+    }
+  }
+  await interaction.reply(payload);
 }
 
 function formatWatchList(watches) {

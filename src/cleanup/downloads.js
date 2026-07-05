@@ -1,4 +1,4 @@
-import { rm, rmdir } from 'node:fs/promises';
+import { readdir, rm, rmdir } from 'node:fs/promises';
 import path from 'node:path';
 
 export async function cleanupExpiredDownloads({ config, store, now = Date.now(), log = console } = {}) {
@@ -34,18 +34,45 @@ export async function removeStoredFiles(files, config) {
   for (const file of files) {
     const filePath = resolveStoredDownloadPath(config.downloadDir, file.path);
     if (!filePath || seen.has(filePath)) continue;
-    seen.add(filePath);
+    const paths = await resolveRelatedStoredDownloadPaths(filePath);
 
-    try {
-      await rm(filePath, { force: true });
-      deleted += 1;
-      await removeEmptyParents(path.dirname(filePath), config.downloadDir);
-    } catch (error) {
-      failed.push({ file, error });
+    for (const relatedPath of paths) {
+      if (seen.has(relatedPath)) continue;
+      seen.add(relatedPath);
+
+      try {
+        await rm(relatedPath, { force: true });
+        deleted += 1;
+      } catch (error) {
+        failed.push({ file: { ...file, path: relatedPath }, error });
+      }
     }
+
+    await removeEmptyParents(path.dirname(filePath), config.downloadDir);
   }
 
   return { deleted, failed };
+}
+
+async function resolveRelatedStoredDownloadPaths(filePath) {
+  const resolved = path.resolve(filePath);
+  const paths = [resolved];
+  if (path.extname(resolved).toLowerCase() !== '.zip') return paths;
+
+  const dir = path.dirname(resolved);
+  const prefix = `${path.basename(resolved, '.zip')}__`;
+  try {
+    const entries = await readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      if (!entry.name.startsWith(prefix)) continue;
+      if (!/\.(jpe?g|png|webp|gif|heic)$/i.test(entry.name)) continue;
+      paths.push(path.join(dir, entry.name));
+    }
+  } catch {
+    return paths;
+  }
+  return paths;
 }
 
 async function removeEmptyParents(startDir, downloadDir) {
