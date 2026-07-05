@@ -1,9 +1,21 @@
 import { extractVideoId, normalizeUsername, profileUrl as makeProfileUrl } from '../util/files.js';
 
-const DEFAULT_POLL_INTERVAL_MS = 5 * 60 * 1000;
+const DEFAULT_POLL_INTERVAL_MS = 60 * 1000;
 const DEFAULT_SCAN_LIMIT = 20;
 const DEFAULT_BACKOFF_BASE_MS = 60 * 1000;
 const DEFAULT_BACKOFF_MAX_MS = 60 * 60 * 1000;
+const DELETION_CHECK_DELAYS_MS = [
+  60 * 1000,
+  60 * 1000,
+  60 * 1000,
+  60 * 1000,
+  60 * 1000,
+  25 * 60 * 1000,
+  30 * 60 * 1000,
+  23 * 60 * 60 * 1000,
+  24 * 60 * 60 * 1000,
+  7 * 24 * 60 * 60 * 1000,
+];
 
 export function normalizeWatchedUser(input) {
   const username = normalizeUsername(input?.username ?? input?.profile_url ?? input?.profileUrl ?? input?.url ?? input);
@@ -73,11 +85,64 @@ export function calculateFailureBackoffMs(failureCount, { baseMs = DEFAULT_BACKO
   return Math.min(maxMs, baseMs * (2 ** (attempts - 1)));
 }
 
+export function nextDeletionCheckDelayMs(completedChecks = 0) {
+  const index = Math.max(0, Number(completedChecks) || 0);
+  return DELETION_CHECK_DELAYS_MS[Math.min(index, DELETION_CHECK_DELAYS_MS.length - 1)];
+}
+
+export function resolveProfileUsername(profileResult, fallbackUsername = '') {
+  const metadata = Array.isArray(profileResult) ? {} : profileResult?.metadata ?? {};
+  const entries = Array.isArray(profileResult) ? profileResult : profileResult?.entries ?? [];
+  const candidates = [
+    metadata.uploader,
+    metadata.channel,
+    metadata.creator,
+    metadata.username,
+    entries[0]?.uploader,
+    entries[0]?.channel,
+    entries[0]?.creator,
+    entries[0]?.username,
+    fallbackUsername,
+  ];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    try {
+      return normalizeUsername(candidate);
+    } catch {
+      // Try the next metadata field.
+    }
+  }
+  return fallbackUsername;
+}
+
+export function resolveProfileCreatorId(profileResult) {
+  const metadata = Array.isArray(profileResult) ? {} : profileResult?.metadata ?? {};
+  const entries = Array.isArray(profileResult) ? profileResult : profileResult?.entries ?? [];
+  return String(
+    metadata.uploader_id
+      ?? metadata.channel_id
+      ?? metadata.creator_id
+      ?? metadata.user_id
+      ?? entries[0]?.uploader_id
+      ?? entries[0]?.channel_id
+      ?? entries[0]?.creator_id
+      ?? entries[0]?.user_id
+      ?? '',
+  ).trim();
+}
+
 function resolveMethod(target, names) {
   for (const name of names) {
     if (typeof target?.[name] === 'function') return target[name].bind(target);
   }
   throw new Error(`Downloader is missing a required method: ${names.join(' or ')}`);
+}
+
+function resolveOptionalMethod(target, names) {
+  for (const name of names) {
+    if (typeof target?.[name] === 'function') return target[name].bind(target);
+  }
+  return null;
 }
 
 function defaultSleep(ms) {
@@ -89,6 +154,8 @@ export class TikTokMonitor {
     store,
     downloader,
     alert = async () => {},
+    deletionAlert = async () => {},
+    usernameChangeAlert = async () => {},
     logger = console,
     pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
     scanLimit = DEFAULT_SCAN_LIMIT,
@@ -103,6 +170,8 @@ export class TikTokMonitor {
     this.store = store;
     this.downloader = downloader;
     this.alert = alert;
+    this.deletionAlert = deletionAlert;
+    this.usernameChangeAlert = usernameChangeAlert;
     this.logger = logger ?? console;
     this.pollIntervalMs = pollIntervalMs;
     this.scanLimit = scanLimit;
@@ -113,6 +182,7 @@ export class TikTokMonitor {
 
     this.#listProfileVideos = resolveMethod(downloader, ['listProfileVideos']);
     this.#downloadVideo = resolveMethod(downloader, ['download', 'downloadVideo']);
+    this.#checkVideoAvailable = resolveOptionalMethod(downloader, ['checkVideoAvailable', 'isVideoAvailable']);
   }
 
   #running = false;
@@ -120,6 +190,7 @@ export class TikTokMonitor {
   #lastPollAt = null;
   #listProfileVideos;
   #downloadVideo;
+  #checkVideoAvailable;
 
   start() {
     if (this.#running) return this;
@@ -138,6 +209,7 @@ export class TikTokMonitor {
   async runOnce() {
     this.#lastPollAt = this.now();
     const watches = await Promise.resolve(this.store.listWatches());
+    await this.#runDeletionChecks();
     const summary = {
       watchedUsers: 0,
       skippedUsers: 0,
@@ -148,7 +220,8 @@ export class TikTokMonitor {
       failures: 0,
     };
 
-    for (const watch of watches ?? []) {
+    for (const originalWatch of watches ?? []) {
+      let watch = originalWatch;
       const now = this.now();
       const dueAt = Number(watch?.next_check_at ?? 0);
       if (dueAt && dueAt > now) {
@@ -183,6 +256,17 @@ export class TikTokMonitor {
           limit: this.scanLimit,
           watch,
         });
+        const identity = this.#recordProfileIdentity(normalized.username, profileResult, now);
+        if (identity.changed) {
+          normalized = normalizeWatchedUser(identity.username);
+          watch = { ...watch, username: identity.username };
+          await Promise.resolve(this.usernameChangeAlert({
+            previousUsername: identity.previousUsername,
+            username: identity.username,
+            creatorId: identity.creatorId,
+            watch,
+          }));
+        }
         const videos = Array.isArray(profileResult) ? profileResult : profileResult?.entries ?? [];
 
         for (const video of (videos ?? []).slice(0, this.scanLimit)) {
@@ -234,6 +318,7 @@ export class TikTokMonitor {
           summary.alertedVideos += 1;
 
           await Promise.resolve(this.store.markVideoSeen({ ...seenRecord, alertedAt: now }, now));
+          await Promise.resolve(this.store.scheduleVideoDeletionCheck?.(videoId, now + nextDeletionCheckDelayMs(0)));
         }
 
         await Promise.resolve(this.store.markWatchSuccess(normalized.username, now));
@@ -250,6 +335,46 @@ export class TikTokMonitor {
     }
 
     return summary;
+  }
+
+  #recordProfileIdentity(username, profileResult, now) {
+    if (typeof this.store.recordWatchIdentity !== 'function') {
+      return { changed: false, username, previousUsername: username, creatorId: '' };
+    }
+    const currentUsername = resolveProfileUsername(profileResult, username);
+    const creatorId = resolveProfileCreatorId(profileResult);
+    return this.store.recordWatchIdentity(username, { creatorId, currentUsername }, now);
+  }
+
+  async #runDeletionChecks() {
+    if (!this.#checkVideoAvailable || typeof this.store.listVideosDueForDeletionCheck !== 'function') return;
+    const now = this.now();
+    const due = await Promise.resolve(this.store.listVideosDueForDeletionCheck(now, 25));
+    for (const video of due ?? []) {
+      try {
+        const result = await Promise.resolve(this.#checkVideoAvailable(video));
+        if (result?.available === false) {
+          const deleted = await Promise.resolve(this.store.markVideoDeleted?.(video.video_id, now)) ?? video;
+          await Promise.resolve(this.deletionAlert({
+            video: { ...video, ...deleted },
+            reason: result.reason || result.message || 'The post is no longer publicly available.',
+          }));
+          continue;
+        }
+
+        const completedChecks = Number(video.deletion_check_count ?? 0) + 1;
+        await Promise.resolve(
+          this.store.markVideoStillAvailable?.(
+            video.video_id,
+            now + nextDeletionCheckDelayMs(completedChecks),
+            now,
+          ),
+        );
+      } catch (error) {
+        await Promise.resolve(this.store.postponeVideoDeletionCheck?.(video.video_id, now + 5 * 60 * 1000, now));
+        this.logger?.warn?.(`Deletion check failed for ${video.video_id}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
   }
 
   async pollUsername(username, { force = false } = {}) {

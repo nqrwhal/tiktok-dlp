@@ -50,7 +50,7 @@ export function loadConfig(env = process.env, cwd = process.cwd()) {
     dataDir,
     downloadDir,
     stateDbPath,
-    pollIntervalSeconds: parsePositiveInt(env.POLL_INTERVAL_SECONDS, 300),
+    pollIntervalSeconds: parsePositiveInt(env.POLL_INTERVAL_SECONDS, 60),
     profileScanLimit: parsePositiveInt(env.PROFILE_SCAN_LIMIT, 20),
     discordUploadLimitBytes: uploadLimitMb * 1024 * 1024,
     downloadLinkTtlMinutes,

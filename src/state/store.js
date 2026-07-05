@@ -20,6 +20,9 @@ export class Store {
         username TEXT PRIMARY KEY,
         channel_id TEXT NOT NULL,
         created_at INTEGER NOT NULL,
+        creator_id TEXT,
+        previous_username TEXT,
+        username_changed_at INTEGER,
         last_checked_at INTEGER,
         last_success_at INTEGER,
         failure_count INTEGER NOT NULL DEFAULT 0,
@@ -33,7 +36,21 @@ export class Store {
         source_url TEXT NOT NULL,
         title TEXT,
         seen_at INTEGER NOT NULL,
-        alerted_at INTEGER
+        alerted_at INTEGER,
+        last_available_at INTEGER,
+        last_deletion_checked_at INTEGER,
+        next_deletion_check_at INTEGER,
+        deletion_check_count INTEGER NOT NULL DEFAULT 0,
+        deleted_at INTEGER,
+        deletion_alerted_at INTEGER
+      );
+
+      CREATE TABLE IF NOT EXISTS watch_username_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        creator_id TEXT,
+        previous_username TEXT NOT NULL,
+        new_username TEXT NOT NULL,
+        detected_at INTEGER NOT NULL
       );
 
       CREATE TABLE IF NOT EXISTS jobs (
@@ -74,11 +91,22 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_files_video_id ON files(video_id);
       CREATE INDEX IF NOT EXISTS idx_link_tokens_expires_at ON link_tokens(expires_at);
     `);
+    this.ensureColumn('watched_users', 'creator_id', 'TEXT');
+    this.ensureColumn('watched_users', 'previous_username', 'TEXT');
+    this.ensureColumn('watched_users', 'username_changed_at', 'INTEGER');
+    this.ensureColumn('seen_videos', 'last_available_at', 'INTEGER');
+    this.ensureColumn('seen_videos', 'last_deletion_checked_at', 'INTEGER');
+    this.ensureColumn('seen_videos', 'next_deletion_check_at', 'INTEGER');
+    this.ensureColumn('seen_videos', 'deletion_check_count', 'INTEGER NOT NULL DEFAULT 0');
+    this.ensureColumn('seen_videos', 'deleted_at', 'INTEGER');
+    this.ensureColumn('seen_videos', 'deletion_alerted_at', 'INTEGER');
     this.ensureColumn('jobs', 'requested_by', "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn('files', 'requested_by', "TEXT NOT NULL DEFAULT ''");
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_jobs_requested_by ON jobs(requested_by);
       CREATE INDEX IF NOT EXISTS idx_files_requested_by ON files(requested_by);
+      CREATE INDEX IF NOT EXISTS idx_seen_videos_next_deletion_check_at ON seen_videos(next_deletion_check_at);
+      CREATE INDEX IF NOT EXISTS idx_watch_username_history_detected_at ON watch_username_history(detected_at DESC);
     `);
   }
 
@@ -108,6 +136,59 @@ export class Store {
 
   listWatches() {
     return this.db.prepare('SELECT * FROM watched_users ORDER BY username').all();
+  }
+
+  recordWatchIdentity(username, { creatorId = '', currentUsername = '' } = {}, now = Date.now()) {
+    const previousUsername = String(username ?? '');
+    const nextUsername = String(currentUsername || previousUsername);
+    const id = String(creatorId ?? '');
+    const existing = this.getWatch(previousUsername);
+    if (!existing) return { changed: false, username: nextUsername, previousUsername, creatorId: id };
+
+    if (id) {
+      this.db.prepare('UPDATE watched_users SET creator_id = ? WHERE username = ?').run(id, previousUsername);
+    }
+
+    if (!nextUsername || nextUsername.toLowerCase() === previousUsername.toLowerCase()) {
+      return { changed: false, username: previousUsername, previousUsername, creatorId: id || existing.creator_id || '' };
+    }
+
+    this.db.prepare(`
+      INSERT INTO watch_username_history (creator_id, previous_username, new_username, detected_at)
+      VALUES (?, ?, ?, ?)
+    `).run(id || existing.creator_id || '', previousUsername, nextUsername, now);
+
+    const conflict = this.getWatch(nextUsername);
+    if (conflict) {
+      this.db.prepare(`
+        UPDATE watched_users
+        SET
+          creator_id = COALESCE(NULLIF(?, ''), creator_id),
+          previous_username = ?,
+          username_changed_at = ?,
+          last_checked_at = COALESCE(last_checked_at, ?),
+          last_success_at = COALESCE(last_success_at, ?)
+        WHERE username = ?
+      `).run(id, previousUsername, now, existing.last_checked_at, existing.last_success_at, nextUsername);
+      this.db.prepare('DELETE FROM watched_users WHERE username = ?').run(previousUsername);
+    } else {
+      this.db.prepare(`
+        UPDATE watched_users
+        SET username = ?, creator_id = COALESCE(NULLIF(?, ''), creator_id), previous_username = ?, username_changed_at = ?
+        WHERE username = ?
+      `).run(nextUsername, id, previousUsername, now, previousUsername);
+    }
+
+    return { changed: true, username: nextUsername, previousUsername, creatorId: id || existing.creator_id || '' };
+  }
+
+  listWatchUsernameHistory(limit = 25) {
+    return this.db.prepare(`
+      SELECT *
+      FROM watch_username_history
+      ORDER BY detected_at DESC, id DESC
+      LIMIT ?
+    `).all(Math.max(1, Math.min(100, Number(limit) || 25)));
   }
 
   markWatchSuccess(username, now = Date.now()) {
@@ -140,6 +221,73 @@ export class Store {
         title = excluded.title,
         alerted_at = COALESCE(excluded.alerted_at, seen_videos.alerted_at)
     `).run(videoId, username, sourceUrl, title ?? '', now, alertedAt);
+  }
+
+  scheduleVideoDeletionCheck(videoId, nextCheckAt) {
+    this.db.prepare(`
+      UPDATE seen_videos
+      SET next_deletion_check_at = ?, last_available_at = COALESCE(last_available_at, alerted_at, seen_at)
+      WHERE video_id = ?
+    `).run(nextCheckAt, String(videoId));
+  }
+
+  listVideosDueForDeletionCheck(now = Date.now(), limit = 25) {
+    return this.db.prepare(`
+      SELECT
+        seen_videos.*,
+        (
+          SELECT link_tokens.token
+          FROM files
+          JOIN link_tokens ON link_tokens.file_id = files.id
+          WHERE files.video_id = seen_videos.video_id
+            AND link_tokens.expires_at = 0
+          ORDER BY link_tokens.created_at DESC
+          LIMIT 1
+        ) AS permanent_token,
+        (
+          SELECT files.filename
+          FROM files
+          WHERE files.video_id = seen_videos.video_id
+          ORDER BY files.created_at DESC
+          LIMIT 1
+        ) AS filename
+      FROM seen_videos
+      WHERE alerted_at IS NOT NULL
+        AND deleted_at IS NULL
+        AND next_deletion_check_at IS NOT NULL
+        AND next_deletion_check_at <= ?
+      ORDER BY next_deletion_check_at ASC
+      LIMIT ?
+    `).all(now, Math.max(1, Math.min(100, Number(limit) || 25)));
+  }
+
+  markVideoStillAvailable(videoId, nextCheckAt, now = Date.now()) {
+    this.db.prepare(`
+      UPDATE seen_videos
+      SET
+        last_available_at = ?,
+        last_deletion_checked_at = ?,
+        next_deletion_check_at = ?,
+        deletion_check_count = deletion_check_count + 1
+      WHERE video_id = ?
+    `).run(now, now, nextCheckAt, String(videoId));
+  }
+
+  postponeVideoDeletionCheck(videoId, nextCheckAt, now = Date.now()) {
+    this.db.prepare(`
+      UPDATE seen_videos
+      SET last_deletion_checked_at = ?, next_deletion_check_at = ?
+      WHERE video_id = ?
+    `).run(now, nextCheckAt, String(videoId));
+  }
+
+  markVideoDeleted(videoId, now = Date.now()) {
+    this.db.prepare(`
+      UPDATE seen_videos
+      SET deleted_at = ?, deletion_alerted_at = ?, last_deletion_checked_at = ?, next_deletion_check_at = NULL
+      WHERE video_id = ?
+    `).run(now, now, now, String(videoId));
+    return this.db.prepare('SELECT * FROM seen_videos WHERE video_id = ?').get(String(videoId)) ?? null;
   }
 
   createJob({ type, status = 'queued', requestedBy = '', username = '', sourceUrl, videoId = '', title = '' }, now = Date.now()) {

@@ -61,6 +61,12 @@ portal for the application.
 Watched usernames only alert for videos newer than when the watch was added.
 Videos with no timestamp metadata are treated as eligible so new uploads are not
 missed when TikTok or `yt-dlp` omits dates.
+The default monitor interval is 60 seconds; set `POLL_INTERVAL_SECONDS` to a
+positive integer to tune it.
+When profile metadata reports that a watched creator now has a different
+username, the bot updates the watch record and posts a username-change notice.
+This depends on TikTok or `yt-dlp` still resolving the old profile URL far
+enough to expose the creator identity.
 
 ## Docker
 
@@ -127,5 +133,9 @@ curl https://example.com/health
   server.
 - Watched-user downloads are kept permanently on the server by default.
 - Watched-user files are stored under `DOWNLOAD_DIR/<username>/...`.
+- After a watched post is saved, the bot checks whether the original post still
+  exists every minute for five minutes, then around 30 minutes, one hour, one
+  day, and weekly after that. If the source post disappears, Discord gets a
+  deletion notice with the saved-copy link when available.
 - `DOWNLOAD_LINK_TTL_MINUTES` controls new temporary links. Legacy
   `DOWNLOAD_LINK_TTL_HOURS` values are ignored.

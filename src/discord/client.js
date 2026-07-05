@@ -361,6 +361,42 @@ export async function sendVideoAlert({ client, config, store, result, video, wat
   }
 }
 
+export async function sendDeletionAlert({ client, config, video, watch, reason = '' }) {
+  const channelId = watch?.channel_id || config.discordChannelId;
+  const channel = await client.channels.fetch(channelId);
+  const sourceUrl = video?.source_url || video?.sourceUrl || '';
+  const savedLink = video?.permanent_token ? makePublicFileUrl(config, video.permanent_token) : '';
+  const embed = new EmbedBuilder()
+    .setColor(UI_COLORS.warning)
+    .setTitle('Monitored Post Deleted')
+    .setDescription(truncateText([
+      video?.title || video?.filename || video?.video_id || 'A monitored TikTok post',
+      reason ? `Reason: ${reason}` : '',
+    ].filter(Boolean).join('\n'), 4000))
+    .addFields(
+      { name: 'Creator', value: video?.username ? `@${video.username}` : '@unknown', inline: true },
+      { name: 'Post', value: video?.video_id || 'unknown', inline: true },
+      { name: 'Saved Copy', value: savedLink || 'Saved locally; no permanent link was found.', inline: false },
+    )
+    .setTimestamp(new Date());
+  if (sourceUrl) embed.setURL(sourceUrl);
+  await channel.send({ embeds: [embed] });
+}
+
+export async function sendUsernameChangeAlert({ client, config, change, watch }) {
+  const channelId = watch?.channel_id || config.discordChannelId;
+  const channel = await client.channels.fetch(channelId);
+  const embed = new EmbedBuilder()
+    .setColor(UI_COLORS.info)
+    .setTitle('Watched Username Changed')
+    .setDescription(`@${change.previousUsername} is now @${change.username}.`)
+    .setTimestamp(new Date());
+  if (change.creatorId) {
+    embed.addFields({ name: 'Creator ID', value: truncateText(change.creatorId, 100), inline: true });
+  }
+  await channel.send({ embeds: [embed] });
+}
+
 export async function buildDeliveryPayload(result, config, requestedDelivery = 'auto', options = {}) {
   const canUpload = shouldUploadToDiscord(result.sizeBytes, config);
   const wantsFile = requestedDelivery === 'file' || (requestedDelivery === 'auto' && canUpload && !result.reused);

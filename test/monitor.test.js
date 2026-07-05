@@ -5,7 +5,10 @@ import {
   TikTokMonitor,
   calculateFailureBackoffMs,
   isVideoNewerThanWatch,
+  nextDeletionCheckDelayMs,
   normalizeWatchedUser,
+  resolveProfileCreatorId,
+  resolveProfileUsername,
   resolveVideoTimestampMs,
 } from '../src/tiktok/monitor.js';
 
@@ -16,6 +19,7 @@ class FakeStore {
     this.seenRecords = [];
     this.successes = [];
     this.failures = [];
+    this.usernameChanges = [];
   }
 
   listWatches() {
@@ -52,6 +56,20 @@ class FakeStore {
       watch.last_error = String(error?.message ?? error);
     }
     this.failures.push({ username, error, nextCheckAt, now });
+  }
+
+  recordWatchIdentity(username, { creatorId = '', currentUsername = '' } = {}, now) {
+    const watch = this.watches.find((entry) => entry.username === username);
+    if (!watch) return { changed: false, username, previousUsername: username, creatorId };
+    if (creatorId) watch.creator_id = creatorId;
+    if (currentUsername && currentUsername.toLowerCase() !== username.toLowerCase()) {
+      watch.username = currentUsername;
+      watch.previous_username = username;
+      watch.username_changed_at = now;
+      this.usernameChanges.push({ username, currentUsername, creatorId, now });
+      return { changed: true, username: currentUsername, previousUsername: username, creatorId };
+    }
+    return { changed: false, username, previousUsername: username, creatorId };
   }
 }
 
@@ -160,6 +178,55 @@ test('timestamp helpers compare videos against watch creation time', () => {
   assert.equal(isVideoNewerThanWatch({ timestamp: 1_700_000_001 }, watch), true);
   assert.equal(isVideoNewerThanWatch({}, watch), true);
   assert.equal(isVideoNewerThanWatch({ timestamp: 1 }, {}), true);
+});
+
+test('profile identity helpers resolve usernames and creator ids', () => {
+  const profile = {
+    metadata: { uploader: 'new.creator', uploader_id: 'stable-123' },
+    entries: [{ uploader: 'fallback' }],
+  };
+  assert.equal(resolveProfileUsername(profile, 'old.creator'), 'new.creator');
+  assert.equal(resolveProfileCreatorId(profile), 'stable-123');
+  assert.equal(nextDeletionCheckDelayMs(0), 60 * 1000);
+  assert.equal(nextDeletionCheckDelayMs(5), 25 * 60 * 1000);
+});
+
+test('runOnce records username changes when profile metadata changes', async () => {
+  const now = 1_700_000_000_000;
+  const changes = [];
+  const store = new FakeStore([
+    {
+      username: 'old.creator',
+      channel_id: 'channel-1',
+      failure_count: 0,
+      next_check_at: null,
+    },
+  ]);
+  const downloader = new FakeDownloader([]);
+  downloader.listProfileVideos = async (profileUrl, options) => {
+    downloader.listCalls.push({ profileUrl, options });
+    return {
+      metadata: { uploader: 'new.creator', uploader_id: 'stable-123' },
+      entries: [],
+    };
+  };
+
+  const monitor = new TikTokMonitor({
+    store,
+    downloader,
+    usernameChangeAlert: async (payload) => changes.push(payload),
+    now: () => now,
+  });
+
+  await monitor.runOnce();
+
+  assert.equal(store.watches[0].username, 'new.creator');
+  assert.equal(store.watches[0].previous_username, 'old.creator');
+  assert.equal(store.watches[0].creator_id, 'stable-123');
+  assert.equal(store.successes[0].username, 'new.creator');
+  assert.equal(changes.length, 1);
+  assert.equal(changes[0].previousUsername, 'old.creator');
+  assert.equal(changes[0].username, 'new.creator');
 });
 
 test('runOnce skips videos older than the watch creation time', async () => {
@@ -288,4 +355,42 @@ test('runOnce backoffs failures and skips watches until due', async () => {
   const second = await monitor.runOnce();
   assert.equal(second.skippedUsers, 1);
   assert.equal(downloader.listCalls.length, 1);
+});
+
+test('runOnce sends deletion alerts for saved posts that disappear', async () => {
+  const now = 1_700_000_000_000;
+  const alerts = [];
+  const dueVideo = {
+    video_id: 'deleted-1',
+    username: 'creator',
+    source_url: 'https://www.tiktok.com/@creator/video/deleted-1',
+    title: 'Deleted video',
+    deletion_check_count: 0,
+    permanent_token: 'tok',
+  };
+  const store = {
+    listWatches: () => [],
+    listVideosDueForDeletionCheck: () => [dueVideo],
+    markVideoDeleted: (videoId, deletedAt) => ({ ...dueVideo, video_id: videoId, deleted_at: deletedAt }),
+  };
+  const downloader = {
+    listProfileVideos: async () => [],
+    download: async () => ({}),
+    checkVideoAvailable: async () => ({ available: false, reason: 'not found' }),
+  };
+
+  const monitor = new TikTokMonitor({
+    store,
+    downloader,
+    deletionAlert: async (payload) => alerts.push(payload),
+    now: () => now,
+  });
+
+  const summary = await monitor.runOnce();
+
+  assert.equal(alerts.length, 1);
+  assert.equal(alerts[0].video.video_id, 'deleted-1');
+  assert.equal(alerts[0].video.deleted_at, now);
+  assert.equal(alerts[0].reason, 'not found');
+  assert.equal(summary.watchedUsers, 0);
 });

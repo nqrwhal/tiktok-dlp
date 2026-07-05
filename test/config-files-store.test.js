@@ -197,12 +197,30 @@ test('expired downloads remove both file records and disk files', async () => {
   }
 });
 
-test('store migrates older databases before creating requester indexes', async () => {
+test('store migrates older databases before creating indexes for new columns', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-migration-'));
   const dbPath = path.join(dir, 'state.db');
   const db = new DatabaseSync(dbPath);
   try {
     db.exec(`
+      CREATE TABLE watched_users (
+        username TEXT PRIMARY KEY,
+        channel_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        last_checked_at INTEGER,
+        last_success_at INTEGER,
+        failure_count INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        next_check_at INTEGER
+      );
+      CREATE TABLE seen_videos (
+        video_id TEXT PRIMARY KEY,
+        username TEXT NOT NULL,
+        source_url TEXT NOT NULL,
+        title TEXT,
+        seen_at INTEGER NOT NULL,
+        alerted_at INTEGER
+      );
       CREATE TABLE jobs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         type TEXT NOT NULL,
@@ -233,8 +251,14 @@ test('store migrates older databases before creating requester indexes', async (
 
   const store = createStore(dbPath);
   try {
+    const watchColumns = store.db.prepare('PRAGMA table_info(watched_users)').all().map((column) => column.name);
+    const seenColumns = store.db.prepare('PRAGMA table_info(seen_videos)').all().map((column) => column.name);
     const jobColumns = store.db.prepare('PRAGMA table_info(jobs)').all().map((column) => column.name);
     const fileColumns = store.db.prepare('PRAGMA table_info(files)').all().map((column) => column.name);
+    const indexes = store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all().map((index) => index.name);
+    assert.ok(watchColumns.includes('creator_id'));
+    assert.ok(seenColumns.includes('next_deletion_check_at'));
+    assert.ok(indexes.includes('idx_seen_videos_next_deletion_check_at'));
     assert.ok(jobColumns.includes('requested_by'));
     assert.ok(fileColumns.includes('requested_by'));
   } finally {
@@ -328,6 +352,73 @@ test('download link listing can include monitored downloads', async () => {
       [],
     );
     assert.equal(store.countDownloadLinksByRequester('user-1', { includeMonitored: true, username: 'openai' }), 2);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('store records watched username changes', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-watch-identity-'));
+  const store = createStore(path.join(dir, 'state.db'));
+  try {
+    store.addWatch('old.creator', 'channel-1', 1000);
+    const change = store.recordWatchIdentity('old.creator', {
+      creatorId: 'stable-123',
+      currentUsername: 'new.creator',
+    }, 2000);
+
+    assert.deepEqual(change, {
+      changed: true,
+      username: 'new.creator',
+      previousUsername: 'old.creator',
+      creatorId: 'stable-123',
+    });
+    assert.equal(store.getWatch('old.creator'), null);
+    assert.equal(store.getWatch('new.creator').previous_username, 'old.creator');
+    assert.equal(store.getWatch('new.creator').creator_id, 'stable-123');
+    assert.equal(store.listWatchUsernameHistory()[0].previous_username, 'old.creator');
+    assert.equal(store.listWatchUsernameHistory()[0].new_username, 'new.creator');
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('store schedules and marks deletion checks for seen videos', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-deletion-checks-'));
+  const store = createStore(path.join(dir, 'state.db'));
+  try {
+    const fileId = store.createFileRecord({
+      videoId: 'v1',
+      username: 'openai',
+      sourceUrl: 'https://www.tiktok.com/@openai/video/v1',
+      filePath: path.join(dir, 'video.mp4'),
+      filename: 'video.mp4',
+      sizeBytes: 123,
+    }, 1000);
+    store.createLinkToken({ token: 'permanent-token', fileId, expiresAt: 0 }, 1000);
+    store.markVideoSeen({
+      videoId: 'v1',
+      username: 'openai',
+      sourceUrl: 'https://www.tiktok.com/@openai/video/v1',
+      title: 'title',
+      alertedAt: 1000,
+    }, 1000);
+    store.scheduleVideoDeletionCheck('v1', 2000);
+
+    assert.equal(store.listVideosDueForDeletionCheck(1999).length, 0);
+    const due = store.listVideosDueForDeletionCheck(2000);
+    assert.equal(due.length, 1);
+    assert.equal(due[0].permanent_token, 'permanent-token');
+
+    store.markVideoStillAvailable('v1', 3000, 2000);
+    assert.equal(store.listVideosDueForDeletionCheck(2000).length, 0);
+    assert.equal(store.listVideosDueForDeletionCheck(3000)[0].deletion_check_count, 1);
+
+    const deleted = store.markVideoDeleted('v1', 4000);
+    assert.equal(deleted.deleted_at, 4000);
+    assert.equal(store.listVideosDueForDeletionCheck(9999).length, 0);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });

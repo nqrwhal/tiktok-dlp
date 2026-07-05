@@ -2,7 +2,7 @@ import path from 'node:path';
 import { loadConfig, loadEnvFile, ensureRuntimeDirs, validateRuntimeConfig } from './config.js';
 import { createStore } from './state/store.js';
 import { startHttpServer } from './http/server.js';
-import { startDiscordBot, sendVideoAlert } from './discord/client.js';
+import { startDiscordBot, sendDeletionAlert, sendUsernameChangeAlert, sendVideoAlert } from './discord/client.js';
 import { registerCommands } from './discord/register-commands.js';
 import { TikTokMonitor } from './tiktok/monitor.js';
 import { downloadVideo, fetchVideoMetadata } from './tiktok/ytdlp.js';
@@ -165,6 +165,21 @@ function downloadLinkTtlMs() {
   return config.downloadLinkTtlMinutes * 60 * 1000;
 }
 
+async function checkVideoAvailable(video) {
+  const sourceUrl = video?.source_url || video?.sourceUrl || video?.url || video?.webpage_url || '';
+  if (!sourceUrl) return { available: false, reason: 'The original post URL is missing.' };
+  try {
+    await fetchVideoMetadata(sourceUrl, config);
+    return { available: true };
+  } catch (error) {
+    const kind = String(error?.kind ?? '');
+    if (['access_denied', 'invalid_url', 'no_formats', 'not_found'].includes(kind)) {
+      return { available: false, reason: error.message ?? String(error) };
+    }
+    throw error;
+  }
+}
+
 const monitor = new TikTokMonitor({
   config,
   store,
@@ -178,10 +193,20 @@ const monitor = new TikTokMonitor({
       username: options.username || video.username,
       permanent: true,
     }),
+    checkVideoAvailable,
   },
   alert: async ({ result, video, watch }) => {
     if (!discordClient) return;
     await sendVideoAlert({ client: discordClient, config, store, result, video, watch });
+  },
+  deletionAlert: async ({ video, reason }) => {
+    if (!discordClient) return;
+    const watch = store.getWatch(video?.username ?? '') ?? null;
+    await sendDeletionAlert({ client: discordClient, config, video, watch, reason });
+  },
+  usernameChangeAlert: async (change) => {
+    if (!discordClient) return;
+    await sendUsernameChangeAlert({ client: discordClient, config, change, watch: change.watch });
   },
 });
 
