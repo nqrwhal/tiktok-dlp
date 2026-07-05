@@ -67,7 +67,7 @@ const statusCommand = new SlashCommandBuilder()
 
 const historyCommand = new SlashCommandBuilder()
   .setName('history')
-  .setDescription('Show recent download history.');
+  .setDescription('Show recent generated download links.');
 
 const downloadsCommand = new SlashCommandBuilder()
   .setName('downloads')
@@ -75,7 +75,7 @@ const downloadsCommand = new SlashCommandBuilder()
   .addSubcommand((subcommand) =>
     subcommand
       .setName('list')
-      .setDescription('List your active download links.')
+      .setDescription('List your saved permanent downloads.')
       .addIntegerOption((option) =>
         option
           .setName('limit')

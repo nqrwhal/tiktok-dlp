@@ -189,6 +189,20 @@ export class Store {
     `).run(token, fileId, expiresAt, now);
   }
 
+  buildRequesterClause(includeMonitored) {
+    return includeMonitored
+      ? `(
+          files.requested_by = ?
+          OR EXISTS (
+            SELECT 1
+            FROM jobs
+            WHERE jobs.file_id = files.id
+              AND jobs.type = 'monitor'
+          )
+        )`
+      : 'files.requested_by = ?';
+  }
+
   getToken(token) {
     return this.db.prepare(`
       SELECT link_tokens.token, link_tokens.expires_at, link_tokens.created_at AS token_created_at, files.*
@@ -257,18 +271,7 @@ export class Store {
   }
 
   listDownloadLinksByRequester(requestedBy, { limit = 25, offset = 0, activeOnly = true, includeMonitored = false, username = '', now = Date.now() } = {}) {
-    const ownerClause = includeMonitored
-      ? `(
-          files.requested_by = ?
-          OR EXISTS (
-            SELECT 1
-            FROM jobs
-            WHERE jobs.file_id = files.id
-              AND jobs.type = 'monitor'
-          )
-        )`
-      : 'files.requested_by = ?';
-    const clauses = [ownerClause];
+    const clauses = [this.buildRequesterClause(includeMonitored)];
     const params = [String(requestedBy ?? '')];
     if (activeOnly) {
       clauses.push('(link_tokens.expires_at = 0 OR link_tokens.expires_at > ?)');
@@ -295,7 +298,7 @@ export class Store {
           SELECT jobs.title
           FROM jobs
           WHERE jobs.file_id = files.id
-          ORDER BY jobs.created_at DESC
+          ORDER BY jobs.created_at DESC, jobs.id DESC
           LIMIT 1
         ) AS title
       FROM link_tokens
@@ -311,18 +314,7 @@ export class Store {
   }
 
   countDownloadLinksByRequester(requestedBy, { activeOnly = true, includeMonitored = false, username = '', now = Date.now() } = {}) {
-    const ownerClause = includeMonitored
-      ? `(
-          files.requested_by = ?
-          OR EXISTS (
-            SELECT 1
-            FROM jobs
-            WHERE jobs.file_id = files.id
-              AND jobs.type = 'monitor'
-          )
-        )`
-      : 'files.requested_by = ?';
-    const clauses = [ownerClause];
+    const clauses = [this.buildRequesterClause(includeMonitored)];
     const params = [String(requestedBy ?? '')];
     if (activeOnly) {
       clauses.push('(link_tokens.expires_at = 0 OR link_tokens.expires_at > ?)');
@@ -339,6 +331,145 @@ export class Store {
       WHERE ${clauses.join('\n        AND ')}
     `;
     return this.db.prepare(sql).get(...params).count;
+  }
+
+  listPermanentDownloadsByRequester(requestedBy, { limit = 25, offset = 0, includeMonitored = false, username = '' } = {}) {
+    const clauses = [this.buildRequesterClause(includeMonitored), 'link_tokens.expires_at = 0'];
+    const params = [String(requestedBy ?? '')];
+    if (username) {
+      clauses.push('lower(files.username) = lower(?)');
+      params.push(String(username));
+    }
+    const sql = `
+      WITH ranked_links AS (
+        SELECT
+          link_tokens.token,
+          link_tokens.expires_at,
+          link_tokens.created_at AS token_created_at,
+          files.id AS file_id,
+          files.video_id,
+          files.username,
+          files.source_url,
+          files.requested_by,
+          files.filename,
+          files.size_bytes,
+          files.created_at AS file_created_at,
+          (
+            SELECT jobs.title
+            FROM jobs
+            WHERE jobs.file_id = files.id
+            ORDER BY jobs.created_at DESC, jobs.id DESC
+            LIMIT 1
+          ) AS title,
+          ROW_NUMBER() OVER (
+            PARTITION BY files.id
+            ORDER BY link_tokens.created_at DESC, link_tokens.token DESC
+          ) AS row_number
+        FROM link_tokens
+        JOIN files ON files.id = link_tokens.file_id
+        WHERE ${clauses.join('\n          AND ')}
+      )
+      SELECT
+        token,
+        expires_at,
+        token_created_at,
+        file_id,
+        video_id,
+        username,
+        source_url,
+        requested_by,
+        filename,
+        size_bytes,
+        file_created_at,
+        title
+      FROM ranked_links
+      WHERE row_number = 1
+      ORDER BY token_created_at DESC, file_id DESC
+      LIMIT ?
+      OFFSET ?
+    `;
+    params.push(Math.max(1, Math.min(50, Number(limit) || 25)));
+    params.push(Math.max(0, Number(offset) || 0));
+    return this.db.prepare(sql).all(...params);
+  }
+
+  countPermanentDownloadsByRequester(requestedBy, { includeMonitored = false, username = '' } = {}) {
+    const clauses = [this.buildRequesterClause(includeMonitored), 'link_tokens.expires_at = 0'];
+    const params = [String(requestedBy ?? '')];
+    if (username) {
+      clauses.push('lower(files.username) = lower(?)');
+      params.push(String(username));
+    }
+    const sql = `
+      WITH ranked_links AS (
+        SELECT
+          files.id AS file_id,
+          ROW_NUMBER() OVER (
+            PARTITION BY files.id
+            ORDER BY link_tokens.created_at DESC, link_tokens.token DESC
+          ) AS row_number
+        FROM link_tokens
+        JOIN files ON files.id = link_tokens.file_id
+        WHERE ${clauses.join('\n          AND ')}
+      )
+      SELECT COUNT(*) AS count
+      FROM ranked_links
+      WHERE row_number = 1
+    `;
+    return this.db.prepare(sql).get(...params).count;
+  }
+
+  listLinkHistoryByRequester(requestedBy, { limit = 10, offset = 0, includeMonitored = false, username = '' } = {}) {
+    const clauses = [this.buildRequesterClause(includeMonitored)];
+    const params = [String(requestedBy ?? '')];
+    if (username) {
+      clauses.push('lower(files.username) = lower(?)');
+      params.push(String(username));
+    }
+    const sql = `
+      SELECT
+        link_tokens.token,
+        link_tokens.expires_at,
+        link_tokens.created_at AS token_created_at,
+        files.id AS file_id,
+        files.video_id,
+        files.username,
+        files.source_url,
+        files.requested_by,
+        files.filename,
+        files.size_bytes,
+        files.created_at AS file_created_at,
+        (
+          SELECT jobs.title
+          FROM jobs
+          WHERE jobs.file_id = files.id
+          ORDER BY jobs.created_at DESC, jobs.id DESC
+          LIMIT 1
+        ) AS title,
+        (
+          SELECT jobs.status
+          FROM jobs
+          WHERE jobs.file_id = files.id
+          ORDER BY jobs.created_at DESC, jobs.id DESC
+          LIMIT 1
+        ) AS job_status,
+        (
+          SELECT jobs.error
+          FROM jobs
+          WHERE jobs.file_id = files.id
+          ORDER BY jobs.created_at DESC, jobs.id DESC
+          LIMIT 1
+        ) AS job_error
+      FROM link_tokens
+      JOIN files ON files.id = link_tokens.file_id
+      WHERE ${clauses.join('\n        AND ')}
+      ORDER BY link_tokens.created_at DESC, link_tokens.token DESC
+      LIMIT ?
+      OFFSET ?
+    `;
+    params.push(Math.max(1, Math.min(50, Number(limit) || 10)));
+    params.push(Math.max(0, Number(offset) || 0));
+    return this.db.prepare(sql).all(...params);
   }
 
   listFilesForPurge({ requestedBy = '' } = {}) {

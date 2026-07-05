@@ -77,7 +77,7 @@ async function downloadOne(sourceUrl, { delivery = 'auto', type = 'manual', user
       sizeBytes,
     });
     const token = randomToken();
-    const expiresAt = Date.now() + config.downloadLinkTtlHours * 60 * 60 * 1000;
+    const expiresAt = Date.now() + downloadLinkTtlMs();
     store.createLinkToken({ token, fileId, expiresAt });
 
     const result = {
@@ -128,7 +128,7 @@ async function findReusableDownload(metadata) {
 
 function createDownloadResultFromFile({ metadata, sourceUrl, delivery, jobId, fileRecord, username = '' }) {
   const token = randomToken();
-  const expiresAt = Date.now() + config.downloadLinkTtlHours * 60 * 60 * 1000;
+  const expiresAt = Date.now() + downloadLinkTtlMs();
   store.createLinkToken({ token, fileId: fileRecord.id, expiresAt });
 
   return {
@@ -150,6 +150,10 @@ function createDownloadResultFromFile({ metadata, sourceUrl, delivery, jobId, fi
     delivery,
     reused: true,
   };
+}
+
+function downloadLinkTtlMs() {
+  return config.downloadLinkTtlMinutes * 60 * 1000;
 }
 
 const monitor = new TikTokMonitor({
