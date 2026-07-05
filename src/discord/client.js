@@ -366,12 +366,20 @@ export async function buildDeliveryPayload(result, config, requestedDelivery = '
   const wantsFile = requestedDelivery === 'file' || (requestedDelivery === 'auto' && canUpload && !result.reused);
   const embed = buildVideoEmbed(result, options.video);
   const contentPrefix = options.contentPrefix ?? '';
+  const linkPermanent = Boolean(result.linkPermanent);
+  const readyText = result.reused ? 'Download ready (cache hit).' : 'Download ready.';
+  const readyLinkText = result.reused ? 'Download ready (cache hit)' : 'Download ready';
 
   if (wantsFile && canUpload) {
     const attachment = new AttachmentBuilder(result.filePath, { name: result.filename || path.basename(result.filePath) });
     const link = result.publicUrl || (result.token ? makePublicFileUrl(config, result.token) : '');
+    const serverCopy = link
+      ? linkPermanent
+        ? `\nPermanent server copy: ${link}`
+        : `\nServer copy expires in ${formatTtlLong(config)}: ${link}`
+      : '';
     return {
-      content: `${contentPrefix}${options.alert ? `New TikTok ${mediaLabel(result)} downloaded.` : 'Download ready.'}${link ? `\nServer copy expires in ${formatTtlLong(config)}: ${link}` : ''}`.trim(),
+      content: `${contentPrefix}${options.alert ? alertReadyText(result) : readyText}${serverCopy}`.trim(),
       embeds: [embed],
       files: [attachment],
       components: buildLinkManagementRows(result.token, config),
@@ -393,8 +401,11 @@ export async function buildDeliveryPayload(result, config, requestedDelivery = '
   }
 
   const link = result.publicUrl || (result.token ? makePublicFileUrl(config, result.token) : '');
+  const retention = linkPermanent
+    ? 'This server copy is permanent.'
+    : `Temporary links expire after ${formatTtlLong(config)}. Use the buttons below to save or renew the server copy.`;
   return {
-    content: `${contentPrefix}${link ? `Download ready: ${link}` : 'Download ready, but PUBLIC_BASE_URL is not configured for links.'}\nTemporary links expire after ${formatTtlLong(config)}. Use the buttons below to save or renew the server copy.`.trim(),
+    content: `${contentPrefix}${link ? `${readyLinkText}: ${link}` : `${readyText} PUBLIC_BASE_URL is not configured for links.`}\n${retention}`.trim(),
     embeds: [embed],
     components: buildLinkManagementRows(result.token, config),
   };
@@ -727,6 +738,12 @@ function mediaLabel(result) {
   return result?.mediaType === 'slideshow' ? 'slideshow' : 'post';
 }
 
+function alertReadyText(result) {
+  return result.reused
+    ? `New TikTok ${mediaLabel(result)} delivered from cache.`
+    : `New TikTok ${mediaLabel(result)} downloaded.`;
+}
+
 function downloadLinkTtlMs(config = {}) {
   return ttlMinutes(config) * 60 * 1000;
 }
@@ -754,7 +771,5 @@ function formatTtlLong(config = {}) {
 function ttlMinutes(config = {}) {
   const minutes = Number(config.downloadLinkTtlMinutes);
   if (Number.isFinite(minutes) && minutes > 0) return Math.round(minutes);
-  const hours = Number(config.downloadLinkTtlHours);
-  if (Number.isFinite(hours) && hours > 0) return Math.round(hours * 60);
   return 30;
 }

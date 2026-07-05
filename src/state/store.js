@@ -240,6 +240,30 @@ export class Store {
     return result.changes > 0 ? this.getToken(token) : null;
   }
 
+  setMonitorLinkTokensPermanent() {
+    return this.db.prepare(`
+      UPDATE link_tokens
+      SET expires_at = 0
+      WHERE expires_at <> 0
+        AND EXISTS (
+          SELECT 1
+          FROM jobs
+          WHERE jobs.file_id = link_tokens.file_id
+            AND jobs.type = 'monitor'
+        )
+    `).run().changes;
+  }
+
+  capTemporaryLinkTokenTtl(ttlMs) {
+    const ttl = Math.max(1, Number(ttlMs) || 1);
+    return this.db.prepare(`
+      UPDATE link_tokens
+      SET expires_at = created_at + ?
+      WHERE expires_at <> 0
+        AND expires_at > created_at + ?
+    `).run(ttl, ttl).changes;
+  }
+
   deleteExpiredTokens(now = Date.now()) {
     return this.db.prepare('DELETE FROM link_tokens WHERE expires_at > 0 AND expires_at <= ?').run(now).changes;
   }

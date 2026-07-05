@@ -16,6 +16,8 @@ validateRuntimeConfig(config);
 await ensureRuntimeDirs(config);
 
 const store = createStore(config.stateDbPath);
+store.setMonitorLinkTokensPermanent();
+store.capTemporaryLinkTokenTtl(downloadLinkTtlMs());
 let discordClient = null;
 const cleanupTimer = setInterval(() => {
   cleanupExpiredDownloads({ config, store }).catch((error) => {
@@ -27,28 +29,33 @@ cleanupExpiredDownloads({ config, store }).catch((error) => {
   console.error('[cleanup] Initial expired download cleanup failed:', error);
 });
 
-async function downloadOne(sourceUrl, { delivery = 'auto', type = 'manual', username = '', requestedBy = '' } = {}) {
+async function downloadOne(sourceUrl, { delivery = 'auto', type = 'manual', username = '', requestedBy = '', permanent = type === 'monitor' } = {}) {
   const metadata = await fetchVideoMetadata(sourceUrl, config);
+  const resolvedUsername = username || metadata.uploader || metadata.channel || '';
+  const downloadMetadata = resolvedUsername
+    ? { ...metadata, uploader: resolvedUsername, username: resolvedUsername }
+    : metadata;
   const jobId = store.createJob({
     type,
     status: 'downloading',
     requestedBy,
-    username: username || metadata.uploader || metadata.channel || '',
+    username: resolvedUsername,
     sourceUrl,
-    videoId: metadata.id || '',
-    title: metadata.title || '',
+    videoId: downloadMetadata.id || '',
+    title: downloadMetadata.title || '',
   });
 
   try {
-    const existing = await findReusableDownload(metadata);
+    const existing = await findReusableDownload(downloadMetadata);
     if (existing) {
       const result = createDownloadResultFromFile({
-        metadata,
+        metadata: downloadMetadata,
         sourceUrl,
         delivery,
         jobId,
         fileRecord: existing,
-        username,
+        username: resolvedUsername,
+        permanent,
       });
       store.updateJob(jobId, {
         status: 'complete',
@@ -62,14 +69,14 @@ async function downloadOne(sourceUrl, { delivery = 'auto', type = 'manual', user
 
     const downloaded = await downloadVideo(sourceUrl, {
       ...config,
-      metadata,
+      metadata: downloadMetadata,
       downloadDir: config.downloadDir,
     });
     const sizeBytes = downloaded.sizeBytes ?? await fileSize(downloaded.filePath);
     const filename = downloaded.filename || path.basename(downloaded.filePath);
     const fileId = store.createFileRecord({
-      videoId: metadata.id || downloaded.videoId || '',
-      username: username || downloaded.username || metadata.uploader || '',
+      videoId: downloadMetadata.id || downloaded.videoId || '',
+      username: resolvedUsername || downloaded.username || '',
       requestedBy,
       sourceUrl,
       filePath: downloaded.filePath,
@@ -77,12 +84,12 @@ async function downloadOne(sourceUrl, { delivery = 'auto', type = 'manual', user
       sizeBytes,
     });
     const token = randomToken();
-    const expiresAt = Date.now() + downloadLinkTtlMs();
+    const expiresAt = permanent ? 0 : Date.now() + downloadLinkTtlMs();
     store.createLinkToken({ token, fileId, expiresAt });
 
     const result = {
       ...downloaded,
-      ...metadata,
+      ...downloadMetadata,
       jobId,
       fileId,
       token,
@@ -91,12 +98,13 @@ async function downloadOne(sourceUrl, { delivery = 'auto', type = 'manual', user
       filePath: downloaded.filePath,
       filename,
       sizeBytes,
-      videoId: metadata.id || downloaded.videoId || '',
-      username: username || downloaded.username || metadata.uploader || metadata.channel || '',
-      title: metadata.title || downloaded.title || '',
-      description: metadata.description || '',
-      thumbnailUrl: metadata.thumbnail || downloaded.thumbnailUrl || '',
+      videoId: downloadMetadata.id || downloaded.videoId || '',
+      username: resolvedUsername || downloaded.username || '',
+      title: downloadMetadata.title || downloaded.title || '',
+      description: downloadMetadata.description || '',
+      thumbnailUrl: downloadMetadata.thumbnail || downloaded.thumbnailUrl || '',
       delivery,
+      linkPermanent: expiresAt === 0,
     };
 
     store.updateJob(jobId, {
@@ -126,9 +134,9 @@ async function findReusableDownload(metadata) {
   }
 }
 
-function createDownloadResultFromFile({ metadata, sourceUrl, delivery, jobId, fileRecord, username = '' }) {
+function createDownloadResultFromFile({ metadata, sourceUrl, delivery, jobId, fileRecord, username = '', permanent = false }) {
   const token = randomToken();
-  const expiresAt = Date.now() + downloadLinkTtlMs();
+  const expiresAt = permanent ? 0 : Date.now() + downloadLinkTtlMs();
   store.createLinkToken({ token, fileId: fileRecord.id, expiresAt });
 
   return {
@@ -149,6 +157,7 @@ function createDownloadResultFromFile({ metadata, sourceUrl, delivery, jobId, fi
     thumbnailUrl: metadata.thumbnail || '',
     delivery,
     reused: true,
+    linkPermanent: expiresAt === 0,
   };
 }
 
@@ -164,9 +173,10 @@ const monitor = new TikTokMonitor({
       const { listProfileVideos } = await import('./tiktok/ytdlp.js');
       return listProfileVideos(username, config);
     },
-    downloadVideo: async (video) => downloadOne(video.url || video.webpage_url || video.sourceUrl, {
+    downloadVideo: async (video, options = {}) => downloadOne(video.url || video.webpage_url || video.sourceUrl || options.sourceUrl, {
       type: 'monitor',
-      username: video.username,
+      username: options.username || video.username,
+      permanent: true,
     }),
   },
   alert: async ({ result, video, watch }) => {
