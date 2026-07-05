@@ -38,6 +38,11 @@ export function loadConfig(env = process.env, cwd = process.cwd()) {
   const publicBaseUrl = String(env.PUBLIC_BASE_URL ?? 'https://example.com').replace(/\/+$/, '');
   const uploadLimitMb = parsePositiveInt(env.DISCORD_UPLOAD_LIMIT_MB, 10);
   const httpPort = parsePositiveInt(env.HTTP_PORT, 8080);
+  const legacyTtlHours = env.DOWNLOAD_LINK_TTL_HOURS == null
+    ? 0
+    : parsePositiveInt(env.DOWNLOAD_LINK_TTL_HOURS, 0);
+  const legacyTtlMinutes = legacyTtlHours > 0 ? legacyTtlHours * 60 : null;
+  const downloadLinkTtlMinutes = parsePositiveInt(env.DOWNLOAD_LINK_TTL_MINUTES, legacyTtlMinutes ?? 30);
 
   return {
     discordToken: env.DISCORD_TOKEN ?? '',
@@ -52,7 +57,8 @@ export function loadConfig(env = process.env, cwd = process.cwd()) {
     pollIntervalSeconds: parsePositiveInt(env.POLL_INTERVAL_SECONDS, 300),
     profileScanLimit: parsePositiveInt(env.PROFILE_SCAN_LIMIT, 20),
     discordUploadLimitBytes: uploadLimitMb * 1024 * 1024,
-    downloadLinkTtlHours: parsePositiveInt(env.DOWNLOAD_LINK_TTL_HOURS, 360),
+    downloadLinkTtlMinutes,
+    downloadLinkTtlHours: Math.max(1, Math.ceil(downloadLinkTtlMinutes / 60)),
     retentionDays: parsePositiveInt(env.RETENTION_DAYS, 30),
     maxConcurrentDownloads: parsePositiveInt(env.MAX_CONCURRENT_DOWNLOADS, 1),
     pingMode: String(env.PING_MODE ?? 'none').toLowerCase(),

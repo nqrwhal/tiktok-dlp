@@ -12,10 +12,19 @@ import {
 import path from 'node:path';
 import { removeStoredFiles } from '../cleanup/downloads.js';
 import { extractTikTokUrls, normalizeUsername, shouldUploadToDiscord, makePublicFileUrl, randomToken } from '../util/files.js';
+import {
+  UI_COLORS,
+  buildErrorPayload,
+  buildNoticePayload,
+  formatBytes,
+  formatDate,
+  formatExpiry,
+  formatLinkState,
+  truncateText,
+} from './ui.js';
 
 const LINK_BUTTON_PREFIX = 'link:';
 const DOWNLOADS_BUTTON_PREFIX = 'downloads:list:';
-const FIFTEEN_DAYS_MS = 15 * 24 * 60 * 60 * 1000;
 
 export async function startDiscordBot({ config, store, monitor, downloadOne, registerCommands }) {
   if (config.registerCommandsOnStart) {
@@ -45,7 +54,7 @@ export async function startDiscordBot({ config, store, monitor, downloadOne, reg
           await interaction.reply(buildNoticePayload({
             title: 'Unknown Button',
             description: 'Unknown button action.',
-            color: 0xef4444,
+            color: UI_COLORS.error,
           }));
         }
         return;
@@ -55,11 +64,14 @@ export async function startDiscordBot({ config, store, monitor, downloadOne, reg
       await handleInteraction({ interaction, config, store, monitor, downloadOne });
     } catch (error) {
       console.error('[discord] Interaction failed:', error);
-      const message = `Something went wrong: ${error.message ?? error}`;
+      const payload = buildErrorPayload({
+        description: `Something went wrong: ${error.message ?? error}`,
+      });
       if (interaction.deferred || interaction.replied) {
-        await interaction.editReply({ content: message }).catch(() => {});
+        delete payload.ephemeral;
+        await interaction.editReply(payload).catch(() => {});
       } else {
-        await interaction.reply({ content: message, ephemeral: true }).catch(() => {});
+        await interaction.reply(payload).catch(() => {});
       }
     }
   });
@@ -69,7 +81,10 @@ export async function startDiscordBot({ config, store, monitor, downloadOne, reg
       await handleMessageCreate({ message, config, downloadOne });
     } catch (error) {
       console.error('[discord] Message handling failed:', error);
-      await message.reply(`Something went wrong: ${error.message ?? error}`).catch(() => {});
+      await message.reply(buildErrorPayload({
+        description: `Something went wrong: ${error.message ?? error}`,
+        ephemeral: false,
+      })).catch(() => {});
     }
   });
 
@@ -141,10 +156,14 @@ export async function handleInteraction({ interaction, config, store, monitor, d
   }
 
   if (command === 'history') {
-    await interaction.reply(buildNoticePayload({
-      title: 'Download History',
-      description: formatHistory(store.listJobs(10)),
-    }));
+    const history = store.listLinkHistoryByRequester(interaction.user?.id ?? '', {
+      limit: 10,
+      includeMonitored: true,
+    });
+    await interaction.reply({
+      embeds: [buildLinkHistoryEmbed(history, { config })],
+      ephemeral: true,
+    });
     return;
   }
 
@@ -164,11 +183,14 @@ export async function handleMessageCreate({ message, config, downloadOne }) {
   const urls = extractTikTokUrls(message.content, 3);
   if (!urls.length) return false;
 
-  const status = await message.reply(
-    urls.length === 1
+  const status = await message.reply(buildNoticePayload({
+    title: 'Downloading',
+    description: urls.length === 1
       ? 'Downloading TikTok link...'
       : `Downloading ${urls.length} TikTok links...`,
-  );
+    color: UI_COLORS.warning,
+    ephemeral: false,
+  }));
 
   for (const [index, url] of urls.entries()) {
     try {
@@ -182,15 +204,24 @@ export async function handleMessageCreate({ message, config, downloadOne }) {
       if (urls.length === 1) {
         await status.edit(payload);
       } else {
-        await status.edit(`Downloaded ${index + 1}/${urls.length} TikTok links.`);
+        await status.edit(buildNoticePayload({
+          title: 'Downloading',
+          description: `Downloaded ${index + 1}/${urls.length} TikTok links.`,
+          color: UI_COLORS.warning,
+          ephemeral: false,
+        }));
         await message.reply(payload);
       }
     } catch (error) {
-      const content = `Could not download ${url}: ${error.message ?? error}`;
+      const payload = buildErrorPayload({
+        title: 'Download Failed',
+        description: `Could not download ${url}: ${error.message ?? error}`,
+        ephemeral: false,
+      });
       if (urls.length === 1) {
-        await status.edit({ content, embeds: [], components: [], files: [] });
+        await status.edit({ ...payload, components: [], files: [] });
       } else {
-        await message.reply(content);
+        await message.reply(payload);
       }
     }
   }
@@ -227,18 +258,22 @@ export function shouldShowHelp(message) {
 }
 
 export function buildHelpMessage() {
-  return [
-    'Post a TikTok URL in any channel I can read, or DM it to me, and I will download it.',
-    '',
-    'Slash commands:',
-    '`/download url:<tiktok-url> delivery:auto|file|link`',
-    '`/downloads list`',
-    '`/downloads purge scope:mine confirm:PURGE`',
-    '`/watch add|remove|list|run`',
-    '`/status` and `/history`',
-    '',
-    'Help keywords: `tiktok help`, `!tiktok help`, or DM me `help`.',
-  ].join('\n');
+  return buildNoticePayload({
+    title: 'TikTok Downloader Help',
+    description: [
+      'Post a TikTok URL in any channel I can read, or DM it to me, and I will download it.',
+      '',
+      'Slash commands:',
+      '`/download url:<tiktok-url> delivery:auto|file|link`',
+      '`/downloads list`',
+      '`/downloads purge scope:mine confirm:PURGE`',
+      '`/watch add|remove|list|run`',
+      '`/status` and `/history`',
+      '',
+      'Help keywords: `tiktok help`, `!tiktok help`, or DM me `help`.',
+    ].join('\n'),
+    ephemeral: false,
+  });
 }
 
 export async function handleDownloadsInteraction({ interaction, config, store }) {
@@ -276,7 +311,7 @@ export async function handleDownloadsInteraction({ interaction, config, store })
       await interaction.reply(buildNoticePayload({
         title: 'Permission Required',
         description: 'Only members with Manage Server can purge all downloads.',
-        color: 0xef4444,
+        color: UI_COLORS.error,
       }));
       return;
     }
@@ -336,25 +371,32 @@ export async function buildDeliveryPayload(result, config, requestedDelivery = '
     const attachment = new AttachmentBuilder(result.filePath, { name: result.filename || path.basename(result.filePath) });
     const link = result.publicUrl || (result.token ? makePublicFileUrl(config, result.token) : '');
     return {
-      content: `${contentPrefix}${options.alert ? `New TikTok ${mediaLabel(result)} downloaded.` : 'Download ready.'}${link ? `\n15-day server copy: ${link}` : ''}`.trim(),
+      content: `${contentPrefix}${options.alert ? `New TikTok ${mediaLabel(result)} downloaded.` : 'Download ready.'}${link ? `\nServer copy expires in ${formatTtlLong(config)}: ${link}` : ''}`.trim(),
       embeds: [embed],
       files: [attachment],
-      components: buildLinkManagementRows(result.token),
+      components: buildLinkManagementRows(result.token, config),
     };
   }
 
   if (requestedDelivery === 'file' && !canUpload) {
     return {
-      content: `File is too large for Discord upload (${formatBytes(result.sizeBytes)}). Use delivery:link or auto.`,
-      embeds: [embed],
+      embeds: [
+        embed,
+        buildNoticePayload({
+          title: 'File Too Large',
+          description: `File is too large for Discord upload (${formatBytes(result.sizeBytes)}). Use delivery:link or auto.`,
+          color: UI_COLORS.warning,
+          ephemeral: false,
+        }).embeds[0],
+      ],
     };
   }
 
   const link = result.publicUrl || (result.token ? makePublicFileUrl(config, result.token) : '');
   return {
-    content: `${contentPrefix}${link ? `Download ready: ${link}` : 'Download ready, but PUBLIC_BASE_URL is not configured for links.'}\nKeep the link longer? Use the buttons below.`.trim(),
+    content: `${contentPrefix}${link ? `Download ready: ${link}` : 'Download ready, but PUBLIC_BASE_URL is not configured for links.'}\nTemporary links expire after ${formatTtlLong(config)}. Use the buttons below to save or renew the server copy.`.trim(),
     embeds: [embed],
-    components: buildLinkManagementRows(result.token),
+    components: buildLinkManagementRows(result.token, config),
   };
 }
 
@@ -367,7 +409,7 @@ export async function handleLinkButton({ interaction, config, store }) {
     await interaction.reply(buildNoticePayload({
       title: 'Missing Token',
       description: 'That link action is missing its token.',
-      color: 0xef4444,
+      color: UI_COLORS.error,
     }));
     return true;
   }
@@ -377,29 +419,29 @@ export async function handleLinkButton({ interaction, config, store }) {
     await interaction.reply(buildNoticePayload({
       title: 'Download Not Found',
       description: 'I cannot find that download anymore.',
-      color: 0xef4444,
+      color: UI_COLORS.error,
     }));
     return true;
   }
 
   if (action === 'new') {
     const newToken = randomToken();
-    const expiresAt = Date.now() + FIFTEEN_DAYS_MS;
+    const expiresAt = Date.now() + downloadLinkTtlMs(config);
     store.createLinkToken({ token: newToken, fileId: record.id, expiresAt });
     await interaction.reply(buildNoticePayload({
-      title: 'New 15-Day Link',
+      title: `New ${formatTtlLong(config)} Link`,
       description: makePublicFileUrl(config, newToken),
     }));
     return true;
   }
 
   if (action === 'extend') {
-    const updated = store.extendLinkToken(token, FIFTEEN_DAYS_MS);
+    const updated = store.extendLinkToken(token, downloadLinkTtlMs(config));
     await interaction.reply(buildNoticePayload({
       title: updated?.expires_at === 0 ? 'Permanent Link' : 'Link Extended',
       description: updated?.expires_at === 0
         ? `This link is already permanent: ${makePublicFileUrl(config, token)}`
-        : `Extended by 15 days. New expiry: ${formatExpiry(updated?.expires_at)}\n${makePublicFileUrl(config, token)}`,
+        : `Extended by ${formatTtlLong(config)}. New expiry: ${formatExpiry(updated?.expires_at)}\n${makePublicFileUrl(config, token)}`,
     }));
     return true;
   }
@@ -416,7 +458,7 @@ export async function handleLinkButton({ interaction, config, store }) {
   await interaction.reply(buildNoticePayload({
     title: 'Unknown Action',
     description: 'Unknown link action.',
-    color: 0xef4444,
+    color: UI_COLORS.error,
   }));
   return true;
 }
@@ -427,7 +469,7 @@ async function handleDownloadsListButton({ interaction, config, store }) {
     await interaction.reply(buildNoticePayload({
       title: 'Invalid List Action',
       description: 'That downloads list action is invalid.',
-      color: 0xef4444,
+      color: UI_COLORS.error,
     }));
     return true;
   }
@@ -436,7 +478,7 @@ async function handleDownloadsListButton({ interaction, config, store }) {
     await interaction.reply(buildNoticePayload({
       title: 'Not Your List',
       description: 'Only the user who opened this list can page through it.',
-      color: 0xef4444,
+      color: UI_COLORS.error,
     }));
     return true;
   }
@@ -454,18 +496,17 @@ async function handleDownloadsListButton({ interaction, config, store }) {
   return true;
 }
 
-function buildDownloadsListPayload({ config, store, userId, limit = 10, page = 0, username = '' }) {
+export function buildDownloadsListPayload({ config, store, userId, limit = 10, page = 0, username = '' }) {
   const pageSize = Math.max(1, Math.min(25, Number(limit) || 10));
   const currentPage = Math.max(0, Number(page) || 0);
   const listOptions = {
     limit: pageSize,
     offset: currentPage * pageSize,
-    activeOnly: true,
     includeMonitored: true,
     username,
   };
-  const links = store.listDownloadLinksByRequester(userId, listOptions);
-  const total = store.countDownloadLinksByRequester(userId, listOptions);
+  const links = store.listPermanentDownloadsByRequester(userId, listOptions);
+  const total = store.countPermanentDownloadsByRequester(userId, listOptions);
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
   const clampedPage = Math.min(currentPage, pageCount - 1);
 
@@ -492,31 +533,17 @@ function buildDownloadsListPayload({ config, store, userId, limit = 10, page = 0
   };
 }
 
-function buildNoticePayload({ title, description, color = 0x00f2ea, ephemeral = true }) {
-  const payload = {
-    embeds: [
-      new EmbedBuilder()
-        .setColor(color)
-        .setTitle(truncateText(title, 256))
-        .setDescription(truncateText(description, 4000))
-        .setTimestamp(new Date()),
-    ],
-  };
-  if (ephemeral) payload.ephemeral = true;
-  return payload;
-}
-
-function buildLinkManagementRows(token) {
+function buildLinkManagementRows(token, config = {}) {
   if (!token) return [];
   return [
     new ActionRowBuilder().addComponents(
       new ButtonBuilder()
         .setCustomId(`${LINK_BUTTON_PREFIX}new:${token}`)
-        .setLabel('New 15-day link')
+        .setLabel(`New ${formatTtlShort(config)} link`)
         .setStyle(ButtonStyle.Secondary),
       new ButtonBuilder()
         .setCustomId(`${LINK_BUTTON_PREFIX}extend:${token}`)
-        .setLabel('Extend 15d')
+        .setLabel(`Extend ${formatTtlShort(config)}`)
         .setStyle(ButtonStyle.Primary),
       new ButtonBuilder()
         .setCustomId(`${LINK_BUTTON_PREFIX}permanent:${token}`)
@@ -544,33 +571,73 @@ function buildDownloadsPaginationRows({ userId, limit, page, pageCount, username
   ];
 }
 
-function buildDownloadsListEmbed(links, { config, total, page, pageSize, username = '' }) {
-  const title = username ? `Downloads for @${username}` : 'Downloads';
+export function buildDownloadsListEmbed(links, { config, total, page, pageSize, username = '' }) {
+  const title = username ? `Saved Downloads for @${username}` : 'Saved Downloads';
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
   const embed = new EmbedBuilder()
-    .setColor(0x00f2ea)
+    .setColor(UI_COLORS.info)
     .setTitle(title)
-    .setFooter({ text: `Page ${page + 1} of ${pageCount} - ${total} active link${total === 1 ? '' : 's'}` })
+    .setFooter({ text: `Page ${page + 1} of ${pageCount} - ${total} saved download${total === 1 ? '' : 's'}` })
     .setTimestamp(new Date());
 
   if (!links.length) {
     embed.setDescription(username
-      ? `No active download links found for @${username}.`
-      : 'You do not have any active download links yet.');
+      ? `No permanent downloads saved for @${username}. Use Keep on server to save one.`
+      : 'No permanent downloads saved yet. Use Keep on server to save one.');
     return embed;
   }
 
-  embed.addFields(...links.map((link, index) => {
+  embed.addFields(...links.slice(0, 25).map((link, index) => {
     const ordinal = page * pageSize + index + 1;
-    const title = truncateText(link.title || link.filename || link.source_url || 'download', 120);
+    const title = truncateText(link.title || link.filename || link.source_url || 'download', 90);
     const user = link.username ? `@${truncateText(link.username, 32)}` : '@unknown';
     const url = makePublicFileUrl(config, link.token) || 'PUBLIC_BASE_URL is not configured.';
+    const postId = link.video_id ? `post: ${truncateText(link.video_id, 64)}` : '';
     return {
       name: truncateText(`${ordinal}. ${user} - ${title}`, 256),
       value: truncateText([
         url,
-        `expires: ${formatExpiry(link.expires_at)} - ${formatBytes(link.size_bytes)}`,
-      ].join('\n'), 1024),
+        [
+          `saved: ${formatDate(link.token_created_at)}`,
+          formatBytes(link.size_bytes),
+          postId,
+        ].filter(Boolean).join(' - '),
+      ].join('\n'), 420),
+    };
+  }));
+
+  return embed;
+}
+
+export function buildLinkHistoryEmbed(history, { config, now = Date.now() }) {
+  const embed = new EmbedBuilder()
+    .setColor(UI_COLORS.info)
+    .setTitle('Download Link History')
+    .setTimestamp(new Date());
+
+  if (!history.length) {
+    embed.setDescription('No download links found yet.');
+    return embed;
+  }
+
+  embed.addFields(...history.slice(0, 10).map((entry, index) => {
+    const title = truncateText(entry.title || entry.filename || entry.source_url || 'download', 90);
+    const user = entry.username ? `@${truncateText(entry.username, 32)}` : '@unknown';
+    const url = makePublicFileUrl(config, entry.token) || 'PUBLIC_BASE_URL is not configured.';
+    const status = entry.job_status ? `job: ${entry.job_status}` : '';
+    const postId = entry.video_id ? `post: ${truncateText(entry.video_id, 64)}` : '';
+    return {
+      name: truncateText(`${index + 1}. ${user} - ${title}`, 256),
+      value: truncateText([
+        url,
+        [
+          formatLinkState(entry.expires_at, now),
+          `created: ${formatDate(entry.token_created_at)}`,
+          formatBytes(entry.size_bytes),
+          status,
+          postId,
+        ].filter(Boolean).join(' - '),
+      ].join('\n'), 520),
     };
   }));
 
@@ -587,19 +654,23 @@ function parseDownloadsListCustomId(customId) {
   const rest = text.slice(DOWNLOADS_BUTTON_PREFIX.length);
   const [encodedUserId, limit, page, encodedUsername = ''] = rest.split(':');
   if (!encodedUserId) return null;
-  return {
-    userId: decodeURIComponent(encodedUserId),
-    limit: Math.max(1, Math.min(25, Number(limit) || 10)),
-    page: Math.max(0, Number(page) || 0),
-    username: decodeURIComponent(encodedUsername),
-  };
+  try {
+    return {
+      userId: decodeURIComponent(encodedUserId),
+      limit: Math.max(1, Math.min(25, Number(limit) || 10)),
+      page: Math.max(0, Number(page) || 0),
+      username: decodeURIComponent(encodedUsername),
+    };
+  } catch {
+    return null;
+  }
 }
 
 export function buildVideoEmbed(result, video = {}) {
   const title = result.title || video.title || `TikTok ${mediaLabel(result)}`;
   const sourceUrl = result.sourceUrl || video.url;
   const embed = new EmbedBuilder()
-    .setColor(0x00f2ea)
+    .setColor(UI_COLORS.info)
     .setTitle(title.slice(0, 256))
     .setTimestamp(new Date())
     .setFooter({ text: `${result.videoId || video.id || 'unknown'} • ${formatBytes(result.sizeBytes || 0)}` });
@@ -619,15 +690,6 @@ function formatWatchList(watches) {
   }).join('\n');
 }
 
-function formatHistory(jobs) {
-  if (!jobs.length) return 'No download jobs yet.';
-  return jobs.map((job) => {
-    const when = new Date(job.created_at).toISOString();
-    const target = job.username ? `@${job.username}` : job.source_url;
-    return `#${job.id} ${job.status} ${target} ${when}${job.error ? ` — ${job.error}` : ''}`;
-  }).join('\n').slice(0, 1900);
-}
-
 function formatPurgeResult({ scope, counts, removal }) {
   const target = scope === 'all' ? 'all downloads' : 'your downloads';
   const failed = removal.failed.length
@@ -642,7 +704,7 @@ function canPurgeAll(interaction) {
 
 function buildStatusEmbed(stats, monitorStatus) {
   return new EmbedBuilder()
-    .setColor(0x22c55e)
+    .setColor(UI_COLORS.success)
     .setTitle('TikTok downloader status')
     .addFields(
       { name: 'Watched users', value: String(stats.watchCount), inline: true },
@@ -661,26 +723,38 @@ function pingPrefix(config) {
   return '';
 }
 
-function formatBytes(bytes) {
-  const value = Number(bytes || 0);
-  if (value < 1024) return `${value} B`;
-  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
-  return `${(value / 1024 / 1024).toFixed(1)} MB`;
-}
-
 function mediaLabel(result) {
   return result?.mediaType === 'slideshow' ? 'slideshow' : 'post';
 }
 
-function formatExpiry(value) {
-  if (Number(value) === 0) return 'never';
-  return value ? new Date(value).toISOString() : 'unknown';
+function downloadLinkTtlMs(config = {}) {
+  return ttlMinutes(config) * 60 * 1000;
 }
 
-function truncateText(value, maxLength) {
-  const text = String(value ?? '').replace(/\s+/g, ' ').trim();
-  if (text.length <= maxLength) return text;
-  if (maxLength <= 1) return text.slice(0, maxLength);
-  if (maxLength <= 3) return text.slice(0, maxLength);
-  return `${text.slice(0, maxLength - 3).trimEnd()}...`;
+function formatTtlShort(config = {}) {
+  const minutes = ttlMinutes(config);
+  if (minutes % (24 * 60) === 0) return `${minutes / (24 * 60)}d`;
+  if (minutes % 60 === 0) return `${minutes / 60}h`;
+  return `${minutes}m`;
+}
+
+function formatTtlLong(config = {}) {
+  const minutes = ttlMinutes(config);
+  if (minutes % (24 * 60) === 0) {
+    const days = minutes / (24 * 60);
+    return `${days} day${days === 1 ? '' : 's'}`;
+  }
+  if (minutes % 60 === 0) {
+    const hours = minutes / 60;
+    return `${hours} hour${hours === 1 ? '' : 's'}`;
+  }
+  return `${minutes} minute${minutes === 1 ? '' : 's'}`;
+}
+
+function ttlMinutes(config = {}) {
+  const minutes = Number(config.downloadLinkTtlMinutes);
+  if (Number.isFinite(minutes) && minutes > 0) return Math.round(minutes);
+  const hours = Number(config.downloadLinkTtlHours);
+  if (Number.isFinite(hours) && hours > 0) return Math.round(hours * 60);
+  return 30;
 }

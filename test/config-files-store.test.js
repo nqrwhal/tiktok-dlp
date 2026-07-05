@@ -42,7 +42,18 @@ test('loadConfig resolves paths and upload limits', () => {
   assert.equal(config.discordUploadLimitBytes, 2 * 1024 * 1024);
   assert.equal(config.httpPort, 9999);
   assert.equal(config.publicBaseUrl, 'https://example.com');
-  assert.equal(config.downloadLinkTtlHours, 360);
+  assert.equal(config.downloadLinkTtlMinutes, 30);
+  assert.equal(config.downloadLinkTtlHours, 1);
+});
+
+test('loadConfig supports minute TTL and legacy hour TTL', () => {
+  const minuteConfig = loadConfig({ DOWNLOAD_LINK_TTL_MINUTES: '45' }, '/tmp/project');
+  assert.equal(minuteConfig.downloadLinkTtlMinutes, 45);
+  assert.equal(minuteConfig.downloadLinkTtlHours, 1);
+
+  const legacyConfig = loadConfig({ DOWNLOAD_LINK_TTL_HOURS: '360' }, '/tmp/project');
+  assert.equal(legacyConfig.downloadLinkTtlMinutes, 360 * 60);
+  assert.equal(legacyConfig.downloadLinkTtlHours, 360);
 });
 
 test('parsePositiveInt falls back for invalid input', () => {
@@ -323,6 +334,90 @@ test('download link listing can include monitored downloads', async () => {
   }
 });
 
+test('permanent download listing dedupes files and keeps monitored results stable', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-permanent-links-'));
+  const store = createStore(path.join(dir, 'state.db'));
+  try {
+    const userFileId = store.createFileRecord({
+      requestedBy: 'user-1',
+      username: 'OpenAI',
+      sourceUrl: 'https://www.tiktok.com/@openai/video/1',
+      filePath: path.join(dir, 'one.mp4'),
+      filename: 'one.mp4',
+      sizeBytes: 1,
+    }, 1000);
+    const olderJobId = store.createJob({
+      type: 'manual',
+      requestedBy: 'user-1',
+      username: 'OpenAI',
+      sourceUrl: 'https://www.tiktok.com/@openai/video/1',
+      title: 'older title',
+    }, 1100);
+    store.updateJob(olderJobId, { file_id: userFileId }, 1150);
+    const newerJobId = store.createJob({
+      type: 'manual',
+      requestedBy: 'user-1',
+      username: 'OpenAI',
+      sourceUrl: 'https://www.tiktok.com/@openai/video/1',
+      title: 'newer title',
+    }, 1200);
+    store.updateJob(newerJobId, { file_id: userFileId }, 1250);
+    store.createLinkToken({ token: 'user-temp', fileId: userFileId, expiresAt: 9000 }, 1300);
+    store.createLinkToken({ token: 'user-perm-old', fileId: userFileId, expiresAt: 0 }, 1400);
+    store.createLinkToken({ token: 'user-perm-new', fileId: userFileId, expiresAt: 0 }, 1500);
+
+    const tempOnlyFileId = store.createFileRecord({
+      requestedBy: 'user-1',
+      username: 'openai',
+      sourceUrl: 'https://www.tiktok.com/@openai/video/2',
+      filePath: path.join(dir, 'two.mp4'),
+      filename: 'two.mp4',
+      sizeBytes: 2,
+    }, 1600);
+    store.createLinkToken({ token: 'temp-only', fileId: tempOnlyFileId, expiresAt: 9000 }, 1700);
+
+    const monitorFileId = store.createFileRecord({
+      username: 'OpenAI',
+      sourceUrl: 'https://www.tiktok.com/@openai/video/3',
+      filePath: path.join(dir, 'three.mp4'),
+      filename: 'three.mp4',
+      sizeBytes: 3,
+    }, 1800);
+    const monitorJobId = store.createJob({
+      type: 'monitor',
+      username: 'OpenAI',
+      sourceUrl: 'https://www.tiktok.com/@openai/video/3',
+      title: 'monitored title',
+    }, 1900);
+    store.updateJob(monitorJobId, { file_id: monitorFileId }, 1950);
+    store.createLinkToken({ token: 'monitor-perm', fileId: monitorFileId, expiresAt: 0 }, 2000);
+
+    assert.deepEqual(
+      store.listPermanentDownloadsByRequester('user-1').map((link) => link.token),
+      ['user-perm-new'],
+    );
+    assert.equal(store.listPermanentDownloadsByRequester('user-1')[0].title, 'newer title');
+    assert.equal(store.countPermanentDownloadsByRequester('user-1'), 1);
+    assert.deepEqual(
+      store.listPermanentDownloadsByRequester('user-1', { username: 'openai' }).map((link) => link.token),
+      ['user-perm-new'],
+    );
+    assert.deepEqual(
+      store.listPermanentDownloadsByRequester('user-1', { includeMonitored: true, username: 'OPENAI' }).map((link) => link.token),
+      ['monitor-perm', 'user-perm-new'],
+    );
+    assert.deepEqual(
+      store.listPermanentDownloadsByRequester('user-1', { includeMonitored: true, limit: 1, offset: 1 }).map((link) => link.token),
+      ['user-perm-new'],
+    );
+    assert.equal(store.countPermanentDownloadsByRequester('user-1', { includeMonitored: true, username: 'openai' }), 2);
+    assert.equal(store.listPermanentDownloadsByRequester('user-1', { includeMonitored: true }).some((link) => link.token === 'temp-only'), false);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('delivery payload includes link-management buttons', async () => {
   const payload = await buildDeliveryPayload({
     token: 'abc',
@@ -333,6 +428,7 @@ test('delivery payload includes link-management buttons', async () => {
   }, {
     publicBaseUrl: 'https://example.com',
     discordUploadLimitBytes: 10,
+    downloadLinkTtlMinutes: 30,
   }, 'link');
 
   assert.match(payload.content, /Download ready: https:\/\/example\.com\/files\/abc/);
@@ -341,6 +437,8 @@ test('delivery payload includes link-management buttons', async () => {
     payload.components[0].components.map((button) => button.data.custom_id),
     ['link:new:abc', 'link:extend:abc', 'link:permanent:abc'],
   );
+  assert.equal(payload.components[0].components[0].data.label, 'New 30m link');
+  assert.equal(payload.components[0].components[1].data.label, 'Extend 30m');
   assert.equal(payload.components[0].components[2].data.label, 'Keep on server');
 });
 
@@ -357,6 +455,7 @@ test('reused downloads use links for auto delivery', async () => {
   }, {
     publicBaseUrl: 'https://example.com',
     discordUploadLimitBytes: 10,
+    downloadLinkTtlMinutes: 30,
   }, 'auto');
 
   assert.equal(payload.files, undefined);
@@ -400,17 +499,21 @@ test('link button actions create, extend, and persist links', async () => {
       customId,
       reply: async (payload) => replies.push(payload),
     });
-    const config = { publicBaseUrl: 'https://example.com' };
+    const config = { publicBaseUrl: 'https://example.com', downloadLinkTtlMinutes: 30 };
 
     const beforeExtend = Date.now();
     await handleLinkButton({ interaction: makeInteraction('link:extend:tok'), config, store });
-    assert.ok(store.getToken('tok').expires_at >= beforeExtend + 15 * 24 * 60 * 60 * 1000);
+    assert.ok(store.getToken('tok').expires_at >= beforeExtend + 30 * 60 * 1000);
 
     await handleLinkButton({ interaction: makeInteraction('link:permanent:tok'), config, store });
     assert.equal(store.getToken('tok').expires_at, 0);
 
+    const beforeNew = Date.now();
     await handleLinkButton({ interaction: makeInteraction('link:new:tok'), config, store });
     assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM link_tokens WHERE file_id = ?').get(fileId).count, 2);
+    const newToken = store.db.prepare("SELECT * FROM link_tokens WHERE token <> 'tok'").get();
+    assert.ok(newToken.expires_at >= beforeNew + 30 * 60 * 1000);
+    assert.ok(newToken.expires_at < beforeNew + 31 * 60 * 1000);
     assert.equal(replies.length, 3);
   } finally {
     store.close();

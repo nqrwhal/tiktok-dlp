@@ -19,7 +19,7 @@ Example public download URL configuration:
 
 ```env
 PUBLIC_BASE_URL=https://example.com
-DOWNLOAD_LINK_TTL_HOURS=360
+DOWNLOAD_LINK_TTL_MINUTES=30
 ```
 
 Do not commit `.env`; it is ignored by git.
@@ -48,9 +48,9 @@ Commands:
 - `/watch list`
 - `/watch run username:<username>`
 - `/status`
-- `/history`
-- `/downloads list limit:<1-25> username:<username>` shows your active download links plus
-  monitored downloads.
+- `/history` shows your recent generated download links and their expiry state.
+- `/downloads list limit:<1-25> username:<username>` shows your saved permanent
+  downloads plus monitored downloads that were kept on the server.
 - `/downloads purge scope:mine|all confirm:PURGE` deletes saved download files,
   public links, and download history. `scope:all` requires Manage Server.
 
@@ -120,7 +120,10 @@ curl https://example.com/health
 - If a TikTok post was already downloaded and the file still exists locally,
   the bot reuses that file and creates a fresh link instead of downloading it
   again. Fresh metadata is still used for the Discord embed.
-- Every download gets a 15-day server copy by default. When every link for a
-  file expires, the local file and file record are removed. Discord buttons let
-  you create another 15-day link, extend the current link by 15 days, or keep
-  the file permanently on the server.
+- Every download gets a temporary 30-minute server copy by default. When every
+  link for a file expires, the local file and file record are removed. Discord
+  buttons let you create another temporary link, extend the current link by the
+  configured TTL, or keep the file permanently on the server.
+- `DOWNLOAD_LINK_TTL_MINUTES` controls new temporary links. Existing deployments
+  that still set `DOWNLOAD_LINK_TTL_HOURS` keep that legacy value until they
+  switch to minutes.
