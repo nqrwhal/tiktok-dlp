@@ -38,11 +38,7 @@ export function loadConfig(env = process.env, cwd = process.cwd()) {
   const publicBaseUrl = String(env.PUBLIC_BASE_URL ?? 'https://example.com').replace(/\/+$/, '');
   const uploadLimitMb = parsePositiveInt(env.DISCORD_UPLOAD_LIMIT_MB, 10);
   const httpPort = parsePositiveInt(env.HTTP_PORT, 8080);
-  const legacyTtlHours = env.DOWNLOAD_LINK_TTL_HOURS == null
-    ? 0
-    : parsePositiveInt(env.DOWNLOAD_LINK_TTL_HOURS, 0);
-  const legacyTtlMinutes = legacyTtlHours > 0 ? legacyTtlHours * 60 : null;
-  const downloadLinkTtlMinutes = parsePositiveInt(env.DOWNLOAD_LINK_TTL_MINUTES, legacyTtlMinutes ?? 30);
+  const downloadLinkTtlMinutes = parsePositiveInt(env.DOWNLOAD_LINK_TTL_MINUTES, 30);
 
   return {
     discordToken: env.DISCORD_TOKEN ?? '',

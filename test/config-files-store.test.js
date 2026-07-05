@@ -46,14 +46,14 @@ test('loadConfig resolves paths and upload limits', () => {
   assert.equal(config.downloadLinkTtlHours, 1);
 });
 
-test('loadConfig supports minute TTL and legacy hour TTL', () => {
+test('loadConfig supports minute TTL and ignores legacy hour TTL', () => {
   const minuteConfig = loadConfig({ DOWNLOAD_LINK_TTL_MINUTES: '45' }, '/tmp/project');
   assert.equal(minuteConfig.downloadLinkTtlMinutes, 45);
   assert.equal(minuteConfig.downloadLinkTtlHours, 1);
 
   const legacyConfig = loadConfig({ DOWNLOAD_LINK_TTL_HOURS: '360' }, '/tmp/project');
-  assert.equal(legacyConfig.downloadLinkTtlMinutes, 360 * 60);
-  assert.equal(legacyConfig.downloadLinkTtlHours, 360);
+  assert.equal(legacyConfig.downloadLinkTtlMinutes, 30);
+  assert.equal(legacyConfig.downloadLinkTtlHours, 1);
 });
 
 test('parsePositiveInt falls back for invalid input', () => {
@@ -334,6 +334,69 @@ test('download link listing can include monitored downloads', async () => {
   }
 });
 
+test('store can make existing monitor download links permanent', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-monitor-permanent-'));
+  const store = createStore(path.join(dir, 'state.db'));
+  try {
+    const manualFileId = store.createFileRecord({
+      requestedBy: 'user-1',
+      username: 'openai',
+      sourceUrl: 'https://www.tiktok.com/@openai/video/1',
+      filePath: path.join(dir, 'manual.mp4'),
+      filename: 'manual.mp4',
+      sizeBytes: 1,
+    }, 1000);
+    const monitorFileId = store.createFileRecord({
+      username: 'openai',
+      sourceUrl: 'https://www.tiktok.com/@openai/video/2',
+      filePath: path.join(dir, 'monitor.mp4'),
+      filename: 'monitor.mp4',
+      sizeBytes: 2,
+    }, 1000);
+    const monitorJobId = store.createJob({
+      type: 'monitor',
+      username: 'openai',
+      sourceUrl: 'https://www.tiktok.com/@openai/video/2',
+    }, 1000);
+    store.updateJob(monitorJobId, { file_id: monitorFileId }, 1000);
+    store.createLinkToken({ token: 'manual-token', fileId: manualFileId, expiresAt: 2000 }, 1000);
+    store.createLinkToken({ token: 'monitor-token', fileId: monitorFileId, expiresAt: 2000 }, 1000);
+
+    assert.equal(store.setMonitorLinkTokensPermanent(), 1);
+    assert.equal(store.getToken('manual-token').expires_at, 2000);
+    assert.equal(store.getToken('monitor-token').expires_at, 0);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('store caps existing temporary link TTL without changing permanent links', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-cap-ttl-'));
+  const store = createStore(path.join(dir, 'state.db'));
+  try {
+    const fileId = store.createFileRecord({
+      requestedBy: 'user-1',
+      username: 'openai',
+      sourceUrl: 'https://www.tiktok.com/@openai/video/1',
+      filePath: path.join(dir, 'video.mp4'),
+      filename: 'video.mp4',
+      sizeBytes: 1,
+    }, 1000);
+    store.createLinkToken({ token: 'long-temp', fileId, expiresAt: 15 * 24 * 60 * 60 * 1000 }, 2000);
+    store.createLinkToken({ token: 'short-temp', fileId, expiresAt: 5000 }, 2000);
+    store.createLinkToken({ token: 'permanent', fileId, expiresAt: 0 }, 2000);
+
+    assert.equal(store.capTemporaryLinkTokenTtl(30 * 60 * 1000), 1);
+    assert.equal(store.getToken('long-temp').expires_at, 2000 + 30 * 60 * 1000);
+    assert.equal(store.getToken('short-temp').expires_at, 5000);
+    assert.equal(store.getToken('permanent').expires_at, 0);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('permanent download listing dedupes files and keeps monitored results stable', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-permanent-links-'));
   const store = createStore(path.join(dir, 'state.db'));
@@ -442,6 +505,25 @@ test('delivery payload includes link-management buttons', async () => {
   assert.equal(payload.components[0].components[2].data.label, 'Keep on server');
 });
 
+test('delivery payload distinguishes permanent server copies', async () => {
+  const payload = await buildDeliveryPayload({
+    token: 'abc',
+    publicUrl: 'https://example.com/files/abc',
+    title: 'clip',
+    sourceUrl: 'https://www.tiktok.com/@openai/video/1',
+    sizeBytes: 20 * 1024 * 1024,
+    linkPermanent: true,
+  }, {
+    publicBaseUrl: 'https://example.com',
+    discordUploadLimitBytes: 10,
+    downloadLinkTtlMinutes: 30,
+  }, 'link');
+
+  assert.match(payload.content, /Download ready: https:\/\/example\.com\/files\/abc/);
+  assert.match(payload.content, /server copy is permanent/i);
+  assert.doesNotMatch(payload.content, /Temporary links expire/);
+});
+
 test('reused downloads use links for auto delivery', async () => {
   const payload = await buildDeliveryPayload({
     token: 'abc',
@@ -459,7 +541,8 @@ test('reused downloads use links for auto delivery', async () => {
   }, 'auto');
 
   assert.equal(payload.files, undefined);
-  assert.match(payload.content, /Download ready: https:\/\/example\.com\/files\/abc/);
+  assert.match(payload.content, /Download ready \(cache hit\): https:\/\/example\.com\/files\/abc/);
+  assert.match(payload.content, /Temporary links expire after 30 minutes/);
 });
 
 test('help keyword works in DMs and scoped guild messages', () => {
