@@ -260,6 +260,8 @@ test('store migrates older databases before creating indexes for new columns', a
     const fileColumns = store.db.prepare('PRAGMA table_info(files)').all().map((column) => column.name);
     const indexes = store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all().map((index) => index.name);
     assert.ok(watchColumns.includes('creator_id'));
+    assert.ok(watchColumns.includes('has_story'));
+    assert.ok(watchColumns.includes('story_status_checked_at'));
     assert.ok(seenColumns.includes('next_deletion_check_at'));
     assert.ok(indexes.includes('idx_seen_videos_next_deletion_check_at'));
     assert.ok(jobColumns.includes('requested_by'));
@@ -369,6 +371,7 @@ test('store records watched username changes', async () => {
     const change = store.recordWatchIdentity('old.creator', {
       creatorId: 'stable-123',
       currentUsername: 'new.creator',
+      hasStory: false,
     }, 2000);
 
     assert.deepEqual(change, {
@@ -382,6 +385,8 @@ test('store records watched username changes', async () => {
     assert.equal(store.getWatch('old.creator'), null);
     assert.equal(store.getWatch('new.creator').previous_username, 'old.creator');
     assert.equal(store.getWatch('new.creator').creator_id, 'stable-123');
+    assert.equal(store.getWatch('new.creator').has_story, 0);
+    assert.equal(store.getWatch('new.creator').story_status_checked_at, 2000);
     assert.equal(store.listWatchUsernameHistory()[0].previous_username, 'old.creator');
     assert.equal(store.listWatchUsernameHistory()[0].new_username, 'new.creator');
   } finally {

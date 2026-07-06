@@ -23,6 +23,8 @@ export class Store {
         creator_id TEXT,
         sec_uid TEXT,
         author_id TEXT,
+        has_story INTEGER,
+        story_status_checked_at INTEGER,
         previous_username TEXT,
         username_changed_at INTEGER,
         last_checked_at INTEGER,
@@ -96,6 +98,8 @@ export class Store {
     this.ensureColumn('watched_users', 'creator_id', 'TEXT');
     this.ensureColumn('watched_users', 'sec_uid', 'TEXT');
     this.ensureColumn('watched_users', 'author_id', 'TEXT');
+    this.ensureColumn('watched_users', 'has_story', 'INTEGER');
+    this.ensureColumn('watched_users', 'story_status_checked_at', 'INTEGER');
     this.ensureColumn('watched_users', 'previous_username', 'TEXT');
     this.ensureColumn('watched_users', 'username_changed_at', 'INTEGER');
     this.ensureColumn('seen_videos', 'last_available_at', 'INTEGER');
@@ -147,24 +151,37 @@ export class Store {
     `).all();
   }
 
-  recordWatchIdentity(username, { creatorId = '', currentUsername = '', secUid = '', authorId = '' } = {}, now = Date.now()) {
+  recordWatchIdentity(username, {
+    creatorId = '',
+    currentUsername = '',
+    secUid = '',
+    authorId = '',
+    hasStory = null,
+    storyStatusCheckedAt = null,
+  } = {}, now = Date.now()) {
     const previousUsername = String(username ?? '');
     const nextUsername = String(currentUsername || previousUsername);
     const id = String(creatorId ?? '');
     const nextSecUid = String(secUid ?? '');
     const nextAuthorId = String(authorId ?? '');
+    const nextHasStory = normalizeNullableBoolean(hasStory);
+    const nextStoryStatusCheckedAt = nextHasStory === null
+      ? null
+      : normalizeNullableInteger(storyStatusCheckedAt) ?? now;
     const existing = this.getWatch(previousUsername);
     if (!existing) return { changed: false, username: nextUsername, previousUsername, creatorId: id, secUid: nextSecUid, authorId: nextAuthorId };
 
-    if (id || nextSecUid || nextAuthorId) {
+    if (id || nextSecUid || nextAuthorId || nextHasStory !== null) {
       this.db.prepare(`
         UPDATE watched_users
         SET
           creator_id = COALESCE(NULLIF(?, ''), creator_id),
           sec_uid = COALESCE(NULLIF(?, ''), sec_uid),
-          author_id = COALESCE(NULLIF(?, ''), author_id)
+          author_id = COALESCE(NULLIF(?, ''), author_id),
+          has_story = COALESCE(?, has_story),
+          story_status_checked_at = COALESCE(?, story_status_checked_at)
         WHERE username = ?
-      `).run(id, nextSecUid, nextAuthorId, previousUsername);
+      `).run(id, nextSecUid, nextAuthorId, nextHasStory, nextStoryStatusCheckedAt, previousUsername);
     }
 
     if (!nextUsername || nextUsername.toLowerCase() === previousUsername.toLowerCase()) {
@@ -191,12 +208,25 @@ export class Store {
           creator_id = COALESCE(NULLIF(?, ''), creator_id),
           sec_uid = COALESCE(NULLIF(?, ''), sec_uid),
           author_id = COALESCE(NULLIF(?, ''), author_id),
+          has_story = COALESCE(?, has_story),
+          story_status_checked_at = COALESCE(?, story_status_checked_at),
           previous_username = ?,
           username_changed_at = ?,
           last_checked_at = COALESCE(last_checked_at, ?),
           last_success_at = COALESCE(last_success_at, ?)
         WHERE username = ?
-      `).run(id, nextSecUid, nextAuthorId, previousUsername, now, existing.last_checked_at, existing.last_success_at, nextUsername);
+      `).run(
+        id,
+        nextSecUid,
+        nextAuthorId,
+        nextHasStory,
+        nextStoryStatusCheckedAt,
+        previousUsername,
+        now,
+        existing.last_checked_at,
+        existing.last_success_at,
+        nextUsername,
+      );
       this.db.prepare('DELETE FROM watched_users WHERE username = ?').run(previousUsername);
     } else {
       this.db.prepare(`
@@ -206,10 +236,12 @@ export class Store {
           creator_id = COALESCE(NULLIF(?, ''), creator_id),
           sec_uid = COALESCE(NULLIF(?, ''), sec_uid),
           author_id = COALESCE(NULLIF(?, ''), author_id),
+          has_story = COALESCE(?, has_story),
+          story_status_checked_at = COALESCE(?, story_status_checked_at),
           previous_username = ?,
           username_changed_at = ?
         WHERE username = ?
-      `).run(nextUsername, id, nextSecUid, nextAuthorId, previousUsername, now, previousUsername);
+      `).run(nextUsername, id, nextSecUid, nextAuthorId, nextHasStory, nextStoryStatusCheckedAt, previousUsername, now, previousUsername);
     }
 
     return {
@@ -790,6 +822,18 @@ export class Store {
     const latestJob = this.db.prepare('SELECT * FROM jobs ORDER BY created_at DESC LIMIT 1').get() ?? null;
     return { watchCount, videoCount, fileCount, latestJob };
   }
+}
+
+function normalizeNullableBoolean(value) {
+  if (value === true || value === 1 || value === '1') return 1;
+  if (value === false || value === 0 || value === '0') return 0;
+  return null;
+}
+
+function normalizeNullableInteger(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.trunc(number) : null;
 }
 
 export function createStore(dbPath) {

@@ -128,13 +128,15 @@ export async function listProfileStories(usernameOrUrl, options = {}) {
   const profileUrl = resolveProfileUrl(usernameOrUrl);
   const cachedAuthorId = normalizeNumericId(options.watch?.author_id ?? options.watch?.authorId ?? options.authorId);
   const cachedSecUid = normalizeSecUid(options.watch?.sec_uid ?? options.watch?.secUid ?? options.secUid);
+  const cachedHasStory = normalizeOptionalBoolean(options.watch?.has_story ?? options.watch?.hasStory);
   const cachedUsername = String(options.username ?? options.watch?.username ?? extractUsernameFromUrl(profileUrl) ?? '');
-  const profile = cachedAuthorId
+  const profile = cachedAuthorId && cachedHasStory !== false
     ? {
         profileUrl,
         userId: cachedAuthorId,
         username: cachedUsername,
         secUid: cachedSecUid,
+        hasStory: cachedHasStory ?? undefined,
       }
     : await fetchProfileStoryIdentity(profileUrl, options);
   if (!profile.userId || profile.hasStory === false) {
@@ -151,6 +153,7 @@ export async function listProfileStories(usernameOrUrl, options = {}) {
         uploader: profile.username || '',
         username: profile.username || '',
         mediaType: 'story',
+        hasStory: profile.hasStory ?? false,
       }, profileUrl),
       entries: [],
     };
@@ -164,6 +167,7 @@ export async function listProfileStories(usernameOrUrl, options = {}) {
         sourceUrl: storySourceUrl,
       }, index)).filter((entry) => entry.videoId && entry.directVideoUrl)
     : [];
+  const hasStory = entries.length > 0;
 
   return {
     sourceUrl: profileUrl,
@@ -178,6 +182,7 @@ export async function listProfileStories(usernameOrUrl, options = {}) {
       uploader: profile.username,
       username: profile.username,
       mediaType: 'story',
+      hasStory,
     }, profileUrl),
     entries,
   };
@@ -566,6 +571,12 @@ function normalizeNumericId(value = '') {
   return /^\d{10,}$/.test(text) ? text : '';
 }
 
+function normalizeOptionalBoolean(value) {
+  if (value === true || value === 1 || value === '1') return true;
+  if (value === false || value === 0 || value === '0') return false;
+  return null;
+}
+
 function normalizePositiveInt(value) {
   const parsed = Number.parseInt(String(value ?? ''), 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
@@ -634,7 +645,7 @@ async function fetchProfileStoryIdentity(profileUrl, options = {}) {
     userId: String(user.id),
     username,
     secUid: String(user.secUid ?? ''),
-    hasStory: storyStatus === 0 ? false : undefined,
+    hasStory: storyStatus === 0 ? false : storyStatus > 0 ? true : undefined,
   };
 }
 

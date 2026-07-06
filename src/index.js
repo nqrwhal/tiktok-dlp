@@ -5,7 +5,7 @@ import { createStore } from './state/store.js';
 import { startHttpServer } from './http/server.js';
 import { startDiscordBot, sendDeletionAlert, sendUsernameChangeAlert, sendVideoAlert } from './discord/client.js';
 import { registerCommands } from './discord/register-commands.js';
-import { TikTokMonitor } from './tiktok/monitor.js';
+import { TikTokMonitor, resolveVideoMediaType } from './tiktok/monitor.js';
 import { downloadVideo, fetchVideoMetadata } from './tiktok/ytdlp.js';
 import { fileSize, makePublicFileUrl, randomToken } from './util/files.js';
 import { cleanupExpiredDownloads } from './cleanup/downloads.js';
@@ -197,6 +197,7 @@ function downloadLinkTtlMs() {
 
 async function checkVideoAvailable(video) {
   const sourceUrl = video?.source_url || video?.sourceUrl || video?.url || video?.webpage_url || '';
+  if (resolveVideoMediaType(video) === 'story') return { available: true, reason: 'Story deletion checks are skipped.' };
   if (!sourceUrl) return { available: false, reason: 'The original post URL is missing.' };
   try {
     await fetchVideoMetadata(sourceUrl, config);

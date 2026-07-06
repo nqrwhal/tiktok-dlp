@@ -179,6 +179,17 @@ export function resolveVideoMediaType(video) {
   return '';
 }
 
+export function resolveProfileHasStory(profileResult) {
+  const metadata = Array.isArray(profileResult) ? {} : profileResult?.metadata ?? {};
+  const explicit = normalizeNullableBoolean(metadata.hasStory ?? metadata.has_story);
+  if (explicit !== null) return explicit;
+
+  const mediaType = String(metadata.mediaType ?? metadata.media_type ?? metadata.type ?? '').toLowerCase();
+  const entries = Array.isArray(profileResult) ? profileResult : profileResult?.entries ?? [];
+  if (mediaType.includes('story') && entries.length > 0) return true;
+  return null;
+}
+
 function resolveMethod(target, names) {
   for (const name of names) {
     if (typeof target?.[name] === 'function') return target[name].bind(target);
@@ -227,11 +238,19 @@ function shouldRecordStoryIdentity(storyResult, normalized, watch) {
   const secUid = resolveProfileSecUid(storyResult);
   const authorId = resolveProfileAuthorId(storyResult);
   const username = resolveProfileUsername(storyResult, normalized.username);
+  const hasStory = resolveProfileHasStory(storyResult);
   return Boolean(
     (secUid && secUid !== String(watch?.sec_uid ?? watch?.secUid ?? ''))
       || (authorId && authorId !== String(watch?.author_id ?? watch?.authorId ?? ''))
-      || (username && username.toLowerCase() !== normalized.username.toLowerCase()),
+      || (username && username.toLowerCase() !== normalized.username.toLowerCase())
+      || hasStory !== null,
   );
+}
+
+function normalizeNullableBoolean(value) {
+  if (value === true || value === 1 || value === '1') return true;
+  if (value === false || value === 0 || value === '0') return false;
+  return null;
 }
 
 export class TikTokMonitor {
@@ -287,6 +306,7 @@ export class TikTokMonitor {
   #downloadQueue = [];
   #activeDownloads = 0;
   #pendingDownloadIds = new Set();
+  #runOncePromise = null;
   #metrics = {
     cycles: 0,
     totalChecks: 0,
@@ -315,7 +335,21 @@ export class TikTokMonitor {
     return this;
   }
 
-  async runOnce({ waitForDownloads = false } = {}) {
+  async runOnce(options = {}) {
+    while (this.#runOncePromise) {
+      await this.#runOncePromise.catch(() => {});
+    }
+
+    const promise = this.#runOnceInternal(options);
+    this.#runOncePromise = promise;
+    try {
+      return await promise;
+    } finally {
+      if (this.#runOncePromise === promise) this.#runOncePromise = null;
+    }
+  }
+
+  async #runOnceInternal({ waitForDownloads = false } = {}) {
     const cycleStartedAt = this.now();
     this.#lastPollAt = cycleStartedAt;
     this.#metrics.cycles += 1;
@@ -567,11 +601,14 @@ export class TikTokMonitor {
     const secUid = resolveProfileSecUid(profileResult);
     const authorId = resolveProfileAuthorId(profileResult);
     const creatorId = authorId || secUid || resolveProfileCreatorId(profileResult);
+    const hasStory = resolveProfileHasStory(profileResult);
     return this.store.recordWatchIdentity(username, {
       creatorId,
       currentUsername,
       secUid,
       authorId,
+      hasStory,
+      storyStatusCheckedAt: hasStory === null ? null : now,
     }, now);
   }
 
@@ -614,13 +651,16 @@ export class TikTokMonitor {
         profileUrl: normalized.profileUrl,
         sourceUrl,
       });
+      const mediaType = resolveVideoMediaType(video);
+      const seenAt = this.now();
+      await Promise.resolve(this.store.markVideoSeen(seenRecord, seenAt));
 
       await Promise.resolve(
         this.alert({
           watch: { ...watch, username: normalized.username, profileUrl: normalized.profileUrl },
           username: normalized.username,
           profileUrl: normalized.profileUrl,
-          video: { ...video, id: videoId, sourceUrl, mediaType: resolveVideoMediaType(video) },
+          video: { ...video, id: videoId, sourceUrl, mediaType },
           downloaded,
           result: downloaded,
         }),
@@ -628,7 +668,9 @@ export class TikTokMonitor {
 
       const now = this.now();
       await Promise.resolve(this.store.markVideoSeen({ ...seenRecord, alertedAt: now }, now));
-      await Promise.resolve(this.store.scheduleVideoDeletionCheck?.(videoId, now + nextDeletionCheckDelayMs(0)));
+      if (mediaType !== 'story') {
+        await Promise.resolve(this.store.scheduleVideoDeletionCheck?.(videoId, now + nextDeletionCheckDelayMs(0)));
+      }
       this.#metrics.totalCompletedDownloads += 1;
       return { downloaded: true, alerted: true };
     } catch (error) {
@@ -670,6 +712,11 @@ export class TikTokMonitor {
     const due = await Promise.resolve(this.store.listVideosDueForDeletionCheck(now, 25));
     for (const video of due ?? []) {
       try {
+        if (resolveVideoMediaType(video) === 'story') {
+          await Promise.resolve(this.store.markVideoStillAvailable?.(video.video_id, null, now));
+          continue;
+        }
+
         const result = await Promise.resolve(this.#checkVideoAvailable(video));
         if (result?.available === false) {
           const deleted = await Promise.resolve(this.store.markVideoDeleted?.(video.video_id, now)) ?? video;
@@ -701,12 +748,16 @@ export class TikTokMonitor {
       ?? { username: normalized.username, channel_id: '', failure_count: 0 };
     const originalListWatches = this.store.listWatches?.bind(this.store);
     if (!originalListWatches) throw new Error('Store must provide listWatches().');
+    while (this.#runOncePromise) {
+      await this.#runOncePromise.catch(() => {});
+    }
     this.store.listWatches = () => [{ ...watch, next_check_at: force ? null : watch.next_check_at }];
     try {
       const summary = await this.runOnce({ waitForDownloads: true });
       return {
         ...summary,
-        newVideos: summary.queuedDownloads || summary.downloadedVideos,
+        newVideos: summary.alertedVideos || summary.downloadedVideos,
+        queuedVideos: summary.queuedDownloads,
         skipped: summary.seenVideos,
       };
     } finally {

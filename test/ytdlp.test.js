@@ -207,6 +207,21 @@ test('photo post fallback parses and packages slideshow images', async () => {
   );
 });
 
+test('listProfileStories refreshes cached no-story profiles before hitting the story API', async () => {
+  const storyFetch = createStoryFetch({ userStoryStatus: 0, hasItems: false });
+  const stories = await listProfileStories('creator', {
+    fetchImpl: storyFetch,
+    limit: 2,
+    username: 'creator',
+    watch: { author_id: '424242424242', sec_uid: TEST_SEC_UID, has_story: 0 },
+  });
+
+  assert.equal(stories.count, 0);
+  assert.equal(storyFetch.profileRequests, 1);
+  assert.equal(storyFetch.apiRequests, 0);
+  assert.equal(stories.metadata.hasStory, false);
+});
+
 test('parsePhotoPostMetadata rejects HTML without image data', () => {
   assert.throws(
     () => parsePhotoPostMetadata('<html></html>', 'https://www.tiktok.com/@user/photo/1'),
@@ -318,21 +333,16 @@ function createPhotoFetch() {
   };
 }
 
-function createStoryFetch() {
+function createStoryFetch({ userStoryStatus = 1, hasItems = true } = {}) {
   const fetchImpl = async (url) => {
     const textUrl = String(url);
     if (textUrl.includes('/api/story/item_list/')) {
+      fetchImpl.apiRequests += 1;
       const parsed = new URL(textUrl);
       assert.equal(parsed.searchParams.get('authorId'), '424242424242');
       assert.equal(parsed.searchParams.get('count'), '2');
-      return {
-        ok: true,
-        status: 200,
-        url: textUrl,
-        json: async () => ({
-          statusCode: 0,
-          TotalCount: 1,
-          itemList: [
+      const itemList = hasItems
+        ? [
             {
               id: '3333333333',
               desc: 'Story',
@@ -353,7 +363,16 @@ function createStoryFetch() {
                 },
               },
             },
-          ],
+          ]
+        : [];
+      return {
+        ok: true,
+        status: 200,
+        url: textUrl,
+        json: async () => ({
+          statusCode: 0,
+          TotalCount: itemList.length,
+          itemList,
         }),
       };
     }
@@ -376,14 +395,15 @@ function createStoryFetch() {
       ok: true,
       status: 200,
       url: 'https://www.tiktok.com/@creator',
-      text: async () => makeStoryProfileHtml(),
+      text: async () => makeStoryProfileHtml({ userStoryStatus }),
     };
   };
   fetchImpl.profileRequests = 0;
+  fetchImpl.apiRequests = 0;
   return fetchImpl;
 }
 
-function makeStoryProfileHtml() {
+function makeStoryProfileHtml({ userStoryStatus = 1 } = {}) {
   const data = {
     __DEFAULT_SCOPE__: {
       'webapp.user-detail': {
@@ -392,7 +412,7 @@ function makeStoryProfileHtml() {
             id: '424242424242',
             uniqueId: 'creator',
             secUid: TEST_SEC_UID,
-            UserStoryStatus: 1,
+            UserStoryStatus: userStoryStatus,
           },
         },
       },

@@ -1066,6 +1066,7 @@ function buildStatusEmbed(stats, monitorStatus) {
       { name: 'Check workers', value: String(monitorStatus.checkConcurrency ?? 1), inline: true },
       { name: 'Download workers', value: String(monitorStatus.downloadConcurrency ?? 1), inline: true },
       { name: 'Download queue', value: `${monitorStatus.activeDownloads ?? 0} active / ${monitorStatus.queueLength ?? 0} queued`, inline: true },
+      { name: 'Download totals', value: `${metrics.totalCompletedDownloads ?? 0} ok / ${metrics.totalDownloadFailures ?? 0} failed`, inline: true },
       { name: 'Last cycle', value: formatMonitorCycle(metrics, lastSummary), inline: false },
     )
     .setTimestamp(new Date());
@@ -1080,7 +1081,7 @@ function formatMonitorCycle(metrics = {}, summary = {}) {
     `scanned: ${summary.scannedVideos ?? 0}`,
     `queued: ${summary.queuedDownloads ?? 0}`,
     `failures: ${summary.failures ?? 0}`,
-    `downloads: ${metrics.totalCompletedDownloads ?? 0} ok / ${metrics.totalDownloadFailures ?? 0} failed`,
+    `downloads: ${summary.downloadedVideos ?? 0} ok / ${summary.alertedVideos ?? 0} alerted`,
   ].join(' - ');
 }
 
