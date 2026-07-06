@@ -58,11 +58,20 @@ The bot requires the `Guilds`, `Guild Messages`, `Direct Messages`, and
 `Message Content` intents. Enable Message Content in the Discord developer
 portal for the application.
 
-Watched usernames only alert for videos newer than when the watch was added.
-Videos with no timestamp metadata are treated as eligible so new uploads are not
-missed when TikTok or `yt-dlp` omits dates.
+Watched usernames alert for videos newer than when the watch was added and also
+try to detect public stories. Stories are downloaded when detected, even when
+TikTok or `yt-dlp` omits timestamp metadata.
 The default monitor interval is 60 seconds; set `POLL_INTERVAL_SECONDS` to a
-positive integer to tune it.
+positive integer to tune it. Successful checks are scheduled per account so a
+slow full scan does not add another full interval before the next check.
+`MONITOR_CONCURRENCY` controls concurrent profile/story checks and defaults to
+2. Downloads are queued separately and capped by `MAX_CONCURRENT_DOWNLOADS`.
+`PROFILE_SCAN_LIMIT` defaults to 5 and caps the normal recent-profile window
+`yt-dlp` enumerates for each check. If all entries in that window are new alert
+candidates, the monitor immediately performs a deeper catch-up scan up to
+`PROFILE_BURST_SCAN_LIMIT`, which defaults to 20.
+The `/status` command shows monitor cycle timing, queued/active downloads,
+worker counts, and recent scan totals.
 When profile metadata reports that a watched creator now has a different
 username, the bot updates the watch record and posts a username-change notice.
 This depends on TikTok or `yt-dlp` still resolving the old profile URL far
@@ -133,6 +142,9 @@ curl https://example.com/health
   server.
 - Watched-user downloads are kept permanently on the server by default.
 - Watched-user files are stored under `DOWNLOAD_DIR/<username>/...`.
+- Watched-user identity data caches TikTok `secUid` and author id when they are
+  available. Later checks use `secUid` for faster `yt-dlp` profile polling and
+  author id for story checks, reducing redundant profile-page requests.
 - After a watched post is saved, the bot checks whether the original post still
   exists every minute for five minutes, then around 30 minutes, one hour, one
   day, and weekly after that. If the source post disappears, Discord gets a

@@ -9,8 +9,11 @@ import {
   normalizeWatchedUser,
   resolveProfileCreatorId,
   resolveProfileUsername,
+  resolveVideoMediaType,
   resolveVideoTimestampMs,
 } from '../src/tiktok/monitor.js';
+
+const TEST_SEC_UID = `MS4wLjABAAAA${'b'.repeat(64)}`;
 
 class FakeStore {
   constructor(watches = [], seenVideos = []) {
@@ -20,6 +23,8 @@ class FakeStore {
     this.successes = [];
     this.failures = [];
     this.usernameChanges = [];
+    this.deletionSchedules = [];
+    this.stillAvailable = [];
   }
 
   listWatches() {
@@ -35,16 +40,16 @@ class FakeStore {
     this.seenRecords.push({ record: { ...record }, now });
   }
 
-  markWatchSuccess(username, now) {
+  markWatchSuccess(username, now, nextCheckAt = null) {
     const watch = this.watches.find((entry) => entry.username === username);
     if (watch) {
       watch.failure_count = 0;
       watch.last_success_at = now;
       watch.last_checked_at = now;
-      watch.next_check_at = null;
+      watch.next_check_at = nextCheckAt;
       watch.last_error = null;
     }
-    this.successes.push({ username, now });
+    this.successes.push({ username, now, nextCheckAt });
   }
 
   markWatchFailure(username, error, nextCheckAt, now) {
@@ -58,25 +63,45 @@ class FakeStore {
     this.failures.push({ username, error, nextCheckAt, now });
   }
 
-  recordWatchIdentity(username, { creatorId = '', currentUsername = '' } = {}, now) {
+  recordWatchIdentity(
+    username,
+    { creatorId = '', currentUsername = '', secUid = '', authorId = '', hasStory = null, storyStatusCheckedAt = null } = {},
+    now,
+  ) {
     const watch = this.watches.find((entry) => entry.username === username);
-    if (!watch) return { changed: false, username, previousUsername: username, creatorId };
+    if (!watch) return { changed: false, username, previousUsername: username, creatorId, secUid, authorId };
     if (creatorId) watch.creator_id = creatorId;
+    if (secUid) watch.sec_uid = secUid;
+    if (authorId) watch.author_id = authorId;
+    if (hasStory !== null && hasStory !== undefined) {
+      watch.has_story = hasStory ? 1 : 0;
+      watch.story_status_checked_at = storyStatusCheckedAt ?? now;
+    }
     if (currentUsername && currentUsername.toLowerCase() !== username.toLowerCase()) {
       watch.username = currentUsername;
       watch.previous_username = username;
       watch.username_changed_at = now;
-      this.usernameChanges.push({ username, currentUsername, creatorId, now });
-      return { changed: true, username: currentUsername, previousUsername: username, creatorId };
+      this.usernameChanges.push({ username, currentUsername, creatorId, secUid, authorId, now });
+      return { changed: true, username: currentUsername, previousUsername: username, creatorId, secUid, authorId };
     }
-    return { changed: false, username, previousUsername: username, creatorId };
+    return { changed: false, username, previousUsername: username, creatorId, secUid, authorId };
+  }
+
+  scheduleVideoDeletionCheck(videoId, nextCheckAt) {
+    this.deletionSchedules.push({ videoId, nextCheckAt });
+  }
+
+  markVideoStillAvailable(videoId, nextCheckAt, now) {
+    this.stillAvailable.push({ videoId, nextCheckAt, now });
   }
 }
 
 class FakeDownloader {
-  constructor(videos = []) {
+  constructor(videos = [], stories = []) {
     this.videos = videos;
+    this.stories = stories;
     this.listCalls = [];
+    this.storyCalls = [];
     this.downloadCalls = [];
     this.error = null;
   }
@@ -87,9 +112,14 @@ class FakeDownloader {
     return this.videos;
   }
 
+  async listProfileStories(storyUrl, options) {
+    this.storyCalls.push({ storyUrl, options });
+    return this.stories;
+  }
+
   async download(video, context) {
     this.downloadCalls.push({ video, context });
-    return { filePath: `/downloads/${video.id ?? 'unknown'}.mp4` };
+    return { filePath: `/downloads/${video.id ?? 'unknown'}.mp4`, mediaType: video.mediaType };
   }
 }
 
@@ -97,11 +127,13 @@ test('normalizeWatchedUser accepts profile URLs and usernames', () => {
   assert.deepEqual(normalizeWatchedUser('https://www.tiktok.com/@Creator/?lang=en'), {
     username: 'Creator',
     profileUrl: 'https://www.tiktok.com/@Creator',
+    storyUrl: 'https://www.tiktok.com/@Creator/story',
   });
 
   assert.deepEqual(normalizeWatchedUser({ username: 'maker' }), {
     username: 'maker',
     profileUrl: 'https://www.tiktok.com/@maker',
+    storyUrl: 'https://www.tiktok.com/@maker/story',
   });
 });
 
@@ -141,26 +173,149 @@ test('runOnce downloads and alerts only unseen videos', async () => {
     now: () => now,
   });
 
-  const summary = await monitor.runOnce();
+  const summary = await monitor.runOnce({ waitForDownloads: true });
 
   assert.equal(downloader.listCalls.length, 1);
   assert.equal(downloader.listCalls[0].profileUrl, 'https://www.tiktok.com/@creator');
-  assert.equal(downloader.listCalls[0].options.limit, 20);
+  assert.equal(downloader.listCalls[0].options.limit, 5);
   assert.equal(downloader.downloadCalls.length, 1);
   assert.equal(downloader.downloadCalls[0].context.profileUrl, 'https://www.tiktok.com/@creator');
   assert.equal(alerts.length, 1);
   assert.equal(alerts[0].video.id, 'new-2');
   assert.equal(store.seen.has('new-2'), true);
-  assert.equal(store.seenRecords.length, 1);
+  assert.equal(store.seenRecords.length, 2);
+  assert.equal(store.seenRecords.at(-1).record.alertedAt, now);
+  assert.equal(store.deletionSchedules.length, 1);
+  assert.equal(store.deletionSchedules[0].videoId, 'new-2');
   assert.equal(store.successes.length, 1);
+  assert.equal(store.successes[0].nextCheckAt, now + 60 * 1000);
+  assert.equal(store.watches[0].next_check_at, now + 60 * 1000);
   assert.equal(store.failures.length, 0);
   assert.deepEqual(summary, {
     watchedUsers: 1,
     skippedUsers: 0,
     scannedVideos: 2,
+    queuedDownloads: 1,
     downloadedVideos: 1,
     alertedVideos: 1,
     seenVideos: 1,
+    failures: 0,
+  });
+});
+
+test('runOnce downloads unseen stories when detected', async () => {
+  const now = 1_700_000_100_000;
+  const alerts = [];
+  const store = new FakeStore([
+    {
+      username: 'creator',
+      channel_id: 'channel-1',
+      created_at: 1_700_000_000_000,
+      last_success_at: null,
+      failure_count: 0,
+      next_check_at: null,
+    },
+  ]);
+  const downloader = new FakeDownloader([], {
+    metadata: {
+      uploader: 'creator',
+      username: 'creator',
+      user_id: '424242424242',
+      channel_id: TEST_SEC_UID,
+      mediaType: 'story',
+    },
+    entries: [
+      {
+        id: 'story-1',
+        title: 'Story',
+        mediaType: 'story',
+        timestamp: 1_699_999_999,
+        webpage_url: 'https://www.tiktok.com/@creator/story/1111111111',
+      },
+    ],
+  });
+
+  const monitor = new TikTokMonitor({
+    store,
+    downloader,
+    alert: async (payload) => alerts.push(payload),
+    now: () => now,
+  });
+
+  const summary = await monitor.runOnce({ waitForDownloads: true });
+
+  assert.equal(downloader.storyCalls.length, 1);
+  assert.equal(downloader.storyCalls[0].storyUrl, 'https://www.tiktok.com/@creator/story');
+  assert.equal(downloader.downloadCalls.length, 1);
+  assert.equal(downloader.downloadCalls[0].video.mediaType, 'story');
+  assert.equal(alerts.length, 1);
+  assert.equal(alerts[0].video.mediaType, 'story');
+  assert.equal(store.seen.has('story-1'), true);
+  assert.equal(store.watches[0].author_id, '424242424242');
+  assert.equal(store.watches[0].sec_uid, TEST_SEC_UID);
+  assert.equal(store.watches[0].has_story, 1);
+  assert.equal(store.deletionSchedules.length, 0);
+  assert.equal(resolveVideoMediaType(alerts[0].video), 'story');
+  assert.deepEqual(summary, {
+    watchedUsers: 1,
+    skippedUsers: 0,
+    scannedVideos: 1,
+    queuedDownloads: 1,
+    downloadedVideos: 1,
+    alertedVideos: 1,
+    seenVideos: 0,
+    failures: 0,
+  });
+});
+
+test('runOnce burst scans when the normal profile window is full of new posts', async () => {
+  const now = 1_700_000_200_000;
+  const alerts = [];
+  const store = new FakeStore([
+    {
+      username: 'creator',
+      channel_id: 'channel-1',
+      created_at: 1_700_000_000_000,
+      failure_count: 0,
+      next_check_at: null,
+    },
+  ]);
+  const downloader = new FakeDownloader([]);
+  downloader.listProfileVideos = async (profileUrl, options) => {
+    downloader.listCalls.push({ profileUrl, options });
+    const count = options.limit === 20 ? 8 : 5;
+    return Array.from({ length: count }, (_, index) => ({
+      id: `new-${index + 1}`,
+      title: `New ${index + 1}`,
+      timestamp: 1_700_000_100 + index,
+      webpage_url: `https://www.tiktok.com/@creator/video/${index + 1}`,
+    }));
+  };
+
+  const monitor = new TikTokMonitor({
+    store,
+    downloader,
+    alert: async (payload) => alerts.push(payload),
+    now: () => now,
+    scanLimit: 5,
+    burstScanLimit: 20,
+  });
+
+  const summary = await monitor.runOnce({ waitForDownloads: true });
+
+  assert.equal(downloader.listCalls.length, 2);
+  assert.equal(downloader.listCalls[0].options.limit, 5);
+  assert.equal(downloader.listCalls[1].options.limit, 20);
+  assert.equal(downloader.downloadCalls.length, 8);
+  assert.equal(alerts.length, 8);
+  assert.deepEqual(summary, {
+    watchedUsers: 1,
+    skippedUsers: 0,
+    scannedVideos: 8,
+    queuedDownloads: 8,
+    downloadedVideos: 8,
+    alertedVideos: 8,
+    seenVideos: 0,
     failures: 0,
   });
 });
@@ -263,7 +418,7 @@ test('runOnce skips videos older than the watch creation time', async () => {
     now: () => now,
   });
 
-  const summary = await monitor.runOnce();
+  const summary = await monitor.runOnce({ waitForDownloads: true });
 
   assert.equal(downloader.downloadCalls.length, 1);
   assert.equal(downloader.downloadCalls[0].video.id, 'new-2');
@@ -274,6 +429,7 @@ test('runOnce skips videos older than the watch creation time', async () => {
     watchedUsers: 1,
     skippedUsers: 0,
     scannedVideos: 2,
+    queuedDownloads: 1,
     downloadedVideos: 1,
     alertedVideos: 1,
     seenVideos: 1,
@@ -318,6 +474,7 @@ test('runOnce baselines timestamp-free videos on the first watch scan', async ()
     watchedUsers: 1,
     skippedUsers: 0,
     scannedVideos: 1,
+    queuedDownloads: 0,
     downloadedVideos: 0,
     alertedVideos: 0,
     seenVideos: 1,
@@ -355,6 +512,179 @@ test('runOnce backoffs failures and skips watches until due', async () => {
   const second = await monitor.runOnce();
   assert.equal(second.skippedUsers, 1);
   assert.equal(downloader.listCalls.length, 1);
+});
+
+test('runOnce marks successful downloads seen before alerting', async () => {
+  const now = 1_700_000_300_000;
+  let alertAttempts = 0;
+  const store = new FakeStore([
+    {
+      username: 'creator',
+      channel_id: 'channel-1',
+      failure_count: 0,
+      next_check_at: null,
+    },
+  ]);
+  const downloader = new FakeDownloader([
+    {
+      id: 'new-1',
+      title: 'New video',
+      webpage_url: 'https://www.tiktok.com/@creator/video/new-1',
+    },
+  ]);
+
+  const monitor = new TikTokMonitor({
+    store,
+    downloader,
+    alert: async () => {
+      alertAttempts += 1;
+      throw new Error('discord failed');
+    },
+    now: () => now,
+  });
+
+  const first = await monitor.runOnce({ waitForDownloads: true });
+  assert.equal(first.queuedDownloads, 1);
+  assert.equal(first.downloadedVideos, 0);
+  assert.equal(first.alertedVideos, 0);
+  assert.equal(alertAttempts, 1);
+  assert.equal(store.seen.has('new-1'), true);
+  assert.equal(store.seenRecords.length, 1);
+  assert.equal(store.seenRecords[0].record.alertedAt, undefined);
+
+  store.watches[0].next_check_at = null;
+  const second = await monitor.runOnce({ waitForDownloads: true });
+
+  assert.equal(downloader.downloadCalls.length, 1);
+  assert.equal(alertAttempts, 1);
+  assert.equal(second.seenVideos, 1);
+  assert.equal(second.queuedDownloads, 0);
+});
+
+test('runOnce serializes overlapping cycles', async () => {
+  const now = 1_700_000_400_000;
+  let listCalls = 0;
+  let releaseFirst;
+  let markFirstStarted;
+  const firstStarted = new Promise((resolve) => {
+    markFirstStarted = resolve;
+  });
+  const firstBlocked = new Promise((resolve) => {
+    releaseFirst = resolve;
+  });
+  const store = new FakeStore([
+    {
+      username: 'creator',
+      channel_id: 'channel-1',
+      failure_count: 0,
+      next_check_at: null,
+    },
+  ]);
+  const downloader = new FakeDownloader([]);
+  downloader.listProfileVideos = async (profileUrl, options) => {
+    downloader.listCalls.push({ profileUrl, options });
+    listCalls += 1;
+    if (listCalls === 1) {
+      markFirstStarted();
+      await firstBlocked;
+    }
+    return [];
+  };
+
+  const monitor = new TikTokMonitor({
+    store,
+    downloader,
+    now: () => now,
+    pollIntervalMs: 0,
+  });
+
+  const first = monitor.runOnce();
+  await firstStarted;
+  const second = monitor.runOnce();
+  await Promise.resolve();
+
+  assert.equal(listCalls, 1);
+  releaseFirst();
+  await Promise.all([first, second]);
+  assert.equal(listCalls, 2);
+});
+
+test('pollUsername reports completed alerts instead of queued failed downloads', async () => {
+  const now = 1_700_000_500_000;
+  const store = new FakeStore([
+    {
+      username: 'creator',
+      channel_id: 'channel-1',
+      failure_count: 0,
+      next_check_at: null,
+    },
+  ]);
+  const downloader = new FakeDownloader([
+    {
+      id: 'new-1',
+      title: 'New video',
+      webpage_url: 'https://www.tiktok.com/@creator/video/new-1',
+    },
+  ]);
+  downloader.download = async (video, context) => {
+    downloader.downloadCalls.push({ video, context });
+    throw new Error('download failed');
+  };
+
+  const monitor = new TikTokMonitor({
+    store,
+    downloader,
+    now: () => now,
+  });
+
+  const result = await monitor.pollUsername('creator', { force: true });
+
+  assert.equal(result.queuedDownloads, 1);
+  assert.equal(result.queuedVideos, 1);
+  assert.equal(result.downloadedVideos, 0);
+  assert.equal(result.alertedVideos, 0);
+  assert.equal(result.newVideos, 0);
+});
+
+test('runOnce clears scheduled deletion checks for stories', async () => {
+  const now = 1_700_000_600_000;
+  const alerts = [];
+  const stillAvailable = [];
+  const dueVideo = {
+    video_id: 'story-1',
+    username: 'creator',
+    source_url: 'https://www.tiktok.com/@creator/story/story-1',
+    title: 'Story',
+    deletion_check_count: 0,
+    permanent_token: 'tok',
+  };
+  const store = {
+    listWatches: () => [],
+    listVideosDueForDeletionCheck: () => [dueVideo],
+    markVideoStillAvailable: (videoId, nextCheckAt, checkedAt) => {
+      stillAvailable.push({ videoId, nextCheckAt, checkedAt });
+    },
+    markVideoDeleted: () => {
+      throw new Error('stories should not be deletion checked');
+    },
+  };
+  const downloader = {
+    listProfileVideos: async () => [],
+    download: async () => ({}),
+    checkVideoAvailable: async () => ({ available: false, reason: 'not found' }),
+  };
+
+  const monitor = new TikTokMonitor({
+    store,
+    downloader,
+    deletionAlert: async (payload) => alerts.push(payload),
+    now: () => now,
+  });
+
+  await monitor.runOnce();
+
+  assert.equal(alerts.length, 0);
+  assert.deepEqual(stillAvailable, [{ videoId: 'story-1', nextCheckAt: null, checkedAt: now }]);
 });
 
 test('runOnce sends deletion alerts for saved posts that disappear', async () => {

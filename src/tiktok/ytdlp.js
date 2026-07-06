@@ -2,7 +2,7 @@ import { spawn as defaultSpawn } from 'node:child_process';
 import { mkdir, mkdtemp, readdir, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { fileSize, isTikTokUrl, makeDownloadLayout, moveDirectoryContents, pickPrimaryVideo, profileUrl as makeProfileUrl, slugify } from '../util/files.js';
+import { fileSize, isTikTokUrl, makeDownloadLayout, moveDirectoryContents, pickPrimaryVideo, profileUrl as makeProfileUrl, storyUrl as makeStoryUrl, slugify } from '../util/files.js';
 
 const METADATA_BASE_ARGS = [
   '--ignore-config',
@@ -51,6 +51,10 @@ export function buildMetadataArgs(sourceUrl, options = {}) {
   if (options.flatPlaylist) args.push('--flat-playlist');
   if (options.playlist === true || options.flatPlaylist) args.push('--yes-playlist');
   else args.push('--no-playlist');
+  const playlistEnd = normalizePositiveInt(options.playlistEnd ?? options.limit);
+  if ((options.playlist === true || options.flatPlaylist) && playlistEnd) {
+    args.push('--playlist-end', String(playlistEnd));
+  }
   if (options.cookiesFile) args.push('--cookies', String(options.cookiesFile));
   if (options.ytdlpCookiesFile) args.push('--cookies', String(options.ytdlpCookiesFile));
   if (Array.isArray(options.extraArgs)) args.push(...options.extraArgs.map(String));
@@ -93,7 +97,10 @@ export async function fetchVideoMetadata(sourceUrl, options = {}) {
 }
 
 export async function listProfileVideos(usernameOrUrl, options = {}) {
-  const sourceUrl = String(usernameOrUrl).startsWith('http') ? String(usernameOrUrl) : makeProfileUrl(usernameOrUrl);
+  const cachedSecUid = normalizeSecUid(options.watch?.sec_uid ?? options.watch?.secUid ?? options.secUid);
+  const sourceUrl = cachedSecUid
+    ? `tiktokuser:${cachedSecUid}`
+    : String(usernameOrUrl).startsWith('http') ? String(usernameOrUrl) : makeProfileUrl(usernameOrUrl);
   const raw = await fetchVideoMetadata(sourceUrl, {
     ...options,
     playlist: true,
@@ -103,11 +110,80 @@ export async function listProfileVideos(usernameOrUrl, options = {}) {
   const entries = Array.isArray(raw.entries)
     ? raw.entries.map((entry, index) => normalizePlaylistEntry(entry, sourceUrl, index))
     : [];
+  const metadata = normalizeMetadata(raw, sourceUrl);
+  if (cachedSecUid && !metadata.secUid) metadata.secUid = cachedSecUid;
+  if (cachedSecUid && !metadata.channel_id) metadata.channel_id = cachedSecUid;
+  if (options.username && !metadata.uploader) metadata.uploader = String(options.username);
+  if (options.username && !metadata.username) metadata.username = String(options.username);
 
   return {
     sourceUrl: String(sourceUrl),
     count: entries.length,
-    metadata: normalizeMetadata(raw, sourceUrl),
+    metadata,
+    entries,
+  };
+}
+
+export async function listProfileStories(usernameOrUrl, options = {}) {
+  const profileUrl = resolveProfileUrl(usernameOrUrl);
+  const cachedAuthorId = normalizeNumericId(options.watch?.author_id ?? options.watch?.authorId ?? options.authorId);
+  const cachedSecUid = normalizeSecUid(options.watch?.sec_uid ?? options.watch?.secUid ?? options.secUid);
+  const cachedHasStory = normalizeOptionalBoolean(options.watch?.has_story ?? options.watch?.hasStory);
+  const cachedUsername = String(options.username ?? options.watch?.username ?? extractUsernameFromUrl(profileUrl) ?? '');
+  const profile = cachedAuthorId && cachedHasStory !== false
+    ? {
+        profileUrl,
+        userId: cachedAuthorId,
+        username: cachedUsername,
+        secUid: cachedSecUid,
+        hasStory: cachedHasStory ?? undefined,
+      }
+    : await fetchProfileStoryIdentity(profileUrl, options);
+  if (!profile.userId || profile.hasStory === false) {
+    return {
+      sourceUrl: profileUrl,
+      storyUrl: makeStoryUrl(profile.username || usernameOrUrl),
+      count: 0,
+      metadata: normalizeMetadata({
+        id: profile.userId || '',
+        user_id: profile.userId || '',
+        uploader_id: profile.userId || '',
+        channel_id: profile.secUid || '',
+        secUid: profile.secUid || '',
+        uploader: profile.username || '',
+        username: profile.username || '',
+        mediaType: 'story',
+        hasStory: profile.hasStory ?? false,
+      }, profileUrl),
+      entries: [],
+    };
+  }
+
+  const raw = await fetchStoryItemList(profile, options);
+  const storySourceUrl = makeStoryUrl(profile.username || usernameOrUrl);
+  const entries = Array.isArray(raw.itemList)
+    ? raw.itemList.map((entry, index) => normalizeStoryEntry(entry, {
+        ...profile,
+        sourceUrl: storySourceUrl,
+      }, index)).filter((entry) => entry.videoId && entry.directVideoUrl)
+    : [];
+  const hasStory = entries.length > 0;
+
+  return {
+    sourceUrl: profileUrl,
+    storyUrl: storySourceUrl,
+    count: entries.length,
+    metadata: normalizeMetadata({
+      id: profile.userId,
+      user_id: profile.userId,
+      uploader_id: profile.userId,
+      channel_id: profile.secUid || '',
+      secUid: profile.secUid || '',
+      uploader: profile.username,
+      username: profile.username,
+      mediaType: 'story',
+      hasStory,
+    }, profileUrl),
     entries,
   };
 }
@@ -126,6 +202,10 @@ export async function downloadVideo(sourceUrl, options = {}) {
 
   if (isPhotoPostMetadata(metadata)) {
     return downloadPhotoPost(sourceUrl, metadata, tempDir, options);
+  }
+
+  if (isStoryMetadata(metadata)) {
+    return downloadStoryPost(sourceUrl, metadata, tempDir, options);
   }
 
   let stdout = '';
@@ -178,6 +258,8 @@ export async function downloadVideo(sourceUrl, options = {}) {
     title: normalized.title || '',
     description: normalized.description || '',
     thumbnailUrl: normalized.thumbnail || '',
+    mediaType: normalized.mediaType || '',
+    duration: numberOrNull(normalized.duration) ?? 0,
     stdout,
     stderr,
   };
@@ -415,6 +497,7 @@ function normalizeMetadata(metadata, sourceUrl) {
   const raw = metadata && typeof metadata === 'object' ? metadata : {};
   const videoId = String(raw.id ?? '');
   const webpageUrl = String(raw.webpage_url ?? raw.original_url ?? sourceUrl ?? '');
+  const mediaType = resolveMediaType(raw, webpageUrl || sourceUrl);
   return {
     ...raw,
     sourceUrl: String(sourceUrl),
@@ -422,24 +505,244 @@ function normalizeMetadata(metadata, sourceUrl) {
     videoId,
     uploader: String(raw.uploader ?? raw.channel ?? raw.creator ?? ''),
     title: String(raw.title ?? ''),
+    mediaType,
   };
 }
 
-function normalizePlaylistEntry(entry, sourceUrl, index) {
+function normalizePlaylistEntry(entry, sourceUrl, index, defaults = {}) {
   const raw = entry && typeof entry === 'object' ? entry : {};
-  const videoUrl = String(raw.webpage_url ?? raw.original_url ?? raw.url ?? sourceUrl ?? '');
+  const mediaType = resolveMediaType({ ...defaults, ...raw }, raw.webpage_url ?? raw.original_url ?? raw.url ?? sourceUrl);
+  const videoId = String(raw.id ?? extractIdFromEntryUrl(raw.url) ?? '');
+  const videoUrl = resolvePlaylistEntryUrl(raw, sourceUrl, mediaType, videoId);
   return {
     ...raw,
-    id: String(raw.id ?? ''),
+    id: videoId,
     position: index + 1,
     sourceUrl: String(sourceUrl),
     url: videoUrl,
     webpage_url: videoUrl,
     videoUrl,
-    videoId: String(raw.id ?? ''),
+    videoId,
     title: String(raw.title ?? ''),
     uploader: String(raw.uploader ?? raw.channel ?? raw.creator ?? ''),
+    mediaType,
   };
+}
+
+function resolvePlaylistEntryUrl(entry = {}, sourceUrl = '', mediaType = '', videoId = '') {
+  for (const value of [entry.webpage_url, entry.original_url, entry.url]) {
+    const text = String(value ?? '');
+    if (/^https?:\/\//i.test(text)) return text;
+  }
+
+  const username = String(
+    entry.uploader
+      ?? entry.channel
+      ?? entry.creator
+      ?? extractUsernameFromUrl(sourceUrl)
+      ?? '',
+  );
+  if (username && videoId) {
+    const kind = mediaType === 'story' ? 'story' : 'video';
+    return `https://www.tiktok.com/@${username}/${kind}/${videoId}`;
+  }
+
+  return String(sourceUrl ?? '');
+}
+
+function extractUsernameFromUrl(sourceUrl = '') {
+  const match = String(sourceUrl).match(/\/@([^/?#]+)/);
+  return match?.[1] ?? '';
+}
+
+function extractIdFromEntryUrl(value = '') {
+  const text = String(value ?? '');
+  if (/^\d{10,}$/.test(text)) return text;
+  return text.match(/(\d{10,})/g)?.at(-1) ?? '';
+}
+
+function normalizeSecUid(value = '') {
+  const text = String(value ?? '').trim();
+  return /^MS4wLjABAAAA[\w-]{64}$/.test(text) ? text : '';
+}
+
+function normalizeNumericId(value = '') {
+  const text = String(value ?? '').trim();
+  return /^\d{10,}$/.test(text) ? text : '';
+}
+
+function normalizeOptionalBoolean(value) {
+  if (value === true || value === 1 || value === '1') return true;
+  if (value === false || value === 0 || value === '0') return false;
+  return null;
+}
+
+function normalizePositiveInt(value) {
+  const parsed = Number.parseInt(String(value ?? ''), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function resolveMediaType(metadata = {}, sourceUrl = '') {
+  const explicit = String(metadata.mediaType ?? metadata.media_type ?? metadata.type ?? '').toLowerCase();
+  if (explicit.includes('story')) return 'story';
+  if (explicit.includes('slideshow') || explicit.includes('photo')) return 'slideshow';
+  const textUrl = String(sourceUrl ?? '').toLowerCase();
+  if (/\/story(\/|$)/.test(textUrl)) return 'story';
+  if (/\/photo(\/|$)/.test(textUrl)) return 'slideshow';
+  return '';
+}
+
+function resolveProfileUrl(usernameOrUrl) {
+  const text = String(usernameOrUrl ?? '');
+  if (/^https?:\/\//i.test(text)) {
+    const username = extractUsernameFromUrl(text);
+    return username ? makeProfileUrl(username) : text;
+  }
+  return makeProfileUrl(text);
+}
+
+async function fetchProfileStoryIdentity(profileUrl, options = {}) {
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  if (typeof fetchImpl !== 'function') {
+    throw new Error('Fetch API is not available for TikTok story lookup.');
+  }
+
+  const response = await fetchImpl(String(profileUrl), {
+    redirect: 'follow',
+    headers: {
+      'user-agent': MOBILE_USER_AGENT,
+      'accept-language': 'en-US,en;q=0.9',
+      accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    },
+  });
+  if (!response?.ok) {
+    throw new Error(`TikTok profile request failed with status ${response?.status ?? 'unknown'}.`);
+  }
+
+  let data;
+  try {
+    data = parseRehydrationJson(await response.text());
+  } catch (error) {
+    throw Object.assign(new Error('TikTok profile identity data was not found.'), {
+      kind: 'story_profile_not_found',
+      sourceUrl: String(profileUrl),
+      cause: error,
+    });
+  }
+
+  const user = findProfileUser(data);
+  if (!user?.id) {
+    throw Object.assign(new Error('TikTok profile identity data was not found.'), {
+      kind: 'story_profile_not_found',
+      sourceUrl: String(profileUrl),
+    });
+  }
+
+  const username = String(user.uniqueId ?? extractUsernameFromUrl(profileUrl) ?? '');
+  const storyStatus = numberOrNull(user.UserStoryStatus ?? user.userStoryStatus ?? user.storyStatus);
+  return {
+    profileUrl: String(response.url || profileUrl),
+    userId: String(user.id),
+    username,
+    secUid: String(user.secUid ?? ''),
+    hasStory: storyStatus === 0 ? false : storyStatus > 0 ? true : undefined,
+  };
+}
+
+async function fetchStoryItemList(profile, options = {}) {
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  if (typeof fetchImpl !== 'function') {
+    throw new Error('Fetch API is not available for TikTok story lookup.');
+  }
+
+  const apiUrl = new URL('/api/story/item_list/', 'https://www.tiktok.com');
+  apiUrl.searchParams.set('authorId', profile.userId);
+  apiUrl.searchParams.set('cursor', '0');
+  apiUrl.searchParams.set('loadBackward', 'false');
+  apiUrl.searchParams.set('aid', '1988');
+  apiUrl.searchParams.set('count', String(Number(options.limit ?? 4) || 4));
+
+  const response = await fetchImpl(apiUrl.toString(), {
+    redirect: 'follow',
+    headers: {
+      'user-agent': MOBILE_USER_AGENT,
+      'accept-language': 'en-US,en;q=0.9',
+      accept: 'application/json,text/plain,*/*',
+      referer: profile.profileUrl || makeProfileUrl(profile.username || ''),
+    },
+  });
+  if (!response?.ok) {
+    throw new Error(`TikTok story request failed with status ${response?.status ?? 'unknown'}.`);
+  }
+
+  const payload = await response.json();
+  const statusCode = numberOrNull(payload?.statusCode ?? payload?.status_code ?? 0) ?? 0;
+  if (statusCode !== 0) {
+    throw Object.assign(new Error(String(payload?.statusMsg ?? payload?.status_msg ?? 'TikTok story request failed.')), {
+      kind: 'story_lookup_failed',
+      statusCode,
+    });
+  }
+  return payload;
+}
+
+function normalizeStoryEntry(item, profile = {}, index = 0) {
+  const raw = item && typeof item === 'object' ? item : {};
+  const video = raw.video && typeof raw.video === 'object' ? raw.video : {};
+  const id = String(raw.id ?? video.id ?? video.videoID ?? '');
+  const username = String(raw.author?.uniqueId ?? profile.username ?? '');
+  const storyPageUrl = username && id ? `https://www.tiktok.com/@${username}/story/${id}` : String(profile.sourceUrl ?? '');
+  const directVideoUrl = firstString(
+    video.playAddr,
+    video.downloadAddr,
+    video.PlayAddrStruct?.UrlList,
+    video.PlayAddrStruct?.urlList,
+    video.bitRateInfo?.map((entry) => entry?.PlayAddr?.UrlList ?? entry?.PlayAddr?.urlList),
+  );
+  const dataSize = numberOrNull(video.PlayAddrStruct?.DataSize ?? video.size ?? video.dataSize) ?? 0;
+  return {
+    id,
+    position: index + 1,
+    sourceUrl: String(profile.sourceUrl ?? storyPageUrl),
+    url: storyPageUrl,
+    webpage_url: storyPageUrl,
+    videoUrl: storyPageUrl,
+    videoId: id,
+    title: String(raw.desc || (id ? `Story ${id}` : 'Story')),
+    description: String(raw.desc ?? ''),
+    uploader: username,
+    username,
+    mediaType: 'story',
+    directVideoUrl,
+    timestamp: numberOrNull(raw.createTime) ?? 0,
+    duration: numberOrNull(video.duration) ?? 0,
+    thumbnail: firstString(video.cover, video.dynamicCover, video.originCover) || '',
+    filesizeApprox: dataSize,
+    storyExpiresAt: numberOrNull(raw.story?.ExpiredAt ?? raw.story?.expiredAt) ?? 0,
+  };
+}
+
+function firstString(...values) {
+  for (const value of values) {
+    const text = firstStringValue(value);
+    if (text) return text;
+  }
+  return '';
+}
+
+function firstStringValue(value) {
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'bigint') return String(value);
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const text = firstStringValue(entry);
+      if (text) return text;
+    }
+  }
+  if (value && typeof value === 'object') {
+    return firstStringValue(value.UrlList ?? value.urlList ?? value.urls ?? value.url);
+  }
+  return '';
 }
 
 async function downloadPhotoPost(sourceUrl, metadata, tempDir, options = {}) {
@@ -534,6 +837,84 @@ async function downloadPhotoPost(sourceUrl, metadata, tempDir, options = {}) {
     mediaType: 'slideshow',
     imageCount: imageEntries.length,
     slideshowImagePaths,
+    duration: 0,
+    stdout: '',
+    stderr: '',
+  };
+}
+
+async function downloadStoryPost(sourceUrl, metadata, tempDir, options = {}) {
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  if (typeof fetchImpl !== 'function') {
+    throw new Error('Fetch API is not available for TikTok story download.');
+  }
+
+  const normalized = normalizeMetadata(metadata, sourceUrl);
+  const directVideoUrl = firstString(
+    metadata.directVideoUrl,
+    metadata.playAddr,
+    metadata.downloadAddr,
+    metadata.video?.playAddr,
+    metadata.video?.downloadAddr,
+    metadata.video?.PlayAddrStruct?.UrlList,
+  );
+  if (!directVideoUrl) {
+    throw Object.assign(new Error('TikTok story did not include a downloadable video URL.'), {
+      kind: 'story_video_url_not_found',
+      sourceUrl: String(sourceUrl),
+    });
+  }
+
+  const response = await fetchImpl(directVideoUrl, {
+    redirect: 'follow',
+    headers: {
+      'user-agent': MOBILE_USER_AGENT,
+      accept: 'video/mp4,video/*,*/*',
+      referer: normalized.webpageUrl || String(sourceUrl),
+    },
+  });
+  if (!response?.ok) {
+    throw new Error(`TikTok story video request failed with status ${response?.status ?? 'unknown'}.`);
+  }
+
+  const videoId = normalized.videoId || normalized.id || 'story';
+  const contentType = String(response.headers?.get?.('content-type') ?? '');
+  const extension = extensionFromVideoContentType(contentType) || extensionFromVideoUrl(response.url || directVideoUrl) || 'mp4';
+  const videoPath = path.join(tempDir, `${slugify(videoId, 'story')}.${extension}`);
+  const infoJson = `${videoId}.info.json`;
+  const descriptionFile = `${videoId}.description`;
+  await writeFile(videoPath, Buffer.from(await response.arrayBuffer()));
+  await writeFile(path.join(tempDir, infoJson), JSON.stringify(metadata, null, 2));
+  if (normalized.description) {
+    await writeFile(path.join(tempDir, descriptionFile), String(normalized.description));
+  }
+
+  let downloadDir = tempDir;
+  let files = await collectFiles(tempDir);
+  if (options.downloadDir) {
+    const layout = makeDownloadLayout({ downloadDir: options.downloadDir }, normalized);
+    downloadDir = layout.dir;
+    files = await moveDirectoryContents(tempDir, downloadDir);
+  }
+
+  const primaryFile = pickPrimaryVideo(files) || pickPrimaryFile(files);
+  const sizeBytes = primaryFile ? await fileSize(primaryFile) : 0;
+  return {
+    sourceUrl: String(sourceUrl),
+    metadata: normalized,
+    downloadDir,
+    files,
+    primaryFile,
+    filePath: primaryFile,
+    filename: primaryFile ? path.basename(primaryFile) : '',
+    sizeBytes,
+    videoId,
+    username: normalized.uploader || '',
+    title: normalized.title || '',
+    description: normalized.description || '',
+    thumbnailUrl: normalized.thumbnail || '',
+    mediaType: 'story',
+    duration: numberOrNull(normalized.duration) ?? 0,
     stdout: '',
     stderr: '',
   };
@@ -640,9 +1021,27 @@ function isPhotoPostMetadata(metadata) {
     && metadata.imageUrls.length > 0;
 }
 
+function isStoryMetadata(metadata) {
+  return resolveMediaType(metadata, metadata?.webpage_url ?? metadata?.webpageUrl ?? metadata?.url ?? '') === 'story'
+    && Boolean(firstString(
+      metadata?.directVideoUrl,
+      metadata?.playAddr,
+      metadata?.downloadAddr,
+      metadata?.video?.playAddr,
+      metadata?.video?.downloadAddr,
+      metadata?.video?.PlayAddrStruct?.UrlList,
+    ));
+}
+
 function parseRehydrationJson(html) {
+  const text = String(html);
+  const scriptMatch = text.match(/<script[^>]+id=["'](?:__UNIVERSAL_DATA_FOR_REHYDRATION__|SIGI_STATE)["'][^>]*>([\s\S]*?)<\/script>/i);
+  if (scriptMatch) {
+    return JSON.parse(scriptMatch[1]);
+  }
+
   const marker = 'id="__UNIVERSAL_DATA_FOR_REHYDRATION__"';
-  const markerIndex = String(html).indexOf(marker);
+  const markerIndex = text.indexOf(marker);
   if (markerIndex < 0) {
     throw Object.assign(new Error('TikTok rehydration data was not found.'), {
       kind: 'photo_metadata_not_found',
@@ -651,8 +1050,8 @@ function parseRehydrationJson(html) {
     });
   }
 
-  const contentStart = String(html).indexOf('>', markerIndex);
-  const contentEnd = String(html).indexOf('</script>', contentStart);
+  const contentStart = text.indexOf('>', markerIndex);
+  const contentEnd = text.indexOf('</script>', contentStart);
   if (contentStart < 0 || contentEnd < 0) {
     throw Object.assign(new Error('TikTok rehydration data was malformed.'), {
       kind: 'photo_metadata_not_found',
@@ -661,7 +1060,7 @@ function parseRehydrationJson(html) {
     });
   }
 
-  return JSON.parse(String(html).slice(contentStart + 1, contentEnd));
+  return JSON.parse(text.slice(contentStart + 1, contentEnd));
 }
 
 function findPhotoItem(value) {
@@ -676,6 +1075,31 @@ function findPhotoItem(value) {
   if (Array.isArray(value.imagePost?.images)) return value;
   for (const entry of Object.values(value)) {
     const found = findPhotoItem(entry);
+    if (found) return found;
+  }
+  return null;
+}
+
+function findProfileUser(value) {
+  if (!value || typeof value !== 'object') return null;
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const found = findProfileUser(entry);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  const scoped = value.__DEFAULT_SCOPE__?.['webapp.user-detail']?.userInfo?.user;
+  if (scoped?.id && scoped?.uniqueId) return scoped;
+
+  const userInfo = value.userInfo?.user;
+  if (userInfo?.id && userInfo?.uniqueId) return userInfo;
+
+  if (value.id && value.uniqueId && value.secUid) return value;
+
+  for (const entry of Object.values(value)) {
+    const found = findProfileUser(entry);
     if (found) return found;
   }
   return null;
@@ -708,11 +1132,30 @@ function extensionFromContentType(contentType) {
   return '';
 }
 
+function extensionFromVideoContentType(contentType) {
+  if (/mp4|mpeg4/i.test(contentType)) return 'mp4';
+  if (/webm/i.test(contentType)) return 'webm';
+  if (/quicktime|mov/i.test(contentType)) return 'mov';
+  if (/matroska|mkv/i.test(contentType)) return 'mkv';
+  return '';
+}
+
 function extensionFromUrl(url) {
   const pathname = new URL(String(url)).pathname;
   const extension = path.extname(pathname).replace(/^\./, '').toLowerCase();
   if (['jpg', 'jpeg', 'png', 'webp', 'gif', 'heic'].includes(extension)) {
     return extension === 'jpeg' ? 'jpg' : extension;
+  }
+  return '';
+}
+
+function extensionFromVideoUrl(url) {
+  try {
+    const pathname = new URL(String(url)).pathname;
+    const extension = path.extname(pathname).replace(/^\./, '').toLowerCase();
+    if (['mp4', 'webm', 'mov', 'mkv', 'm4v'].includes(extension)) return extension;
+  } catch {
+    return '';
   }
   return '';
 }

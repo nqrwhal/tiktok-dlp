@@ -23,6 +23,10 @@ export function profileUrl(username) {
   return `https://www.tiktok.com/@${normalizeUsername(username)}`;
 }
 
+export function storyUrl(username) {
+  return `https://www.tiktok.com/@${normalizeUsername(username)}/story`;
+}
+
 export function isTikTokUrl(value) {
   try {
     const url = new URL(String(value));
@@ -52,6 +56,8 @@ export function extractVideoId(value) {
   const text = String(value ?? '');
   const videoMatch = text.match(/\/video\/(\d+)/);
   if (videoMatch) return videoMatch[1];
+  const storyMatch = text.match(/\/story\/(\d+)/);
+  if (storyMatch) return storyMatch[1];
   const lastDigits = text.match(/(\d{10,})/g)?.at(-1);
   return lastDigits ?? '';
 }

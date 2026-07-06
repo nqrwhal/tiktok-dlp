@@ -404,13 +404,22 @@ export async function sendUsernameChangeAlert({ client, config, change, watch })
 export async function buildMonitorAlertPayload(result, config, { video = {}, watch = {}, now = Date.now() } = {}) {
   const username = watch?.username || result?.username || video?.username || video?.uploader || 'unknown';
   const sourceUrl = result?.sourceUrl || video?.sourceUrl || video?.url || video?.webpage_url || '';
-  const link = result?.publicUrl || (result?.token ? makePublicFileUrl(config, result.token) : '');
   const attachments = buildMonitorAlertAttachments(result, config);
   const fields = [
     {
-      name: 'Saved Copy',
-      value: link ? `[Permanent server copy](${link})` : 'Saved permanently on the server.',
-      inline: false,
+      name: 'Type',
+      value: formatMediaTypeLabel(result, video),
+      inline: true,
+    },
+    {
+      name: 'Size',
+      value: formatBytes(result?.sizeBytes || 0),
+      inline: true,
+    },
+    {
+      name: 'Duration',
+      value: formatDuration(result?.duration ?? video?.duration),
+      inline: true,
     },
   ];
 
@@ -848,7 +857,7 @@ function buildMonitorActionRows(result, config = {}) {
   if (link) {
     components.push(
       new ButtonBuilder()
-        .setLabel(result?.mediaType === 'slideshow' ? 'Download ZIP' : 'Download video')
+        .setLabel(formatDownloadButtonLabel(result))
         .setStyle(ButtonStyle.Link)
         .setURL(link),
     );
@@ -919,13 +928,13 @@ function formatStandardSlideshowNote(result, attachmentMode) {
 function buildStandardDownloadTitle(username, result, video, now) {
   const uploadAt = resolveUploadTimestampMs(result, video);
   const age = uploadAt ? ` - ${formatCompactDuration(Math.max(0, now - uploadAt))} old` : '';
-  return truncateText(`Downloaded post by @${username}${age}`, 256);
+  return truncateText(`Downloaded ${mediaLabel(result, video)} by @${username}${age}`, 256);
 }
 
 function buildMonitorAlertTitle(username, result, video, now) {
   const uploadAt = resolveUploadTimestampMs(result, video);
   const age = uploadAt ? ` - ${formatCompactDuration(Math.max(0, now - uploadAt))} old` : '';
-  return truncateText(`New post by @${username}${age}`, 256);
+  return truncateText(`New ${mediaLabel(result, video)} by @${username}${age}`, 256);
 }
 
 function resolveUploadTimestampMs(result = {}, video = {}) {
@@ -971,6 +980,28 @@ function formatCompactDuration(ms) {
   if (hours < 24) return `${hours}h`;
   const days = Math.round(hours / 24);
   return `${days}d`;
+}
+
+function formatDuration(value) {
+  const seconds = Number(value ?? 0);
+  if (!Number.isFinite(seconds) || seconds <= 0) return 'N/A';
+  const rounded = Math.round(seconds);
+  const minutes = Math.floor(rounded / 60);
+  const remainingSeconds = rounded % 60;
+  if (minutes <= 0) return `${remainingSeconds}s`;
+  return `${minutes}m ${String(remainingSeconds).padStart(2, '0')}s`;
+}
+
+function formatMediaTypeLabel(result = {}, video = {}) {
+  const type = mediaLabel(result, video);
+  return type.charAt(0).toUpperCase() + type.slice(1);
+}
+
+function formatDownloadButtonLabel(result = {}) {
+  const type = mediaLabel(result);
+  if (type === 'slideshow') return 'Download ZIP';
+  if (type === 'story') return 'Download story';
+  return 'Download video';
 }
 
 function canDeleteMonitorPost(interaction) {
@@ -1019,6 +1050,8 @@ function canPurgeAll(interaction) {
 }
 
 function buildStatusEmbed(stats, monitorStatus) {
+  const metrics = monitorStatus.metrics ?? {};
+  const lastSummary = metrics.lastSummary ?? {};
   return new EmbedBuilder()
     .setColor(UI_COLORS.success)
     .setTitle('TikTok downloader status')
@@ -1028,8 +1061,38 @@ function buildStatusEmbed(stats, monitorStatus) {
       { name: 'Files', value: String(stats.fileCount), inline: true },
       { name: 'Monitor', value: monitorStatus.running ? 'running' : 'stopped', inline: true },
       { name: 'Last poll', value: monitorStatus.lastPollAt ? new Date(monitorStatus.lastPollAt).toISOString() : 'never', inline: true },
+      { name: 'Interval', value: formatDurationMs(monitorStatus.pollIntervalMs), inline: true },
+      { name: 'Scan window', value: `${monitorStatus.scanLimit ?? 5} / ${monitorStatus.burstScanLimit ?? 20} burst`, inline: true },
+      { name: 'Check workers', value: String(monitorStatus.checkConcurrency ?? 1), inline: true },
+      { name: 'Download workers', value: String(monitorStatus.downloadConcurrency ?? 1), inline: true },
+      { name: 'Download queue', value: `${monitorStatus.activeDownloads ?? 0} active / ${monitorStatus.queueLength ?? 0} queued`, inline: true },
+      { name: 'Download totals', value: `${metrics.totalCompletedDownloads ?? 0} ok / ${metrics.totalDownloadFailures ?? 0} failed`, inline: true },
+      { name: 'Last cycle', value: formatMonitorCycle(metrics, lastSummary), inline: false },
     )
     .setTimestamp(new Date());
+}
+
+function formatMonitorCycle(metrics = {}, summary = {}) {
+  if (!metrics.lastCycleStartedAt) return 'No monitor cycle has completed yet.';
+  return [
+    `duration: ${formatDurationMs(metrics.lastCycleDurationMs)}`,
+    `checked: ${summary.watchedUsers ?? 0}`,
+    `skipped: ${summary.skippedUsers ?? 0}`,
+    `scanned: ${summary.scannedVideos ?? 0}`,
+    `queued: ${summary.queuedDownloads ?? 0}`,
+    `failures: ${summary.failures ?? 0}`,
+    `downloads: ${summary.downloadedVideos ?? 0} ok / ${summary.alertedVideos ?? 0} alerted`,
+  ].join(' - ');
+}
+
+function formatDurationMs(value) {
+  const ms = Math.max(0, Number(value) || 0);
+  if (ms < 1000) return `${ms}ms`;
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return remainder ? `${minutes}m ${remainder}s` : `${minutes}m`;
 }
 
 function pingPrefix(config) {
@@ -1039,8 +1102,10 @@ function pingPrefix(config) {
   return '';
 }
 
-function mediaLabel(result) {
-  return result?.mediaType === 'slideshow' ? 'slideshow' : 'post';
+function mediaLabel(result = {}, fallback = {}) {
+  const mediaType = result?.mediaType || fallback?.mediaType;
+  if (mediaType === 'story') return 'story';
+  return mediaType === 'slideshow' ? 'slideshow' : 'post';
 }
 
 function alertReadyText(result) {
