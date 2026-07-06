@@ -10,9 +10,12 @@ import {
   classifyYtdlpError,
   downloadVideo,
   fetchVideoMetadata,
+  listProfileStories,
   listProfileVideos,
   parsePhotoPostMetadata,
 } from '../src/tiktok/ytdlp.js';
+
+const TEST_SEC_UID = `MS4wLjABAAAA${'a'.repeat(64)}`;
 
 test('buildMetadataArgs builds a conservative metadata command', () => {
   const args = buildMetadataArgs('https://www.tiktok.com/@user/video/123', {
@@ -36,6 +39,12 @@ test('buildMetadataArgs builds a conservative metadata command', () => {
     'tiktok:foo=bar',
     'https://www.tiktok.com/@user/video/123',
   ]);
+
+  const playlistArgs = buildMetadataArgs('https://www.tiktok.com/@user', {
+    flatPlaylist: true,
+    limit: 7,
+  });
+  assert.deepStrictEqual(playlistArgs.slice(-3), ['--playlist-end', '7', 'https://www.tiktok.com/@user']);
 });
 
 test('buildDownloadArgs points yt-dlp at explicit output dirs', () => {
@@ -104,6 +113,44 @@ test('fetchVideoMetadata, listProfileVideos, and downloadVideo work with a fake 
   assert.equal(profile.count, 2);
   assert.equal(profile.entries[0].videoId, '111');
   assert.equal(profile.entries[1].title, 'Second');
+
+  const cachedProfile = await listProfileVideos('https://www.tiktok.com/@creator', {
+    ytdlpPath: fake,
+    username: 'creator',
+    watch: { sec_uid: TEST_SEC_UID },
+  });
+  assert.equal(cachedProfile.sourceUrl, `tiktokuser:${TEST_SEC_UID}`);
+  assert.equal(cachedProfile.metadata.channel_id, TEST_SEC_UID);
+
+  const storyFetch = createStoryFetch();
+  const stories = await listProfileStories('creator', { fetchImpl: storyFetch, limit: 2 });
+  assert.equal(stories.count, 1);
+  assert.equal(stories.entries[0].mediaType, 'story');
+  assert.equal(stories.entries[0].url, 'https://www.tiktok.com/@creator/story/3333333333');
+  assert.equal(stories.entries[0].directVideoUrl, 'https://cdn.example.test/story.mp4');
+  assert.equal(stories.entries[0].duration, 12);
+
+  const cachedStoryFetch = createStoryFetch();
+  const cachedStories = await listProfileStories('creator', {
+    fetchImpl: cachedStoryFetch,
+    limit: 2,
+    username: 'creator',
+    watch: { author_id: '424242424242', sec_uid: TEST_SEC_UID },
+  });
+  assert.equal(cachedStories.count, 1);
+  assert.equal(cachedStoryFetch.profileRequests, 0);
+
+  const storyRoot = await mkdtemp(path.join(os.tmpdir(), 'tiktok-story-downloads-'));
+  const storyDownload = await downloadVideo(stories.entries[0].url, {
+    fetchImpl: storyFetch,
+    metadata: stories.entries[0],
+    downloadDir: storyRoot,
+  });
+  assert.equal(storyDownload.mediaType, 'story');
+  assert.equal(storyDownload.filename, '3333333333.mp4');
+  assert.equal(storyDownload.duration, 12);
+  assert.ok(storyDownload.primaryFile.startsWith(storyRoot));
+  assert.equal((await readFile(storyDownload.primaryFile)).toString(), 'fake story video');
 
   const download = await downloadVideo(url, { ytdlpPath: fake });
   assert.equal(download.metadata.id, '9876543210');
@@ -179,14 +226,29 @@ const has = (flag) => args.includes(flag);
 const valuesAfter = (flag) => args.flatMap((arg, index) => arg === flag ? [args[index + 1]] : []);
 
 if (has('--dump-single-json')) {
-  if (has('--flat-playlist')) {
+  const sourceUrl = args[args.length - 1] || '';
+  if (sourceUrl.includes('/story')) {
     process.stdout.write(JSON.stringify({
       _type: 'playlist',
-      id: 'creator',
+      id: 'creator-stories',
+      title: 'Creator stories',
+      entries: [
+        { id: '3333333333', title: 'Story', url: '3333333333', duration: 12 },
+      ],
+    }));
+    process.exit(0);
+  }
+
+  if (has('--flat-playlist')) {
+    const isSecUidProfile = sourceUrl.startsWith('tiktokuser:');
+    const secUid = isSecUidProfile ? sourceUrl.slice('tiktokuser:'.length) : 'creator';
+    process.stdout.write(JSON.stringify({
+      _type: 'playlist',
+      id: secUid,
       title: 'Creator uploads',
       entries: [
-        { id: '111', title: 'First', webpage_url: 'https://www.tiktok.com/@creator/video/111' },
-        { id: '222', title: 'Second', webpage_url: 'https://www.tiktok.com/@creator/video/222' },
+        { id: '111', title: 'First', uploader: 'creator', uploader_id: '424242424242', channel_id: isSecUidProfile ? secUid : '${TEST_SEC_UID}', webpage_url: 'https://www.tiktok.com/@creator/video/111' },
+        { id: '222', title: 'Second', uploader: 'creator', uploader_id: '424242424242', channel_id: isSecUidProfile ? secUid : '${TEST_SEC_UID}', webpage_url: 'https://www.tiktok.com/@creator/video/222' },
       ],
     }));
     process.exit(0);
@@ -254,6 +316,89 @@ function createPhotoFetch() {
       text: async () => makePhotoHtml(),
     };
   };
+}
+
+function createStoryFetch() {
+  const fetchImpl = async (url) => {
+    const textUrl = String(url);
+    if (textUrl.includes('/api/story/item_list/')) {
+      const parsed = new URL(textUrl);
+      assert.equal(parsed.searchParams.get('authorId'), '424242424242');
+      assert.equal(parsed.searchParams.get('count'), '2');
+      return {
+        ok: true,
+        status: 200,
+        url: textUrl,
+        json: async () => ({
+          statusCode: 0,
+          TotalCount: 1,
+          itemList: [
+            {
+              id: '3333333333',
+              desc: 'Story',
+              createTime: '1780000000',
+              author: {
+                uniqueId: 'creator',
+              },
+              story: {
+                ExpiredAt: 1780086400000,
+              },
+              video: {
+                id: '3333333333',
+                duration: 12,
+                cover: 'https://cdn.example.test/story.jpg',
+                PlayAddrStruct: {
+                  DataSize: 16,
+                  UrlList: ['https://cdn.example.test/story.mp4'],
+                },
+              },
+            },
+          ],
+        }),
+      };
+    }
+
+    if (textUrl === 'https://cdn.example.test/story.mp4') {
+      const video = Buffer.from('fake story video');
+      return {
+        ok: true,
+        status: 200,
+        url: textUrl,
+        headers: { get: () => 'video/mp4' },
+        arrayBuffer: async () => video.buffer.slice(video.byteOffset, video.byteOffset + video.byteLength),
+      };
+    }
+
+    if (textUrl.includes('www.tiktok.com/@creator')) {
+      fetchImpl.profileRequests += 1;
+    }
+    return {
+      ok: true,
+      status: 200,
+      url: 'https://www.tiktok.com/@creator',
+      text: async () => makeStoryProfileHtml(),
+    };
+  };
+  fetchImpl.profileRequests = 0;
+  return fetchImpl;
+}
+
+function makeStoryProfileHtml() {
+  const data = {
+    __DEFAULT_SCOPE__: {
+      'webapp.user-detail': {
+        userInfo: {
+          user: {
+            id: '424242424242',
+            uniqueId: 'creator',
+            secUid: TEST_SEC_UID,
+            UserStoryStatus: 1,
+          },
+        },
+      },
+    },
+  };
+  return `<html><script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">${JSON.stringify(data)}</script></html>`;
 }
 
 function makePhotoHtml() {
