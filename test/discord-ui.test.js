@@ -134,6 +134,7 @@ test('monitor alert payload is embed-first with monitor-only buttons', async () 
     title: 'fresh post',
     sourceUrl: 'https://www.tiktok.com/@creator/video/123',
     sizeBytes: 1024,
+    duration: 12,
     videoId: '123',
     username: 'creator',
     timestamp: 1_700_000_000,
@@ -148,6 +149,11 @@ test('monitor alert payload is embed-first with monitor-only buttons', async () 
 
   assert.equal(payload.content, undefined);
   assert.equal(payload.embeds[0].data.title, 'New post by @creator - 2m old');
+  const fields = Object.fromEntries(payload.embeds[0].data.fields.map((field) => [field.name, field.value]));
+  assert.equal(fields.Type, 'Post');
+  assert.equal(fields.Size, '1.0 KB');
+  assert.equal(fields.Duration, '12s');
+  assert.equal(fields['Saved Copy'], undefined);
   assert.equal(payload.files.length, 1);
   assert.deepEqual(
     payload.components[0].components.map((button) => button.data.label),
@@ -155,6 +161,43 @@ test('monitor alert payload is embed-first with monitor-only buttons', async () 
   );
   assert.equal(payload.components[0].components[0].data.url, 'https://example.com/files/monitor-token');
   assert.equal(payload.components[0].components[1].data.custom_id, 'monitor:delete:monitor-token');
+});
+
+test('monitor story alert payload reflects story type and keeps download in the button', async () => {
+  const payload = await buildMonitorAlertPayload({
+    token: 'story-token',
+    publicUrl: 'https://example.com/files/story-token',
+    filePath: '/tmp/story.mp4',
+    filename: 'story.mp4',
+    title: 'story clip',
+    sourceUrl: 'https://www.tiktok.com/@creator/story/123',
+    sizeBytes: 2048,
+    duration: 9,
+    videoId: '123',
+    username: 'creator',
+    mediaType: 'story',
+    timestamp: 1_700_000_000,
+    linkPermanent: true,
+  }, {
+    publicBaseUrl: 'https://example.com',
+    discordUploadLimitBytes: 10,
+  }, {
+    watch: { username: 'creator' },
+    now: 1_700_000_120_000,
+  });
+
+  const fields = Object.fromEntries(payload.embeds[0].data.fields.map((field) => [field.name, field.value]));
+  assert.equal(payload.embeds[0].data.title, 'New story by @creator - 2m old');
+  assert.equal(fields.Type, 'Story');
+  assert.equal(fields.Size, '2.0 KB');
+  assert.equal(fields.Duration, '9s');
+  assert.equal(fields['Saved Copy'], undefined);
+  assert.equal(payload.files.length, 0);
+  assert.deepEqual(
+    payload.components[0].components.map((button) => button.data.label),
+    ['Download story', 'Delete post'],
+  );
+  assert.equal(payload.components[0].components[0].data.url, 'https://example.com/files/story-token');
 });
 
 test('monitor slideshow alerts attach galleries only when Discord can show all images', async () => {
