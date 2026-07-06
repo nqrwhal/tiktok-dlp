@@ -30,8 +30,9 @@ cleanupExpiredDownloads({ config, store }).catch((error) => {
   console.error('[cleanup] Initial expired download cleanup failed:', error);
 });
 
-async function downloadOne(sourceUrl, { delivery = 'auto', type = 'manual', username = '', requestedBy = '', permanent = type === 'monitor' } = {}) {
-  const metadata = await fetchVideoMetadata(sourceUrl, config);
+async function downloadOne(sourceUrl, { delivery = 'auto', type = 'manual', username = '', requestedBy = '', permanent = type === 'monitor', metadata: providedMetadata = null } = {}) {
+  const resolvedSourceUrl = sourceUrl || providedMetadata?.url || providedMetadata?.webpage_url || providedMetadata?.sourceUrl || '';
+  const metadata = providedMetadata ?? await fetchVideoMetadata(resolvedSourceUrl, config);
   const resolvedUsername = username || metadata.uploader || metadata.channel || '';
   const downloadMetadata = resolvedUsername
     ? { ...metadata, uploader: resolvedUsername, username: resolvedUsername }
@@ -41,7 +42,7 @@ async function downloadOne(sourceUrl, { delivery = 'auto', type = 'manual', user
     status: 'downloading',
     requestedBy,
     username: resolvedUsername,
-    sourceUrl,
+    sourceUrl: resolvedSourceUrl,
     videoId: downloadMetadata.id || '',
     title: downloadMetadata.title || '',
   });
@@ -51,7 +52,7 @@ async function downloadOne(sourceUrl, { delivery = 'auto', type = 'manual', user
     if (existing) {
       const result = await createDownloadResultFromFile({
         metadata: downloadMetadata,
-        sourceUrl,
+        sourceUrl: resolvedSourceUrl,
         delivery,
         jobId,
         fileRecord: existing,
@@ -68,7 +69,7 @@ async function downloadOne(sourceUrl, { delivery = 'auto', type = 'manual', user
       return result;
     }
 
-    const downloaded = await downloadVideo(sourceUrl, {
+    const downloaded = await downloadVideo(resolvedSourceUrl, {
       ...config,
       metadata: downloadMetadata,
       downloadDir: config.downloadDir,
@@ -80,7 +81,7 @@ async function downloadOne(sourceUrl, { delivery = 'auto', type = 'manual', user
       videoId: downloadMetadata.id || downloaded.videoId || '',
       username: resolvedUsername || downloaded.username || '',
       requestedBy,
-      sourceUrl,
+      sourceUrl: resolvedSourceUrl,
       filePath: downloaded.filePath,
       filename,
       sizeBytes,
@@ -96,7 +97,7 @@ async function downloadOne(sourceUrl, { delivery = 'auto', type = 'manual', user
       fileId,
       token,
       publicUrl: makePublicFileUrl(config, token),
-      sourceUrl,
+      sourceUrl: resolvedSourceUrl,
       filePath: downloaded.filePath,
       filename,
       sizeBytes,
@@ -105,6 +106,8 @@ async function downloadOne(sourceUrl, { delivery = 'auto', type = 'manual', user
       title: downloadMetadata.title || downloaded.title || '',
       description: downloadMetadata.description || '',
       thumbnailUrl: downloadMetadata.thumbnail || downloaded.thumbnailUrl || '',
+      mediaType: downloadMetadata.mediaType || downloaded.mediaType || '',
+      duration: Number(downloadMetadata.duration ?? downloaded.duration ?? 0) || 0,
       delivery,
       linkPermanent: expiresAt === 0,
     };
@@ -160,6 +163,7 @@ async function createDownloadResultFromFile({ metadata, sourceUrl, delivery, job
     mediaType: metadata.mediaType,
     imageCount: metadata.imageCount,
     slideshowImagePaths: await findSlideshowImagePaths(fileRecord.path, metadata),
+    duration: Number(metadata.duration ?? 0) || 0,
     delivery,
     reused: true,
     linkPermanent: expiresAt === 0,
@@ -209,15 +213,25 @@ async function checkVideoAvailable(video) {
 const monitor = new TikTokMonitor({
   config,
   store,
+  pollIntervalMs: config.pollIntervalSeconds * 1000,
+  scanLimit: config.profileScanLimit,
+  burstScanLimit: config.profileBurstScanLimit,
+  checkConcurrency: config.monitorConcurrency,
+  downloadConcurrency: config.maxConcurrentDownloads,
   downloader: {
-    listProfileVideos: async (username) => {
+    listProfileVideos: async (username, options = {}) => {
       const { listProfileVideos } = await import('./tiktok/ytdlp.js');
-      return listProfileVideos(username, config);
+      return listProfileVideos(username, { ...config, ...options });
+    },
+    listProfileStories: async (username, options = {}) => {
+      const { listProfileStories } = await import('./tiktok/ytdlp.js');
+      return listProfileStories(username, { ...config, ...options });
     },
     downloadVideo: async (video, options = {}) => downloadOne(video.url || video.webpage_url || video.sourceUrl || options.sourceUrl, {
       type: 'monitor',
       username: options.username || video.username,
       permanent: true,
+      metadata: video.mediaType === 'story' ? video : null,
     }),
     checkVideoAvailable,
   },

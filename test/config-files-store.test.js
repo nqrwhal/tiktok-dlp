@@ -44,6 +44,9 @@ test('loadConfig resolves paths and upload limits', () => {
   assert.equal(config.publicBaseUrl, 'https://example.com');
   assert.equal(config.downloadLinkTtlMinutes, 30);
   assert.equal(config.downloadLinkTtlHours, 1);
+  assert.equal(config.profileScanLimit, 5);
+  assert.equal(config.profileBurstScanLimit, 20);
+  assert.equal(config.monitorConcurrency, 2);
 });
 
 test('loadConfig supports minute TTL and ignores legacy hour TTL', () => {
@@ -373,6 +376,8 @@ test('store records watched username changes', async () => {
       username: 'new.creator',
       previousUsername: 'old.creator',
       creatorId: 'stable-123',
+      secUid: '',
+      authorId: '',
     });
     assert.equal(store.getWatch('old.creator'), null);
     assert.equal(store.getWatch('new.creator').previous_username, 'old.creator');

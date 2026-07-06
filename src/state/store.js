@@ -21,6 +21,8 @@ export class Store {
         channel_id TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         creator_id TEXT,
+        sec_uid TEXT,
+        author_id TEXT,
         previous_username TEXT,
         username_changed_at INTEGER,
         last_checked_at INTEGER,
@@ -92,6 +94,8 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_link_tokens_expires_at ON link_tokens(expires_at);
     `);
     this.ensureColumn('watched_users', 'creator_id', 'TEXT');
+    this.ensureColumn('watched_users', 'sec_uid', 'TEXT');
+    this.ensureColumn('watched_users', 'author_id', 'TEXT');
     this.ensureColumn('watched_users', 'previous_username', 'TEXT');
     this.ensureColumn('watched_users', 'username_changed_at', 'INTEGER');
     this.ensureColumn('seen_videos', 'last_available_at', 'INTEGER');
@@ -106,6 +110,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_jobs_requested_by ON jobs(requested_by);
       CREATE INDEX IF NOT EXISTS idx_files_requested_by ON files(requested_by);
       CREATE INDEX IF NOT EXISTS idx_seen_videos_next_deletion_check_at ON seen_videos(next_deletion_check_at);
+      CREATE INDEX IF NOT EXISTS idx_watched_users_next_check_at ON watched_users(next_check_at);
       CREATE INDEX IF NOT EXISTS idx_watch_username_history_detected_at ON watch_username_history(detected_at DESC);
     `);
   }
@@ -135,22 +140,42 @@ export class Store {
   }
 
   listWatches() {
-    return this.db.prepare('SELECT * FROM watched_users ORDER BY username').all();
+    return this.db.prepare(`
+      SELECT *
+      FROM watched_users
+      ORDER BY COALESCE(next_check_at, 0), username
+    `).all();
   }
 
-  recordWatchIdentity(username, { creatorId = '', currentUsername = '' } = {}, now = Date.now()) {
+  recordWatchIdentity(username, { creatorId = '', currentUsername = '', secUid = '', authorId = '' } = {}, now = Date.now()) {
     const previousUsername = String(username ?? '');
     const nextUsername = String(currentUsername || previousUsername);
     const id = String(creatorId ?? '');
+    const nextSecUid = String(secUid ?? '');
+    const nextAuthorId = String(authorId ?? '');
     const existing = this.getWatch(previousUsername);
-    if (!existing) return { changed: false, username: nextUsername, previousUsername, creatorId: id };
+    if (!existing) return { changed: false, username: nextUsername, previousUsername, creatorId: id, secUid: nextSecUid, authorId: nextAuthorId };
 
-    if (id) {
-      this.db.prepare('UPDATE watched_users SET creator_id = ? WHERE username = ?').run(id, previousUsername);
+    if (id || nextSecUid || nextAuthorId) {
+      this.db.prepare(`
+        UPDATE watched_users
+        SET
+          creator_id = COALESCE(NULLIF(?, ''), creator_id),
+          sec_uid = COALESCE(NULLIF(?, ''), sec_uid),
+          author_id = COALESCE(NULLIF(?, ''), author_id)
+        WHERE username = ?
+      `).run(id, nextSecUid, nextAuthorId, previousUsername);
     }
 
     if (!nextUsername || nextUsername.toLowerCase() === previousUsername.toLowerCase()) {
-      return { changed: false, username: previousUsername, previousUsername, creatorId: id || existing.creator_id || '' };
+      return {
+        changed: false,
+        username: previousUsername,
+        previousUsername,
+        creatorId: id || existing.creator_id || '',
+        secUid: nextSecUid || existing.sec_uid || '',
+        authorId: nextAuthorId || existing.author_id || '',
+      };
     }
 
     this.db.prepare(`
@@ -164,22 +189,37 @@ export class Store {
         UPDATE watched_users
         SET
           creator_id = COALESCE(NULLIF(?, ''), creator_id),
+          sec_uid = COALESCE(NULLIF(?, ''), sec_uid),
+          author_id = COALESCE(NULLIF(?, ''), author_id),
           previous_username = ?,
           username_changed_at = ?,
           last_checked_at = COALESCE(last_checked_at, ?),
           last_success_at = COALESCE(last_success_at, ?)
         WHERE username = ?
-      `).run(id, previousUsername, now, existing.last_checked_at, existing.last_success_at, nextUsername);
+      `).run(id, nextSecUid, nextAuthorId, previousUsername, now, existing.last_checked_at, existing.last_success_at, nextUsername);
       this.db.prepare('DELETE FROM watched_users WHERE username = ?').run(previousUsername);
     } else {
       this.db.prepare(`
         UPDATE watched_users
-        SET username = ?, creator_id = COALESCE(NULLIF(?, ''), creator_id), previous_username = ?, username_changed_at = ?
+        SET
+          username = ?,
+          creator_id = COALESCE(NULLIF(?, ''), creator_id),
+          sec_uid = COALESCE(NULLIF(?, ''), sec_uid),
+          author_id = COALESCE(NULLIF(?, ''), author_id),
+          previous_username = ?,
+          username_changed_at = ?
         WHERE username = ?
-      `).run(nextUsername, id, previousUsername, now, previousUsername);
+      `).run(nextUsername, id, nextSecUid, nextAuthorId, previousUsername, now, previousUsername);
     }
 
-    return { changed: true, username: nextUsername, previousUsername, creatorId: id || existing.creator_id || '' };
+    return {
+      changed: true,
+      username: nextUsername,
+      previousUsername,
+      creatorId: id || existing.creator_id || '',
+      secUid: nextSecUid || existing.sec_uid || '',
+      authorId: nextAuthorId || existing.author_id || '',
+    };
   }
 
   listWatchUsernameHistory(limit = 25) {
@@ -191,12 +231,12 @@ export class Store {
     `).all(Math.max(1, Math.min(100, Number(limit) || 25)));
   }
 
-  markWatchSuccess(username, now = Date.now()) {
+  markWatchSuccess(username, now = Date.now(), nextCheckAt = null) {
     this.db.prepare(`
       UPDATE watched_users
-      SET last_checked_at = ?, last_success_at = ?, failure_count = 0, last_error = NULL, next_check_at = NULL
+      SET last_checked_at = ?, last_success_at = ?, failure_count = 0, last_error = NULL, next_check_at = ?
       WHERE username = ?
-    `).run(now, now, username);
+    `).run(now, now, nextCheckAt, username);
   }
 
   markWatchFailure(username, error, nextCheckAt, now = Date.now()) {
