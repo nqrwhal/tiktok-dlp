@@ -31,6 +31,10 @@ class FakeStore {
     return this.watches.map((watch) => ({ ...watch }));
   }
 
+  getWatch(username) {
+    return this.watches.find((watch) => watch.username === username) ?? null;
+  }
+
   hasSeenVideo(videoId) {
     return this.seen.has(videoId);
   }
@@ -373,7 +377,7 @@ test('runOnce records username changes when profile metadata changes', async () 
     now: () => now,
   });
 
-  await monitor.runOnce();
+  await monitor.runOnce({ waitForDeletionChecks: true });
 
   assert.equal(store.watches[0].username, 'new.creator');
   assert.equal(store.watches[0].previous_username, 'old.creator');
@@ -465,7 +469,7 @@ test('runOnce baselines timestamp-free videos on the first watch scan', async ()
     now: () => now,
   });
 
-  const summary = await monitor.runOnce();
+  const summary = await monitor.runOnce({ waitForDeletionChecks: true });
 
   assert.equal(downloader.downloadCalls.length, 0);
   assert.equal(alerts.length, 0);
@@ -681,7 +685,7 @@ test('runOnce clears scheduled deletion checks for stories', async () => {
     now: () => now,
   });
 
-  await monitor.runOnce();
+  await monitor.runOnce({ waitForDeletionChecks: true });
 
   assert.equal(alerts.length, 0);
   assert.deepEqual(stillAvailable, [{ videoId: 'story-1', nextCheckAt: null, checkedAt: now }]);
@@ -716,11 +720,53 @@ test('runOnce sends deletion alerts for saved posts that disappear', async () =>
     now: () => now,
   });
 
-  const summary = await monitor.runOnce();
+  const summary = await monitor.runOnce({ waitForDeletionChecks: true });
 
   assert.equal(alerts.length, 1);
   assert.equal(alerts[0].video.video_id, 'deleted-1');
   assert.equal(alerts[0].video.deleted_at, now);
   assert.equal(alerts[0].reason, 'not found');
   assert.equal(summary.watchedUsers, 0);
+});
+
+test('slow deletion checks run in a separate bounded worker and do not stall profile scans', async () => {
+  const now = 1_700_000_700_000;
+  let releaseDeletion;
+  const deletionBlocked = new Promise((resolve) => {
+    releaseDeletion = resolve;
+  });
+  let profileChecks = 0;
+  const store = {
+    listWatches: () => [{ username: 'creator', failure_count: 0, next_check_at: null }],
+    listVideosDueForDeletionCheck: () => [{ video_id: 'old-1', source_url: 'https://www.tiktok.com/@creator/video/old-1', deletion_check_count: 0 }],
+    hasSeenVideo: () => false,
+    markWatchSuccess() {},
+    markWatchFailure() {},
+    markVideoSeen() {},
+    recordWatchIdentity: (username) => ({ changed: false, username, previousUsername: username }),
+    markVideoStillAvailable() {},
+  };
+  const downloader = {
+    listProfileVideos: async () => {
+      profileChecks += 1;
+      return [];
+    },
+    download: async () => ({}),
+    checkVideoAvailable: async () => {
+      await deletionBlocked;
+      return { available: true };
+    },
+  };
+  const monitor = new TikTokMonitor({
+    store,
+    downloader,
+    now: () => now,
+    deletionCheckConcurrency: 1,
+  });
+
+  await monitor.runOnce();
+  assert.equal(profileChecks, 1);
+  assert.equal(monitor.status().activeDeletionChecks, 1);
+  releaseDeletion();
+  await monitor.waitForIdle();
 });

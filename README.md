@@ -12,8 +12,9 @@ npm install
 cp .env.example .env
 ```
 
-Fill in `.env` with your Discord bot token, application/client ID,
-notification channel ID, and `PUBLIC_BASE_URL`.
+Fill in `.env` with your Discord bot token, application/client ID, and
+`PUBLIC_BASE_URL`. `DISCORD_CHANNEL_ID` is only a fallback for legacy watches;
+new watches use the channel where an authorized manager creates them.
 
 Example public download URL configuration:
 
@@ -50,13 +51,19 @@ Commands:
 - `/status`
 - `/history` shows your recent generated download links and their expiry state.
 - `/downloads list limit:<1-25> username:<username>` shows your saved permanent
-  downloads plus monitored downloads that were kept on the server.
+  downloads plus monitored downloads delivered to the current server or DM.
 - `/downloads purge scope:mine|all confirm:PURGE` deletes saved download files,
   public links, and download history. `scope:all` requires Manage Server.
 
 The bot requires the `Guilds`, `Guild Messages`, `Direct Messages`, and
 `Message Content` intents. Enable Message Content in the Discord developer
 portal for the application.
+
+Watch commands are administrative: in a guild they require Manage Server or
+`WATCH_MANAGER_ROLE_ID`; in a DM they require `DISCORD_OWNER_ID`. Watches are
+subscribed per guild/DM, so the same creator can alert independently in more
+than one server without duplicate profile scans. `/watch run` only accepts a
+watch already registered in the current scope.
 
 Watched usernames alert for videos newer than when the watch was added and also
 try to detect public stories. Stories are downloaded when detected, even when
@@ -65,7 +72,9 @@ The default monitor interval is 60 seconds; set `POLL_INTERVAL_SECONDS` to a
 positive integer to tune it. Successful checks are scheduled per account so a
 slow full scan does not add another full interval before the next check.
 `MONITOR_CONCURRENCY` controls concurrent profile/story checks and defaults to
-2. Downloads are queued separately and capped by `MAX_CONCURRENT_DOWNLOADS`.
+2. Manual, message, and monitor downloads share a bounded queue capped by
+`MAX_CONCURRENT_DOWNLOADS`. The queue deduplicates in-flight posts by canonical
+post ID and applies per-user and per-guild limits for interactive requests.
 `PROFILE_SCAN_LIMIT` defaults to 5 and caps the normal recent-profile window
 `yt-dlp` enumerates for each check. If all entries in that window are new alert
 candidates, the monitor immediately performs a deeper catch-up scan up to
@@ -102,14 +111,16 @@ Put the tunnel token in `.env`:
 CLOUDFLARE_TUNNEL_TOKEN=...
 ```
 
-Then run the app and tunnel together:
+Prepare the Docker secret on the host, then run the app and tunnel together:
 
 ```bash
+npm run prepare:tunnel
 docker compose --profile cloudflare up --build -d
 ```
 
-The tunnel token is copied into `.secrets/cloudflare_tunnel_token` locally and
-mounted read-only into the `cloudflared` container.
+`prepare:tunnel` writes `.secrets/cloudflare_tunnel_token` locally and the
+Compose file mounts it only into the `cloudflared` container. The downloader
+container does not receive the tunnel token.
 
 If TikTok starts requiring authenticated cookies for your use case, place a
 cookies file under `./cookies/tiktok.txt` and set:
@@ -133,21 +144,34 @@ curl https://example.com/health
 - Small videos are uploaded to Discord when they fit under
   `DISCORD_UPLOAD_LIMIT_MB`; larger videos and slideshow ZIPs are linked.
 - If a TikTok post was already downloaded and the file still exists locally,
-  the bot reuses that file and creates a fresh link instead of downloading it
-  again. Fresh metadata is still used for the Discord embed.
+  the bot reuses one immutable asset and creates a fresh, requester-owned link
+  instead of downloading it again. Fresh metadata is still used for the Discord
+  embed.
 - Manual and message-based downloads get a temporary 30-minute server copy by
   default. When every link for a file expires, the local file and file record
   are removed. Discord buttons let you create another temporary link, extend the
-  current link by the configured TTL, or keep the file permanently on the
-  server.
-- Watched-user downloads are kept permanently on the server by default.
+  current link by the configured TTL, or keep that link permanently on the
+  server. Only its requester, a server manager, or the configured bot owner can
+  change a link's retention.
+- Watched-user deliveries are kept permanently on the server by default, but a
+  monitor delivery never changes the expiry of another requester's link to the
+  same asset.
+- `/downloads purge scope:mine` removes only the caller's deliveries. A shared
+  asset remains until no active delivery references it. Disk bytes are removed
+  before their database record, and failed removals keep a persisted retry
+  state rather than losing the asset record.
+- `RETENTION_DAYS` retains inactive job/history metadata; file retention is
+  governed by active links. Slideshow and direct HTTP fallback downloads enforce
+  configured size, item-count, and timeout limits and stream ZIP output to disk.
 - Watched-user files are stored under `DOWNLOAD_DIR/<username>/...`.
 - Watched-user identity data caches TikTok `secUid` and author id when they are
   available. Later checks use `secUid` for faster `yt-dlp` profile polling and
   author id for story checks, reducing redundant profile-page requests.
 - After a watched post is saved, the bot checks whether the original post still
   exists every minute for five minutes, then around 30 minutes, one hour, one
-  day, and weekly after that. If the source post disappears, Discord gets a
-  deletion notice with the saved-copy link when available.
+  day, and weekly after that. These checks run in a separate bounded worker so
+  slow availability probes do not block profile polling. If the source post
+  disappears, Discord gets a deletion notice with the saved-copy link when
+  available.
 - `DOWNLOAD_LINK_TTL_MINUTES` controls new temporary links. Legacy
   `DOWNLOAD_LINK_TTL_HOURS` values are ignored.

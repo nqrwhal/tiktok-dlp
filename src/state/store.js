@@ -62,6 +62,8 @@ export class Store {
         type TEXT NOT NULL,
         status TEXT NOT NULL,
         requested_by TEXT NOT NULL DEFAULT '',
+        guild_id TEXT NOT NULL DEFAULT '',
+        channel_id TEXT NOT NULL DEFAULT '',
         username TEXT,
         source_url TEXT NOT NULL,
         video_id TEXT,
@@ -81,14 +83,31 @@ export class Store {
         path TEXT NOT NULL,
         filename TEXT NOT NULL,
         size_bytes INTEGER NOT NULL,
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL,
+        delete_requested_at INTEGER,
+        delete_attempts INTEGER NOT NULL DEFAULT 0,
+        delete_error TEXT
       );
 
       CREATE TABLE IF NOT EXISTS link_tokens (
         token TEXT PRIMARY KEY,
         file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+        job_id INTEGER REFERENCES jobs(id) ON DELETE SET NULL,
+        owner_id TEXT NOT NULL DEFAULT '',
+        scope_id TEXT NOT NULL DEFAULT '',
+        delivery_type TEXT NOT NULL DEFAULT 'manual',
         expires_at INTEGER NOT NULL,
         created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS watch_subscriptions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL,
+        guild_id TEXT NOT NULL DEFAULT '',
+        channel_id TEXT NOT NULL,
+        created_by TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        UNIQUE(username, guild_id)
       );
 
       CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at DESC);
@@ -109,14 +128,33 @@ export class Store {
     this.ensureColumn('seen_videos', 'deleted_at', 'INTEGER');
     this.ensureColumn('seen_videos', 'deletion_alerted_at', 'INTEGER');
     this.ensureColumn('jobs', 'requested_by', "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn('jobs', 'guild_id', "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn('jobs', 'channel_id', "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn('files', 'requested_by', "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn('files', 'delete_requested_at', 'INTEGER');
+    this.ensureColumn('files', 'delete_attempts', 'INTEGER NOT NULL DEFAULT 0');
+    this.ensureColumn('files', 'delete_error', 'TEXT');
+    this.ensureColumn('link_tokens', 'job_id', 'INTEGER');
+    this.ensureColumn('link_tokens', 'owner_id', "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn('link_tokens', 'scope_id', "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn('link_tokens', 'delivery_type', "TEXT NOT NULL DEFAULT 'manual'");
+    this.ensureColumn('seen_videos', 'deletion_check_claimed_at', 'INTEGER');
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_jobs_requested_by ON jobs(requested_by);
+      CREATE INDEX IF NOT EXISTS idx_jobs_file_id ON jobs(file_id);
       CREATE INDEX IF NOT EXISTS idx_files_requested_by ON files(requested_by);
+      CREATE INDEX IF NOT EXISTS idx_files_delete_requested_at ON files(delete_requested_at);
+      CREATE INDEX IF NOT EXISTS idx_link_tokens_file_id_expires_at ON link_tokens(file_id, expires_at);
+      CREATE INDEX IF NOT EXISTS idx_link_tokens_owner_id_created_at ON link_tokens(owner_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_link_tokens_scope_id_created_at ON link_tokens(scope_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_link_tokens_job_id ON link_tokens(job_id);
       CREATE INDEX IF NOT EXISTS idx_seen_videos_next_deletion_check_at ON seen_videos(next_deletion_check_at);
       CREATE INDEX IF NOT EXISTS idx_watched_users_next_check_at ON watched_users(next_check_at);
       CREATE INDEX IF NOT EXISTS idx_watch_username_history_detected_at ON watch_username_history(detected_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_watch_subscriptions_guild_id_username ON watch_subscriptions(guild_id, username);
     `);
+    this.migrateLegacyDeliveryOwnership();
+    this.migrateLegacyWatchSubscriptions();
   }
 
   ensureColumn(table, column, definition) {
@@ -125,18 +163,116 @@ export class Store {
     this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
 
-  addWatch(username, channelId, now = Date.now()) {
+  migrateLegacyDeliveryOwnership() {
+    // Older versions attached the requester and monitor state to the shared
+    // asset row. Preserve unambiguous ownership only; ambiguous legacy links
+    // intentionally remain ownerless rather than granting another requester
+    // control over them.
+    this.db.exec(`
+      UPDATE link_tokens
+      SET job_id = (
+        SELECT jobs.id
+        FROM jobs
+        WHERE jobs.file_id = link_tokens.file_id
+        ORDER BY jobs.created_at DESC, jobs.id DESC
+        LIMIT 1
+      )
+      WHERE job_id IS NULL;
+
+      UPDATE link_tokens
+      SET owner_id = COALESCE((
+        SELECT CASE
+          WHEN COUNT(*) = 1 THEN MAX(COALESCE(jobs.requested_by, ''))
+          ELSE ''
+        END
+        FROM jobs
+        WHERE jobs.file_id = link_tokens.file_id
+      ), '')
+      WHERE owner_id = '';
+
+      UPDATE link_tokens
+      SET delivery_type = CASE
+        WHEN (
+          SELECT COUNT(*)
+          FROM jobs
+          WHERE jobs.file_id = link_tokens.file_id
+        ) = 1
+          AND EXISTS (
+            SELECT 1
+            FROM jobs
+            WHERE jobs.file_id = link_tokens.file_id
+              AND jobs.type = 'monitor'
+          )
+        THEN 'monitor'
+        ELSE delivery_type
+      END
+      WHERE delivery_type = '' OR delivery_type = 'manual';
+    `);
+  }
+
+  migrateLegacyWatchSubscriptions() {
+    this.db.exec(`
+      INSERT OR IGNORE INTO watch_subscriptions (username, guild_id, channel_id, created_by, created_at)
+      SELECT username, '', channel_id, '', created_at
+      FROM watched_users
+      WHERE channel_id <> ''
+        AND NOT EXISTS (
+          SELECT 1
+          FROM watch_subscriptions
+          WHERE watch_subscriptions.username = watched_users.username
+        );
+    `);
+  }
+
+  addWatch(username, channelOrOptions, now = Date.now()) {
+    const options = typeof channelOrOptions === 'object' && channelOrOptions !== null
+      ? channelOrOptions
+      : { channelId: channelOrOptions };
+    const channelId = String(options.channelId ?? options.channel_id ?? '');
+    const guildId = String(options.guildId ?? options.guild_id ?? '');
+    const createdBy = String(options.createdBy ?? options.created_by ?? '');
+    if (!channelId) throw new Error('A watch subscription requires a Discord channel.');
     this.db.prepare(`
       INSERT INTO watched_users (username, channel_id, created_at)
       VALUES (?, ?, ?)
-      ON CONFLICT(username) DO UPDATE SET channel_id = excluded.channel_id
+      ON CONFLICT(username) DO NOTHING
     `).run(username, channelId, now);
+    this.db.prepare(`
+      INSERT INTO watch_subscriptions (username, guild_id, channel_id, created_by, created_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(username, guild_id) DO UPDATE SET
+        channel_id = excluded.channel_id,
+        created_by = excluded.created_by
+    `).run(username, guildId, channelId, createdBy, now);
     return this.getWatch(username);
   }
 
-  removeWatch(username) {
-    const result = this.db.prepare('DELETE FROM watched_users WHERE username = ?').run(username);
-    return result.changes > 0;
+  removeWatch(username, scope = null) {
+    if (!scope || typeof scope !== 'object') {
+      this.db.exec('BEGIN IMMEDIATE');
+      try {
+        this.db.prepare('DELETE FROM watch_subscriptions WHERE username = ?').run(username);
+        const result = this.db.prepare('DELETE FROM watched_users WHERE username = ?').run(username);
+        this.db.exec('COMMIT');
+        return result.changes > 0;
+      } catch (error) {
+        this.db.exec('ROLLBACK');
+        throw error;
+      }
+    }
+
+    const guildId = String(scope.guildId ?? scope.guild_id ?? '');
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const result = this.db.prepare('DELETE FROM watch_subscriptions WHERE username = ? AND guild_id = ?').run(username, guildId);
+      const remaining = this.db.prepare('SELECT 1 FROM watch_subscriptions WHERE username = ? LIMIT 1').get(username);
+      if (!remaining) this.db.prepare('DELETE FROM watched_users WHERE username = ?').run(username);
+      this.db.exec('COMMIT');
+      return result.changes > 0;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   getWatch(username) {
@@ -149,6 +285,38 @@ export class Store {
       FROM watched_users
       ORDER BY COALESCE(next_check_at, 0), username
     `).all();
+  }
+
+  listWatchesForScope({ guildId = '' } = {}) {
+    return this.db.prepare(`
+      SELECT watched_users.*, watch_subscriptions.channel_id AS subscription_channel_id,
+        watch_subscriptions.created_by AS subscription_created_by
+      FROM watch_subscriptions
+      JOIN watched_users ON watched_users.username = watch_subscriptions.username
+      WHERE watch_subscriptions.guild_id = ?
+      ORDER BY watched_users.username
+    `).all(String(guildId ?? ''));
+  }
+
+  getWatchSubscription(username, { guildId = '' } = {}) {
+    return this.db.prepare(`
+      SELECT *
+      FROM watch_subscriptions
+      WHERE username = ? AND guild_id = ?
+    `).get(String(username), String(guildId ?? '')) ?? null;
+  }
+
+  hasWatchSubscription(username, scope = {}) {
+    return Boolean(this.getWatchSubscription(username, scope));
+  }
+
+  listWatchSubscriptions(username) {
+    return this.db.prepare(`
+      SELECT *
+      FROM watch_subscriptions
+      WHERE username = ?
+      ORDER BY guild_id, created_at, id
+    `).all(String(username));
   }
 
   recordWatchIdentity(username, {
@@ -244,6 +412,8 @@ export class Store {
       `).run(nextUsername, id, nextSecUid, nextAuthorId, nextHasStory, nextStoryStatusCheckedAt, previousUsername, now, previousUsername);
     }
 
+    this.moveWatchSubscriptions(previousUsername, nextUsername);
+
     return {
       changed: true,
       username: nextUsername,
@@ -252,6 +422,17 @@ export class Store {
       secUid: nextSecUid || existing.sec_uid || '',
       authorId: nextAuthorId || existing.author_id || '',
     };
+  }
+
+  moveWatchSubscriptions(previousUsername, nextUsername) {
+    if (!previousUsername || !nextUsername || previousUsername === nextUsername) return;
+    this.db.prepare(`
+      INSERT OR IGNORE INTO watch_subscriptions (username, guild_id, channel_id, created_by, created_at)
+      SELECT ?, guild_id, channel_id, created_by, created_at
+      FROM watch_subscriptions
+      WHERE username = ?
+    `).run(nextUsername, previousUsername);
+    this.db.prepare('DELETE FROM watch_subscriptions WHERE username = ?').run(previousUsername);
   }
 
   listWatchUsernameHistory(limit = 25) {
@@ -298,12 +479,15 @@ export class Store {
   scheduleVideoDeletionCheck(videoId, nextCheckAt) {
     this.db.prepare(`
       UPDATE seen_videos
-      SET next_deletion_check_at = ?, last_available_at = COALESCE(last_available_at, alerted_at, seen_at)
+      SET
+        next_deletion_check_at = ?,
+        deletion_check_claimed_at = NULL,
+        last_available_at = COALESCE(last_available_at, alerted_at, seen_at)
       WHERE video_id = ?
     `).run(nextCheckAt, String(videoId));
   }
 
-  listVideosDueForDeletionCheck(now = Date.now(), limit = 25) {
+  listVideosDueForDeletionCheck(now = Date.now(), limit = 25, leaseMs = 10 * 60 * 1000) {
     return this.db.prepare(`
       SELECT
         seen_videos.*,
@@ -328,9 +512,31 @@ export class Store {
         AND deleted_at IS NULL
         AND next_deletion_check_at IS NOT NULL
         AND next_deletion_check_at <= ?
+        AND (deletion_check_claimed_at IS NULL OR deletion_check_claimed_at <= ?)
       ORDER BY next_deletion_check_at ASC
       LIMIT ?
-    `).all(now, Math.max(1, Math.min(100, Number(limit) || 25)));
+    `).all(now, now - Math.max(1, Number(leaseMs) || 1), Math.max(1, Math.min(100, Number(limit) || 25)));
+  }
+
+  claimVideosDueForDeletionCheck(now = Date.now(), limit = 25, leaseMs = 10 * 60 * 1000) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const due = this.listVideosDueForDeletionCheck(now, limit, leaseMs);
+      const claimAt = Math.max(0, Number(now) || 0);
+      for (const video of due) {
+        this.db.prepare(`
+          UPDATE seen_videos
+          SET deletion_check_claimed_at = ?
+          WHERE video_id = ?
+            AND (deletion_check_claimed_at IS NULL OR deletion_check_claimed_at <= ?)
+        `).run(claimAt, String(video.video_id), claimAt - Math.max(1, Number(leaseMs) || 1));
+      }
+      this.db.exec('COMMIT');
+      return due;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   markVideoStillAvailable(videoId, nextCheckAt, now = Date.now()) {
@@ -340,6 +546,7 @@ export class Store {
         last_available_at = ?,
         last_deletion_checked_at = ?,
         next_deletion_check_at = ?,
+        deletion_check_claimed_at = NULL,
         deletion_check_count = deletion_check_count + 1
       WHERE video_id = ?
     `).run(now, now, nextCheckAt, String(videoId));
@@ -348,7 +555,7 @@ export class Store {
   postponeVideoDeletionCheck(videoId, nextCheckAt, now = Date.now()) {
     this.db.prepare(`
       UPDATE seen_videos
-      SET last_deletion_checked_at = ?, next_deletion_check_at = ?
+      SET last_deletion_checked_at = ?, next_deletion_check_at = ?, deletion_check_claimed_at = NULL
       WHERE video_id = ?
     `).run(now, nextCheckAt, String(videoId));
   }
@@ -356,22 +563,49 @@ export class Store {
   markVideoDeleted(videoId, now = Date.now()) {
     this.db.prepare(`
       UPDATE seen_videos
-      SET deleted_at = ?, deletion_alerted_at = ?, last_deletion_checked_at = ?, next_deletion_check_at = NULL
+      SET
+        deleted_at = ?,
+        deletion_alerted_at = ?,
+        last_deletion_checked_at = ?,
+        next_deletion_check_at = NULL,
+        deletion_check_claimed_at = NULL
       WHERE video_id = ?
     `).run(now, now, now, String(videoId));
     return this.db.prepare('SELECT * FROM seen_videos WHERE video_id = ?').get(String(videoId)) ?? null;
   }
 
-  createJob({ type, status = 'queued', requestedBy = '', username = '', sourceUrl, videoId = '', title = '' }, now = Date.now()) {
+  createJob({
+    type,
+    status = 'queued',
+    requestedBy = '',
+    guildId = '',
+    channelId = '',
+    username = '',
+    sourceUrl,
+    videoId = '',
+    title = '',
+  }, now = Date.now()) {
     const result = this.db.prepare(`
-      INSERT INTO jobs (type, status, requested_by, username, source_url, video_id, title, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(type, status, String(requestedBy ?? ''), username, sourceUrl, videoId, title, now, now);
+      INSERT INTO jobs (type, status, requested_by, guild_id, channel_id, username, source_url, video_id, title, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      type,
+      status,
+      String(requestedBy ?? ''),
+      String(guildId ?? ''),
+      String(channelId ?? ''),
+      username,
+      sourceUrl,
+      videoId,
+      title,
+      now,
+      now,
+    );
     return Number(result.lastInsertRowid);
   }
 
   updateJob(id, changes, now = Date.now()) {
-    const allowed = ['status', 'requested_by', 'username', 'source_url', 'video_id', 'title', 'file_id', 'error'];
+    const allowed = ['status', 'requested_by', 'guild_id', 'channel_id', 'username', 'source_url', 'video_id', 'title', 'file_id', 'error'];
     const entries = Object.entries(changes).filter(([key]) => allowed.includes(key));
     if (!entries.length) return;
     const assignments = entries.map(([key]) => `${key} = ?`).join(', ');
@@ -397,35 +631,87 @@ export class Store {
       SELECT *
       FROM files
       WHERE video_id = ?
+        AND delete_requested_at IS NULL
       ORDER BY created_at DESC
       LIMIT 1
     `).get(String(videoId)) ?? null;
   }
 
-  createLinkToken({ token, fileId, expiresAt }, now = Date.now()) {
+  createLinkToken({
+    token,
+    fileId,
+    jobId = null,
+    ownerId = '',
+    scopeId = '',
+    deliveryType = 'manual',
+    expiresAt,
+  }, now = Date.now()) {
+    let resolvedJobId = jobId == null ? null : Number(jobId);
+    let linkedJob = null;
+    if (resolvedJobId == null) {
+      linkedJob = this.db.prepare(`
+        SELECT id, type, requested_by
+        FROM jobs
+        WHERE file_id = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+      `).get(fileId) ?? null;
+      resolvedJobId = linkedJob ? Number(linkedJob.id) : null;
+    } else {
+      linkedJob = this.db.prepare('SELECT id, type, requested_by FROM jobs WHERE id = ?').get(resolvedJobId) ?? null;
+    }
+    const legacyOwner = this.db.prepare('SELECT requested_by FROM files WHERE id = ?').get(fileId)?.requested_by ?? '';
+    const resolvedOwnerId = String(ownerId || linkedJob?.requested_by || legacyOwner || '');
+    const resolvedDeliveryType = deliveryType === 'manual' && linkedJob?.type === 'monitor'
+      ? 'monitor'
+      : String(deliveryType ?? 'manual');
     this.db.prepare(`
-      INSERT INTO link_tokens (token, file_id, expires_at, created_at)
-      VALUES (?, ?, ?, ?)
-    `).run(token, fileId, expiresAt, now);
+      INSERT INTO link_tokens (token, file_id, job_id, owner_id, scope_id, delivery_type, expires_at, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      token,
+      fileId,
+      resolvedJobId,
+      resolvedOwnerId,
+      String(scopeId ?? ''),
+      resolvedDeliveryType,
+      expiresAt,
+      now,
+    );
+    // A new delivery revives an asset that an earlier cleanup pass had marked
+    // for deletion. Its historical attempt count remains useful for diagnosis.
+    this.db.prepare(`
+      UPDATE files
+      SET delete_requested_at = NULL, delete_error = NULL
+      WHERE id = ?
+    `).run(fileId);
   }
 
-  buildRequesterClause(includeMonitored) {
+  buildRequesterClause(includeMonitored, scopeId = '') {
     return includeMonitored
       ? `(
-          files.requested_by = ?
-          OR EXISTS (
-            SELECT 1
-            FROM jobs
-            WHERE jobs.file_id = files.id
-              AND jobs.type = 'monitor'
-          )
+          link_tokens.owner_id = ?
+          OR (link_tokens.delivery_type = 'monitor' AND link_tokens.scope_id = ?)
         )`
-      : 'files.requested_by = ?';
+      : 'link_tokens.owner_id = ?';
+  }
+
+  buildRequesterParams(requestedBy, includeMonitored, scopeId = '') {
+    const ownerId = String(requestedBy ?? '');
+    return includeMonitored ? [ownerId, String(scopeId ?? '')] : [ownerId];
   }
 
   getToken(token) {
     return this.db.prepare(`
-      SELECT link_tokens.token, link_tokens.expires_at, link_tokens.created_at AS token_created_at, files.*
+      SELECT
+        link_tokens.token,
+        link_tokens.job_id,
+        link_tokens.owner_id,
+        link_tokens.scope_id,
+        link_tokens.delivery_type,
+        link_tokens.expires_at,
+        link_tokens.created_at AS token_created_at,
+        files.*
       FROM link_tokens
       JOIN files ON files.id = link_tokens.file_id
       WHERE link_tokens.token = ?
@@ -436,6 +722,10 @@ export class Store {
     return this.db.prepare(`
       SELECT
         link_tokens.token,
+        link_tokens.job_id,
+        link_tokens.owner_id,
+        link_tokens.scope_id,
+        link_tokens.delivery_type,
         link_tokens.expires_at,
         link_tokens.created_at AS token_created_at,
         files.*,
@@ -443,18 +733,37 @@ export class Store {
       FROM link_tokens
       JOIN files ON files.id = link_tokens.file_id
       WHERE link_tokens.token = ?
-        AND EXISTS (
-          SELECT 1
-          FROM jobs
-          WHERE jobs.file_id = files.id
-            AND jobs.type = 'monitor'
-        )
+        AND link_tokens.delivery_type = 'monitor'
     `).get(String(token ?? '')) ?? null;
+  }
+
+  getLatestPermanentTokenForVideo(videoId, { scopeId = '' } = {}) {
+    if (!videoId) return '';
+    const row = this.db.prepare(`
+      SELECT link_tokens.token
+      FROM link_tokens
+      JOIN files ON files.id = link_tokens.file_id
+      WHERE files.video_id = ?
+        AND link_tokens.delivery_type = 'monitor'
+        AND link_tokens.expires_at = 0
+        AND link_tokens.scope_id = ?
+      ORDER BY link_tokens.created_at DESC, link_tokens.token DESC
+      LIMIT 1
+    `).get(String(videoId), String(scopeId ?? ''));
+    return String(row?.token ?? '');
   }
 
   getValidToken(token, now = Date.now()) {
     return this.db.prepare(`
-      SELECT link_tokens.token, link_tokens.expires_at, link_tokens.created_at AS token_created_at, files.*
+      SELECT
+        link_tokens.token,
+        link_tokens.job_id,
+        link_tokens.owner_id,
+        link_tokens.scope_id,
+        link_tokens.delivery_type,
+        link_tokens.expires_at,
+        link_tokens.created_at AS token_created_at,
+        files.*
       FROM link_tokens
       JOIN files ON files.id = link_tokens.file_id
       WHERE link_tokens.token = ? AND (link_tokens.expires_at = 0 OR link_tokens.expires_at > ?)
@@ -480,94 +789,192 @@ export class Store {
     return result.changes > 0 ? this.getToken(token) : null;
   }
 
-  setMonitorLinkTokensPermanent() {
-    return this.db.prepare(`
-      UPDATE link_tokens
-      SET expires_at = 0
-      WHERE expires_at <> 0
-        AND EXISTS (
-          SELECT 1
-          FROM jobs
-          WHERE jobs.file_id = link_tokens.file_id
-            AND jobs.type = 'monitor'
-        )
-    `).run().changes;
-  }
-
-  capTemporaryLinkTokenTtl(ttlMs) {
-    const ttl = Math.max(1, Number(ttlMs) || 1);
-    return this.db.prepare(`
-      UPDATE link_tokens
-      SET expires_at = created_at + ?
-      WHERE expires_at <> 0
-        AND expires_at > created_at + ?
-    `).run(ttl, ttl).changes;
-  }
-
   deleteExpiredTokens(now = Date.now()) {
     return this.db.prepare('DELETE FROM link_tokens WHERE expires_at > 0 AND expires_at <= ?').run(now).changes;
   }
 
-  listFilesWithoutActiveLinks(now = Date.now()) {
+  listFilesWithoutActiveLinks(now = Date.now(), limit = 100) {
     return this.db.prepare(`
-      SELECT files.id, files.path, files.filename
+      SELECT files.id, files.path, files.filename, files.video_id
       FROM files
-      WHERE EXISTS (
-          SELECT 1
-          FROM link_tokens
-          WHERE link_tokens.file_id = files.id
-        )
-        AND NOT EXISTS (
+      WHERE NOT EXISTS (
           SELECT 1
           FROM link_tokens
           WHERE link_tokens.file_id = files.id
             AND (link_tokens.expires_at = 0 OR link_tokens.expires_at > ?)
         )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM files AS shared_files
+          JOIN link_tokens AS shared_links ON shared_links.file_id = shared_files.id
+          WHERE shared_files.path = files.path
+            AND shared_files.id <> files.id
+            AND (shared_links.expires_at = 0 OR shared_links.expires_at > ?)
+        )
       ORDER BY files.created_at ASC
-    `).all(now);
+      LIMIT ?
+    `).all(now, now, Math.max(1, Math.min(1_000, Number(limit) || 100)));
   }
 
-  deleteFileRecords(ids = []) {
-    const uniqueIds = [...new Set(ids.map((id) => Number(id)).filter(Number.isFinite))];
-    if (!uniqueIds.length) return 0;
-    const placeholders = uniqueIds.map(() => '?').join(', ');
-    return this.db.prepare(`DELETE FROM files WHERE id IN (${placeholders})`).run(...uniqueIds).changes;
-  }
-
-  deleteMonitorDownloadByFileId(fileId) {
-    const id = Number(fileId);
-    if (!Number.isFinite(id)) return { files: 0, links: 0, jobs: 0 };
-    const file = this.db.prepare('SELECT id, video_id FROM files WHERE id = ?').get(id);
-    if (!file) return { files: 0, links: 0, jobs: 0 };
-    const monitorJob = this.db.prepare("SELECT 1 FROM jobs WHERE file_id = ? AND type = 'monitor'").get(id);
-    if (!monitorJob) return { files: 0, links: 0, jobs: 0 };
-
-    const counts = {
-      files: 1,
-      links: this.db.prepare('SELECT COUNT(*) AS count FROM link_tokens WHERE file_id = ?').get(id).count,
-      jobs: this.db.prepare('SELECT COUNT(*) AS count FROM jobs WHERE file_id = ?').get(id).count,
-    };
-
+  claimFilesForDeletion(now = Date.now(), limit = 100) {
+    const boundedLimit = Math.max(1, Math.min(1_000, Number(limit) || 100));
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      this.db.prepare('DELETE FROM link_tokens WHERE file_id = ?').run(id);
-      this.db.prepare('DELETE FROM jobs WHERE file_id = ?').run(id);
-      this.db.prepare('DELETE FROM files WHERE id = ?').run(id);
-      if (file.video_id) {
-        this.db.prepare('UPDATE seen_videos SET next_deletion_check_at = NULL WHERE video_id = ?').run(file.video_id);
+      const files = this.db.prepare(`
+        SELECT files.id, files.path, files.filename, files.video_id
+        FROM files
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM link_tokens
+            WHERE link_tokens.file_id = files.id
+              AND (link_tokens.expires_at = 0 OR link_tokens.expires_at > ?)
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM files AS shared_files
+            JOIN link_tokens AS shared_links ON shared_links.file_id = shared_files.id
+            WHERE shared_files.path = files.path
+              AND shared_files.id <> files.id
+              AND (shared_links.expires_at = 0 OR shared_links.expires_at > ?)
+          )
+        ORDER BY
+          CASE WHEN files.delete_requested_at IS NULL THEN 0 ELSE 1 END,
+          files.created_at ASC,
+          files.id ASC
+        LIMIT ?
+      `).all(now, now, boundedLimit);
+      if (files.length) {
+        const ids = files.map((file) => Number(file.id));
+        const placeholders = ids.map(() => '?').join(', ');
+        this.db.prepare(`
+          UPDATE files
+          SET
+            delete_requested_at = ?,
+            delete_attempts = delete_attempts + 1,
+            delete_error = NULL
+          WHERE id IN (${placeholders})
+        `).run(now, ...ids);
       }
       this.db.exec('COMMIT');
+      return files;
     } catch (error) {
       this.db.exec('ROLLBACK');
       throw error;
     }
-
-    return counts;
   }
 
-  listDownloadLinksByRequester(requestedBy, { limit = 25, offset = 0, activeOnly = true, includeMonitored = false, username = '', now = Date.now() } = {}) {
-    const clauses = [this.buildRequesterClause(includeMonitored)];
-    const params = [String(requestedBy ?? '')];
+  markFileDeletionFailed(fileId, error, now = Date.now()) {
+    const message = String(error?.message ?? error ?? 'Unknown disk deletion failure').slice(0, 500);
+    const result = this.db.prepare(`
+      UPDATE files
+      SET
+        delete_requested_at = COALESCE(delete_requested_at, ?),
+        delete_attempts = delete_attempts + CASE WHEN delete_requested_at IS NULL THEN 1 ELSE 0 END,
+        delete_error = ?
+      WHERE id = ?
+    `).run(now, message, Number(fileId));
+    return result.changes > 0;
+  }
+
+  deleteFileRecords(ids = []) {
+    const uniqueIds = normalizeIds(ids);
+    if (!uniqueIds.length) return 0;
+    const placeholders = uniqueIds.map(() => '?').join(', ');
+    const files = this.db.prepare(`SELECT id, video_id FROM files WHERE id IN (${placeholders})`).all(...uniqueIds);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare(`DELETE FROM jobs WHERE file_id IN (${placeholders})`).run(...uniqueIds);
+      const deleted = this.db.prepare(`DELETE FROM files WHERE id IN (${placeholders})`).run(...uniqueIds).changes;
+      for (const file of files) {
+        if (file.video_id) {
+          this.db.prepare('UPDATE seen_videos SET next_deletion_check_at = NULL WHERE video_id = ?').run(file.video_id);
+        }
+      }
+      this.db.exec('COMMIT');
+      return deleted;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  planDeliveryDeletion(token, now = Date.now()) {
+    const record = this.getToken(token);
+    if (!record) return null;
+    const hasOtherActiveLinks = Boolean(this.db.prepare(`
+      SELECT 1
+      FROM files AS shared_files
+      JOIN link_tokens AS shared_links ON shared_links.file_id = shared_files.id
+      WHERE shared_files.path = ?
+        AND (
+          shared_files.id <> ?
+          OR shared_links.token <> ?
+        )
+        AND (shared_links.expires_at = 0 OR shared_links.expires_at > ?)
+      LIMIT 1
+    `).get(record.path, record.id, String(token), now));
+    return {
+      record,
+      file: hasOtherActiveLinks ? null : {
+        id: record.id,
+        path: record.path,
+        filename: record.filename,
+        video_id: record.video_id,
+      },
+    };
+  }
+
+  deleteDeliveryToken(token, { deleteFile = false, now = Date.now() } = {}) {
+    const record = this.getToken(token);
+    if (!record) return { files: 0, links: 0, jobs: 0 };
+    const fileId = Number(record.id);
+    const jobId = Number(record.job_id);
+    let files = 0;
+    let jobs = 0;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      let links = this.db.prepare('DELETE FROM link_tokens WHERE token = ?').run(String(token)).changes;
+      if (Number.isFinite(jobId)) {
+        const remainingJobLinks = this.db.prepare('SELECT 1 FROM link_tokens WHERE job_id = ? LIMIT 1').get(jobId);
+        if (!remainingJobLinks) {
+          jobs = this.db.prepare('DELETE FROM jobs WHERE id = ?').run(jobId).changes;
+        }
+      }
+      if (deleteFile) {
+        links += this.db.prepare(`
+          DELETE FROM link_tokens
+          WHERE file_id = ?
+            AND expires_at > 0
+            AND expires_at <= ?
+        `).run(fileId, now).changes;
+      }
+      if (deleteFile && !this.db.prepare('SELECT 1 FROM link_tokens WHERE file_id = ? LIMIT 1').get(fileId)) {
+        const file = this.db.prepare('SELECT video_id FROM files WHERE id = ?').get(fileId);
+        jobs += this.db.prepare('DELETE FROM jobs WHERE file_id = ?').run(fileId).changes;
+        files = this.db.prepare('DELETE FROM files WHERE id = ?').run(fileId).changes;
+        if (file?.video_id) {
+          this.db.prepare('UPDATE seen_videos SET next_deletion_check_at = NULL WHERE video_id = ?').run(file.video_id);
+        }
+      }
+      this.db.exec('COMMIT');
+      return { files, links, jobs };
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  listDownloadLinksByRequester(requestedBy, {
+    limit = 25,
+    offset = 0,
+    activeOnly = true,
+    includeMonitored = false,
+    scopeId = '',
+    username = '',
+    now = Date.now(),
+  } = {}) {
+    const clauses = [this.buildRequesterClause(includeMonitored, scopeId)];
+    const params = this.buildRequesterParams(requestedBy, includeMonitored, scopeId);
     if (activeOnly) {
       clauses.push('(link_tokens.expires_at = 0 OR link_tokens.expires_at > ?)');
       params.push(now);
@@ -579,6 +986,10 @@ export class Store {
     const sql = `
       SELECT
         link_tokens.token,
+        link_tokens.owner_id,
+        link_tokens.scope_id,
+        link_tokens.delivery_type,
+        link_tokens.job_id,
         link_tokens.expires_at,
         link_tokens.created_at AS token_created_at,
         files.id AS file_id,
@@ -590,11 +1001,7 @@ export class Store {
         files.size_bytes,
         files.created_at AS file_created_at,
         (
-          SELECT jobs.title
-          FROM jobs
-          WHERE jobs.file_id = files.id
-          ORDER BY jobs.created_at DESC, jobs.id DESC
-          LIMIT 1
+          SELECT jobs.title FROM jobs WHERE jobs.id = link_tokens.job_id
         ) AS title
       FROM link_tokens
       JOIN files ON files.id = link_tokens.file_id
@@ -608,9 +1015,15 @@ export class Store {
     return this.db.prepare(sql).all(...params);
   }
 
-  countDownloadLinksByRequester(requestedBy, { activeOnly = true, includeMonitored = false, username = '', now = Date.now() } = {}) {
-    const clauses = [this.buildRequesterClause(includeMonitored)];
-    const params = [String(requestedBy ?? '')];
+  countDownloadLinksByRequester(requestedBy, {
+    activeOnly = true,
+    includeMonitored = false,
+    scopeId = '',
+    username = '',
+    now = Date.now(),
+  } = {}) {
+    const clauses = [this.buildRequesterClause(includeMonitored, scopeId)];
+    const params = this.buildRequesterParams(requestedBy, includeMonitored, scopeId);
     if (activeOnly) {
       clauses.push('(link_tokens.expires_at = 0 OR link_tokens.expires_at > ?)');
       params.push(now);
@@ -628,9 +1041,15 @@ export class Store {
     return this.db.prepare(sql).get(...params).count;
   }
 
-  listPermanentDownloadsByRequester(requestedBy, { limit = 25, offset = 0, includeMonitored = false, username = '' } = {}) {
-    const clauses = [this.buildRequesterClause(includeMonitored), 'link_tokens.expires_at = 0'];
-    const params = [String(requestedBy ?? '')];
+  listPermanentDownloadsByRequester(requestedBy, {
+    limit = 25,
+    offset = 0,
+    includeMonitored = false,
+    scopeId = '',
+    username = '',
+  } = {}) {
+    const clauses = [this.buildRequesterClause(includeMonitored, scopeId), 'link_tokens.expires_at = 0'];
+    const params = this.buildRequesterParams(requestedBy, includeMonitored, scopeId);
     if (username) {
       clauses.push('lower(files.username) = lower(?)');
       params.push(String(username));
@@ -639,6 +1058,10 @@ export class Store {
       WITH ranked_links AS (
         SELECT
           link_tokens.token,
+          link_tokens.owner_id,
+          link_tokens.scope_id,
+          link_tokens.delivery_type,
+          link_tokens.job_id,
           link_tokens.expires_at,
           link_tokens.created_at AS token_created_at,
           files.id AS file_id,
@@ -649,13 +1072,7 @@ export class Store {
           files.filename,
           files.size_bytes,
           files.created_at AS file_created_at,
-          (
-            SELECT jobs.title
-            FROM jobs
-            WHERE jobs.file_id = files.id
-            ORDER BY jobs.created_at DESC, jobs.id DESC
-            LIMIT 1
-          ) AS title,
+          (SELECT jobs.title FROM jobs WHERE jobs.id = link_tokens.job_id) AS title,
           ROW_NUMBER() OVER (
             PARTITION BY files.id
             ORDER BY link_tokens.created_at DESC, link_tokens.token DESC
@@ -666,6 +1083,10 @@ export class Store {
       )
       SELECT
         token,
+        owner_id,
+        scope_id,
+        delivery_type,
+        job_id,
         expires_at,
         token_created_at,
         file_id,
@@ -688,9 +1109,9 @@ export class Store {
     return this.db.prepare(sql).all(...params);
   }
 
-  countPermanentDownloadsByRequester(requestedBy, { includeMonitored = false, username = '' } = {}) {
-    const clauses = [this.buildRequesterClause(includeMonitored), 'link_tokens.expires_at = 0'];
-    const params = [String(requestedBy ?? '')];
+  countPermanentDownloadsByRequester(requestedBy, { includeMonitored = false, scopeId = '', username = '' } = {}) {
+    const clauses = [this.buildRequesterClause(includeMonitored, scopeId), 'link_tokens.expires_at = 0'];
+    const params = this.buildRequesterParams(requestedBy, includeMonitored, scopeId);
     if (username) {
       clauses.push('lower(files.username) = lower(?)');
       params.push(String(username));
@@ -714,9 +1135,15 @@ export class Store {
     return this.db.prepare(sql).get(...params).count;
   }
 
-  listLinkHistoryByRequester(requestedBy, { limit = 10, offset = 0, includeMonitored = false, username = '' } = {}) {
-    const clauses = [this.buildRequesterClause(includeMonitored)];
-    const params = [String(requestedBy ?? '')];
+  listLinkHistoryByRequester(requestedBy, {
+    limit = 10,
+    offset = 0,
+    includeMonitored = false,
+    scopeId = '',
+    username = '',
+  } = {}) {
+    const clauses = [this.buildRequesterClause(includeMonitored, scopeId)];
+    const params = this.buildRequesterParams(requestedBy, includeMonitored, scopeId);
     if (username) {
       clauses.push('lower(files.username) = lower(?)');
       params.push(String(username));
@@ -724,6 +1151,10 @@ export class Store {
     const sql = `
       SELECT
         link_tokens.token,
+        link_tokens.owner_id,
+        link_tokens.scope_id,
+        link_tokens.delivery_type,
+        link_tokens.job_id,
         link_tokens.expires_at,
         link_tokens.created_at AS token_created_at,
         files.id AS file_id,
@@ -734,27 +1165,9 @@ export class Store {
         files.filename,
         files.size_bytes,
         files.created_at AS file_created_at,
-        (
-          SELECT jobs.title
-          FROM jobs
-          WHERE jobs.file_id = files.id
-          ORDER BY jobs.created_at DESC, jobs.id DESC
-          LIMIT 1
-        ) AS title,
-        (
-          SELECT jobs.status
-          FROM jobs
-          WHERE jobs.file_id = files.id
-          ORDER BY jobs.created_at DESC, jobs.id DESC
-          LIMIT 1
-        ) AS job_status,
-        (
-          SELECT jobs.error
-          FROM jobs
-          WHERE jobs.file_id = files.id
-          ORDER BY jobs.created_at DESC, jobs.id DESC
-          LIMIT 1
-        ) AS job_error
+        (SELECT jobs.title FROM jobs WHERE jobs.id = link_tokens.job_id) AS title,
+        (SELECT jobs.status FROM jobs WHERE jobs.id = link_tokens.job_id) AS job_status,
+        (SELECT jobs.error FROM jobs WHERE jobs.id = link_tokens.job_id) AS job_error
       FROM link_tokens
       JOIN files ON files.id = link_tokens.file_id
       WHERE ${clauses.join('\n        AND ')}
@@ -767,52 +1180,133 @@ export class Store {
     return this.db.prepare(sql).all(...params);
   }
 
-  listFilesForPurge({ requestedBy = '' } = {}) {
-    if (requestedBy) {
-      return this.db.prepare('SELECT id, path, filename FROM files WHERE requested_by = ?').all(String(requestedBy));
+  listPurgePlan({ requestedBy = '', now = Date.now() } = {}) {
+    if (!requestedBy) {
+      return this.db.prepare('SELECT id, path, filename, video_id FROM files ORDER BY created_at ASC').all();
     }
-    return this.db.prepare('SELECT id, path, filename FROM files').all();
+    return this.db.prepare(`
+      SELECT files.id, files.path, files.filename, files.video_id
+      FROM files
+      WHERE EXISTS (
+        SELECT 1
+        FROM link_tokens
+        WHERE link_tokens.file_id = files.id
+          AND link_tokens.owner_id = ?
+      )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM link_tokens
+          WHERE link_tokens.file_id = files.id
+            AND link_tokens.owner_id <> ?
+            AND (link_tokens.expires_at = 0 OR link_tokens.expires_at > ?)
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM files AS shared_files
+          JOIN link_tokens AS shared_links ON shared_links.file_id = shared_files.id
+          WHERE shared_files.path = files.path
+            AND shared_files.id <> files.id
+            AND (shared_links.expires_at = 0 OR shared_links.expires_at > ?)
+        )
+      ORDER BY files.created_at ASC
+    `).all(String(requestedBy), String(requestedBy), now, now);
   }
 
-  purgeDownloads({ requestedBy = '' } = {}) {
+  // Kept as a compatibility alias for callers that need to remove bytes before
+  // committing a purge. New callers should use listPurgePlan() explicitly.
+  listFilesForPurge(options = {}) {
+    return this.listPurgePlan(options);
+  }
+
+  purgeDownloads({ requestedBy = '', removeFileIds = null, now = Date.now() } = {}) {
     const scoped = Boolean(requestedBy);
-    const counts = scoped
-      ? {
-          files: this.db.prepare('SELECT COUNT(*) AS count FROM files WHERE requested_by = ?').get(String(requestedBy)).count,
-          links: this.db.prepare(`
-            SELECT COUNT(*) AS count
-            FROM link_tokens
-            JOIN files ON files.id = link_tokens.file_id
-            WHERE files.requested_by = ?
-          `).get(String(requestedBy)).count,
-          jobs: this.db.prepare('SELECT COUNT(*) AS count FROM jobs WHERE requested_by = ?').get(String(requestedBy)).count,
-        }
-      : {
-          files: this.db.prepare('SELECT COUNT(*) AS count FROM files').get().count,
-          links: this.db.prepare('SELECT COUNT(*) AS count FROM link_tokens').get().count,
-          jobs: this.db.prepare('SELECT COUNT(*) AS count FROM jobs').get().count,
-        };
+    const requestedIds = normalizeIds(removeFileIds ?? this.listPurgePlan({ requestedBy, now }).map((file) => file.id));
+    const removableIds = scoped
+      ? this.filterRemovablePurgeFileIds(requestedIds, String(requestedBy), now)
+      : requestedIds;
+    const counts = { files: 0, links: 0, jobs: 0 };
+    const placeholders = removableIds.map(() => '?').join(', ');
+    const files = removableIds.length
+      ? this.db.prepare(`SELECT id, video_id FROM files WHERE id IN (${placeholders})`).all(...removableIds)
+      : [];
 
     this.db.exec('BEGIN IMMEDIATE');
     try {
       if (scoped) {
-        this.db.prepare(`
-          DELETE FROM link_tokens
-          WHERE file_id IN (SELECT id FROM files WHERE requested_by = ?)
-        `).run(String(requestedBy));
-        this.db.prepare('DELETE FROM jobs WHERE requested_by = ?').run(String(requestedBy));
-        this.db.prepare('DELETE FROM files WHERE requested_by = ?').run(String(requestedBy));
+        counts.links += this.db.prepare('DELETE FROM link_tokens WHERE owner_id = ?').run(String(requestedBy)).changes;
+        counts.jobs += this.db.prepare('DELETE FROM jobs WHERE requested_by = ?').run(String(requestedBy)).changes;
       } else {
-        this.db.prepare('DELETE FROM link_tokens').run();
-        this.db.prepare('DELETE FROM jobs').run();
-        this.db.prepare('DELETE FROM files').run();
+        counts.links += this.db.prepare('DELETE FROM link_tokens').run().changes;
+        counts.jobs += this.db.prepare('DELETE FROM jobs').run().changes;
       }
+
+      if (removableIds.length) {
+        counts.links += this.db.prepare(`DELETE FROM link_tokens WHERE file_id IN (${placeholders})`).run(...removableIds).changes;
+        counts.jobs += this.db.prepare(`DELETE FROM jobs WHERE file_id IN (${placeholders})`).run(...removableIds).changes;
+        counts.files = this.db.prepare(`DELETE FROM files WHERE id IN (${placeholders})`).run(...removableIds).changes;
+        for (const file of files) {
+          if (file.video_id) {
+            this.db.prepare('UPDATE seen_videos SET next_deletion_check_at = NULL WHERE video_id = ?').run(file.video_id);
+          }
+        }
+      }
+
       this.db.exec('COMMIT');
+      return counts;
     } catch (error) {
       this.db.exec('ROLLBACK');
       throw error;
     }
-    return counts;
+  }
+
+  filterRemovablePurgeFileIds(ids, requestedBy, now = Date.now()) {
+    if (!ids.length) return [];
+    const placeholders = ids.map(() => '?').join(', ');
+    return this.db.prepare(`
+      SELECT files.id
+      FROM files
+      WHERE files.id IN (${placeholders})
+        AND EXISTS (
+          SELECT 1
+          FROM link_tokens
+          WHERE link_tokens.file_id = files.id
+            AND link_tokens.owner_id = ?
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM link_tokens
+          WHERE link_tokens.file_id = files.id
+            AND link_tokens.owner_id <> ?
+            AND (link_tokens.expires_at = 0 OR link_tokens.expires_at > ?)
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM files AS shared_files
+          JOIN link_tokens AS shared_links ON shared_links.file_id = shared_files.id
+          WHERE shared_files.path = files.path
+            AND shared_files.id <> files.id
+            AND (shared_links.expires_at = 0 OR shared_links.expires_at > ?)
+        )
+    `).all(...ids, requestedBy, requestedBy, now, now).map((row) => Number(row.id));
+  }
+
+  pruneOldJobs(before = Date.now(), limit = 100) {
+    const ids = this.db.prepare(`
+      SELECT jobs.id
+      FROM jobs
+      WHERE jobs.updated_at < ?
+        AND NOT EXISTS (
+          SELECT 1
+          FROM link_tokens
+          WHERE link_tokens.job_id = jobs.id
+            AND (link_tokens.expires_at = 0 OR link_tokens.expires_at > ?)
+        )
+      ORDER BY jobs.updated_at ASC, jobs.id ASC
+      LIMIT ?
+    `).all(before, Date.now(), Math.max(1, Math.min(1_000, Number(limit) || 100))).map((row) => Number(row.id));
+    if (!ids.length) return 0;
+    const placeholders = ids.map(() => '?').join(', ');
+    return this.db.prepare(`DELETE FROM jobs WHERE id IN (${placeholders})`).run(...ids).changes;
   }
 
   stats() {
@@ -834,6 +1328,12 @@ function normalizeNullableInteger(value) {
   if (value === null || value === undefined || value === '') return null;
   const number = Number(value);
   return Number.isFinite(number) ? Math.trunc(number) : null;
+}
+
+function normalizeIds(ids) {
+  return [...new Set((Array.isArray(ids) ? ids : [])
+    .map((id) => Number(id))
+    .filter((id) => Number.isInteger(id) && id > 0))];
 }
 
 export function createStore(dbPath) {

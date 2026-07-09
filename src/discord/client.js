@@ -27,7 +27,7 @@ const LINK_BUTTON_PREFIX = 'link:';
 const DOWNLOADS_BUTTON_PREFIX = 'downloads:list:';
 const MONITOR_BUTTON_PREFIX = 'monitor:';
 
-export async function startDiscordBot({ config, store, monitor, downloadOne, registerCommands }) {
+export async function startDiscordBot({ config, store, monitor, downloadOne, registerCommands, downloadService = null }) {
   if (config.registerCommandsOnStart) {
     await registerCommands(config);
   }
@@ -62,7 +62,7 @@ export async function startDiscordBot({ config, store, monitor, downloadOne, reg
       }
 
       if (!interaction.isChatInputCommand()) return;
-      await handleInteraction({ interaction, config, store, monitor, downloadOne });
+      await handleInteraction({ interaction, config, store, monitor, downloadOne, downloadService });
     } catch (error) {
       console.error('[discord] Interaction failed:', error);
       const payload = buildErrorPayload({
@@ -93,7 +93,7 @@ export async function startDiscordBot({ config, store, monitor, downloadOne, reg
   return client;
 }
 
-export async function handleInteraction({ interaction, config, store, monitor, downloadOne }) {
+export async function handleInteraction({ interaction, config, store, monitor, downloadOne, downloadService = null }) {
   const command = interaction.commandName;
 
   if (command === 'download') {
@@ -104,6 +104,8 @@ export async function handleInteraction({ interaction, config, store, monitor, d
       delivery,
       type: 'manual',
       requestedBy: interaction.user?.id ?? '',
+      guildId: interaction.guildId ?? '',
+      channelId: interaction.channelId ?? '',
     });
     await interaction.editReply(await buildDeliveryPayload(result, config, delivery));
     return;
@@ -111,10 +113,18 @@ export async function handleInteraction({ interaction, config, store, monitor, d
 
   if (command === 'watch') {
     const subcommand = interaction.options.getSubcommand();
+    if (!canManageWatches(interaction, config)) {
+      await interaction.reply(buildNoticePayload({
+        title: 'Permission Required',
+        description: 'Watch controls require Manage Server, the configured watch-manager role, or the bot owner account.',
+        color: UI_COLORS.error,
+      }));
+      return;
+    }
+    const scope = watchScopeFromInteraction(interaction, config);
     if (subcommand === 'add') {
       const username = normalizeUsername(interaction.options.getString('username', true));
-      const channelId = interaction.channelId || config.discordChannelId;
-      const watch = store.addWatch(username, channelId);
+      const watch = store.addWatch(username, scope);
       await interaction.reply(buildNoticePayload({
         title: 'Watch Added',
         description: `Watching @${watch.username}. Alerts will post in this channel.`,
@@ -123,7 +133,7 @@ export async function handleInteraction({ interaction, config, store, monitor, d
     }
     if (subcommand === 'remove') {
       const username = normalizeUsername(interaction.options.getString('username', true));
-      const removed = store.removeWatch(username);
+      const removed = store.removeWatch(username, scope);
       await interaction.reply(buildNoticePayload({
         title: removed ? 'Watch Removed' : 'Watch Not Found',
         description: removed ? `Stopped watching @${username}.` : `@${username} was not watched.`,
@@ -131,7 +141,7 @@ export async function handleInteraction({ interaction, config, store, monitor, d
       return;
     }
     if (subcommand === 'list') {
-      const watches = store.listWatches();
+      const watches = store.listWatchesForScope?.(scope) ?? store.listWatches();
       await interaction.reply(buildNoticePayload({
         title: 'Watched Usernames',
         description: formatWatchList(watches),
@@ -141,6 +151,14 @@ export async function handleInteraction({ interaction, config, store, monitor, d
     if (subcommand === 'run') {
       await interaction.deferReply({ ephemeral: true });
       const username = normalizeUsername(interaction.options.getString('username', true));
+      if (!store.hasWatchSubscription?.(username, scope)) {
+        await interaction.editReply(buildNoticePayload({
+          title: 'Watch Not Found',
+          description: `@${username} is not registered for this server or DM. Add the watch before running it.`,
+          ephemeral: false,
+        }));
+        return;
+      }
       const result = await monitor.pollUsername(username, { force: true });
       await interaction.editReply(buildNoticePayload({
         title: 'Watch Check Complete',
@@ -152,7 +170,7 @@ export async function handleInteraction({ interaction, config, store, monitor, d
   }
 
   if (command === 'status') {
-    await interaction.reply({ embeds: [buildStatusEmbed(store.stats(), monitor.status())], ephemeral: true });
+    await interaction.reply({ embeds: [buildStatusEmbed(store.stats(), monitor.status(), downloadService?.status?.())], ephemeral: true });
     return;
   }
 
@@ -160,6 +178,7 @@ export async function handleInteraction({ interaction, config, store, monitor, d
     const history = store.listLinkHistoryByRequester(interaction.user?.id ?? '', {
       limit: 10,
       includeMonitored: true,
+      scopeId: monitorScopeId(interaction),
     });
     await interaction.reply({
       embeds: [buildLinkHistoryEmbed(history, { config })],
@@ -197,8 +216,10 @@ export async function handleMessageCreate({ message, config, downloadOne }) {
     try {
       const result = await downloadOne(url, {
         delivery: 'auto',
-        type: 'message',
-        requestedBy: message.author?.id ?? '',
+      type: 'message',
+      requestedBy: message.author?.id ?? '',
+      guildId: message.guildId ?? '',
+      channelId: message.channelId ?? '',
       });
       const payload = await buildDeliveryPayload(result, config, 'auto');
 
@@ -289,6 +310,7 @@ export async function handleDownloadsInteraction({ interaction, config, store })
       config,
       store,
       userId,
+      scopeId: monitorScopeId(interaction),
       limit,
       page: 0,
       username,
@@ -319,9 +341,14 @@ export async function handleDownloadsInteraction({ interaction, config, store })
 
     await interaction.deferReply({ ephemeral: true });
     const requestedBy = scope === 'mine' ? interaction.user?.id ?? '' : '';
-    const files = store.listFilesForPurge({ requestedBy });
-    const counts = store.purgeDownloads({ requestedBy });
+    const files = store.listPurgePlan?.({ requestedBy }) ?? store.listFilesForPurge({ requestedBy });
     const removal = await removeStoredFiles(files, config);
+    for (const failure of removal.failed) {
+      store.markFileDeletionFailed?.(failure.file.id, failure.error);
+    }
+    const failedIds = new Set(removal.failed.map((failure) => failure.file.id));
+    const removableFileIds = files.filter((file) => !failedIds.has(file.id)).map((file) => file.id);
+    const counts = store.purgeDownloads({ requestedBy, removeFileIds: removableFileIds });
     await interaction.editReply(buildNoticePayload({
       title: 'Downloads Purged',
       description: formatPurgeResult({ scope, counts, removal }),
@@ -506,8 +533,21 @@ export async function handleMonitorButton({ interaction, config, store }) {
     return true;
   }
 
-  const removal = await removeStoredFiles([{ id: record.id, path: record.path, filename: record.filename }], config);
+  if (record.scope_id && record.scope_id !== monitorScopeId(interaction)) {
+    await interaction.reply(buildNoticePayload({
+      title: 'Wrong Watch Scope',
+      description: 'This monitored delivery belongs to a different server or DM.',
+      color: UI_COLORS.error,
+    }));
+    return true;
+  }
+
+  const deletion = store.planDeliveryDeletion?.(token);
+  const removal = deletion?.file ? await removeStoredFiles([deletion.file], config) : { deleted: 0, failed: [] };
   if (removal.failed.length) {
+    for (const failure of removal.failed) {
+      store.markFileDeletionFailed?.(failure.file.id, failure.error);
+    }
     await interaction.reply(buildNoticePayload({
       title: 'Delete Failed',
       description: 'The saved file could not be removed from disk, so I left its database records intact.',
@@ -516,11 +556,13 @@ export async function handleMonitorButton({ interaction, config, store }) {
     return true;
   }
 
-  const counts = store.deleteMonitorDownloadByFileId?.(record.file_id ?? record.id) ?? { files: 0, links: 0, jobs: 0 };
+  const counts = store.deleteDeliveryToken?.(token, { deleteFile: Boolean(deletion?.file) }) ?? { files: 0, links: 0, jobs: 0 };
   await acknowledgeMonitorDelete(interaction, buildNoticePayload({
-    title: counts.files ? 'Saved Post Deleted' : 'Saved Post Not Found',
-    description: counts.files
-      ? `Deleted ${record.filename || 'the saved post'} from this server.`
+    title: counts.links ? 'Monitored Delivery Deleted' : 'Saved Post Not Found',
+    description: counts.links
+      ? counts.files
+        ? `Deleted ${record.filename || 'the saved post'} from this server.`
+        : 'Removed this monitored delivery. The shared saved asset is still retained by another active link.'
       : 'That monitored saved post had already been deleted.',
   }));
   return true;
@@ -550,10 +592,27 @@ export async function handleLinkButton({ interaction, config, store }) {
     return true;
   }
 
+  if (!canManageLink(record, interaction, config)) {
+    await interaction.reply(buildNoticePayload({
+      title: 'Permission Required',
+      description: 'Only the person who requested this download, a server manager, or the bot owner can change its retention.',
+      color: UI_COLORS.error,
+    }));
+    return true;
+  }
+
   if (action === 'new') {
     const newToken = randomToken();
     const expiresAt = Date.now() + downloadLinkTtlMs(config);
-    store.createLinkToken({ token: newToken, fileId: record.id, expiresAt });
+    store.createLinkToken({
+      token: newToken,
+      fileId: record.id,
+      jobId: record.job_id,
+      ownerId: record.owner_id,
+      scopeId: record.scope_id,
+      deliveryType: record.delivery_type,
+      expiresAt,
+    });
     await interaction.reply(buildNoticePayload({
       title: `New ${formatTtlLong(config)} Link`,
       description: makePublicFileUrl(config, newToken),
@@ -613,6 +672,7 @@ async function handleDownloadsListButton({ interaction, config, store }) {
     config,
     store,
     userId: parsed.userId,
+    scopeId: monitorScopeId(interaction),
     limit: parsed.limit,
     page: parsed.page,
     username: parsed.username,
@@ -622,13 +682,14 @@ async function handleDownloadsListButton({ interaction, config, store }) {
   return true;
 }
 
-export function buildDownloadsListPayload({ config, store, userId, limit = 10, page = 0, username = '' }) {
+export function buildDownloadsListPayload({ config, store, userId, scopeId = '', limit = 10, page = 0, username = '' }) {
   const pageSize = Math.max(1, Math.min(25, Number(limit) || 10));
   const currentPage = Math.max(0, Number(page) || 0);
   const listOptions = {
     limit: pageSize,
     offset: currentPage * pageSize,
     includeMonitored: true,
+    scopeId,
     username,
   };
   const links = store.listPermanentDownloadsByRequester(userId, listOptions);
@@ -637,7 +698,7 @@ export function buildDownloadsListPayload({ config, store, userId, limit = 10, p
   const clampedPage = Math.min(currentPage, pageCount - 1);
 
   if (clampedPage !== currentPage) {
-    return buildDownloadsListPayload({ config, store, userId, limit: pageSize, page: clampedPage, username });
+    return buildDownloadsListPayload({ config, store, userId, scopeId, limit: pageSize, page: clampedPage, username });
   }
 
   return {
@@ -1013,6 +1074,40 @@ function canDeleteMonitorPost(interaction) {
   );
 }
 
+export function canManageWatches(interaction, config = {}) {
+  const userId = String(interaction?.user?.id ?? '');
+  if (userId && userId === String(config.discordOwnerId ?? '')) return true;
+  const inGuild = interaction?.inGuild?.() ?? Boolean(interaction?.guildId);
+  if (!inGuild) return false;
+  if (interaction.memberPermissions?.has?.(PermissionFlagsBits.ManageGuild)) return true;
+  const roleId = String(config.watchManagerRoleId ?? '');
+  return Boolean(roleId && interaction.member?.roles?.cache?.has?.(roleId));
+}
+
+function canManageLink(record, interaction, config = {}) {
+  const userId = String(interaction?.user?.id ?? '');
+  if (userId && userId === String(record?.owner_id ?? '')) return true;
+  if (userId && userId === String(config.discordOwnerId ?? '')) return true;
+  const inGuild = interaction?.inGuild?.() ?? Boolean(interaction?.guildId);
+  return Boolean(inGuild && interaction.memberPermissions?.has?.(PermissionFlagsBits.ManageGuild));
+}
+
+function watchScopeFromInteraction(interaction, config = {}) {
+  const channelId = String(interaction?.channelId || config.discordChannelId || '');
+  if (!channelId) throw new Error('A Discord channel is required to register a watch.');
+  return {
+    guildId: interaction?.guildId ? String(interaction.guildId) : `dm:${channelId}`,
+    channelId,
+    createdBy: String(interaction?.user?.id ?? ''),
+  };
+}
+
+export function monitorScopeId(interaction = {}) {
+  const guildId = String(interaction?.guildId ?? '');
+  if (guildId && !guildId.startsWith('dm:')) return `guild:${guildId}`;
+  return `channel:${String(interaction?.channelId ?? '')}`;
+}
+
 async function acknowledgeMonitorDelete(interaction, payload) {
   if (typeof interaction.update === 'function') {
     try {
@@ -1049,9 +1144,12 @@ function canPurgeAll(interaction) {
   return Boolean(interaction.memberPermissions?.has?.(PermissionFlagsBits.ManageGuild));
 }
 
-function buildStatusEmbed(stats, monitorStatus) {
+function buildStatusEmbed(stats, monitorStatus, downloadStatus = null) {
   const metrics = monitorStatus.metrics ?? {};
   const lastSummary = metrics.lastSummary ?? {};
+  const activeDownloads = downloadStatus?.active ?? monitorStatus.activeDownloads ?? 0;
+  const queuedDownloads = downloadStatus?.queued ?? monitorStatus.queueLength ?? 0;
+  const downloadConcurrency = downloadStatus?.concurrency ?? monitorStatus.downloadConcurrency ?? 1;
   return new EmbedBuilder()
     .setColor(UI_COLORS.success)
     .setTitle('TikTok downloader status')
@@ -1064,8 +1162,9 @@ function buildStatusEmbed(stats, monitorStatus) {
       { name: 'Interval', value: formatDurationMs(monitorStatus.pollIntervalMs), inline: true },
       { name: 'Scan window', value: `${monitorStatus.scanLimit ?? 5} / ${monitorStatus.burstScanLimit ?? 20} burst`, inline: true },
       { name: 'Check workers', value: String(monitorStatus.checkConcurrency ?? 1), inline: true },
-      { name: 'Download workers', value: String(monitorStatus.downloadConcurrency ?? 1), inline: true },
-      { name: 'Download queue', value: `${monitorStatus.activeDownloads ?? 0} active / ${monitorStatus.queueLength ?? 0} queued`, inline: true },
+      { name: 'Download workers', value: String(downloadConcurrency), inline: true },
+      { name: 'Download queue', value: `${activeDownloads} active / ${queuedDownloads} queued`, inline: true },
+      { name: 'Deletion workers', value: `${monitorStatus.activeDeletionChecks ?? 0} active / ${monitorStatus.deletionQueueLength ?? 0} queued`, inline: true },
       { name: 'Download totals', value: `${metrics.totalCompletedDownloads ?? 0} ok / ${metrics.totalDownloadFailures ?? 0} failed`, inline: true },
       { name: 'Last cycle', value: formatMonitorCycle(metrics, lastSummary), inline: false },
     )

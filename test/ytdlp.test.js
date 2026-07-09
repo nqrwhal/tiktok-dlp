@@ -1,4 +1,4 @@
-import { mkdtemp, chmod, readFile, writeFile } from 'node:fs/promises';
+import { mkdtemp, chmod, readFile, readdir, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { strict as assert } from 'node:assert';
@@ -9,6 +9,7 @@ import {
   buildMetadataArgs,
   classifyYtdlpError,
   downloadVideo,
+  fetchPhotoPostMetadata,
   fetchVideoMetadata,
   listProfileStories,
   listProfileVideos,
@@ -204,6 +205,75 @@ test('photo post fallback parses and packages slideshow images', async () => {
       '20260517T224146Z__user400567892112__7640994586499878174__001.jpg',
       '20260517T224146Z__user400567892112__7640994586499878174__002.jpg',
     ],
+  );
+});
+
+test('slideshow fallback streams image bodies and rejects configured size/count limits', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'tiktok-photo-limits-'));
+  const metadata = {
+    id: 'streamed-photo',
+    title: 'streamed photo',
+    uploader: 'creator',
+    mediaType: 'slideshow',
+    imageUrls: ['https://cdn.example.test/streamed.jpg'],
+  };
+  const image = Buffer.from('streamed image bytes');
+  const fetchImpl = async () => ({
+    ok: true,
+    status: 200,
+    url: 'https://cdn.example.test/streamed.jpg',
+    headers: { get: (name) => name === 'content-type' ? 'image/jpeg' : null },
+    body: new ReadableStream({
+      start(controller) {
+        controller.enqueue(image.subarray(0, 6));
+        controller.enqueue(image.subarray(6));
+        controller.close();
+      },
+    }),
+  });
+  const result = await downloadVideo('https://www.tiktok.com/@creator/photo/streamed-photo', {
+    metadata,
+    fetchImpl,
+    downloadDir: root,
+    maxSlideshowItemBytes: 1024,
+    maxSlideshowTotalBytes: 1024,
+  });
+  assert.equal(result.mediaType, 'slideshow');
+  assert.ok((await readFile(result.primaryFile)).includes(Buffer.from('streamed image bytes')));
+
+  await assert.rejects(
+    downloadVideo('https://www.tiktok.com/@creator/photo/too-many', {
+      metadata: { ...metadata, imageUrls: Array.from({ length: 3 }, (_, index) => `https://cdn.example.test/${index}.jpg`) },
+      fetchImpl,
+      downloadDir: root,
+      maxSlideshowImages: 2,
+    }),
+    /exceeding the configured limit/i,
+  );
+  const tempEntries = await readdir(path.join(root, '.tmp')).catch(() => []);
+  assert.deepEqual(tempEntries, []);
+});
+
+test('photo metadata streaming enforces its byte limit before parsing', async () => {
+  const oversized = Buffer.from('<html>this metadata is too large</html>');
+  await assert.rejects(
+    fetchPhotoPostMetadata('https://www.tiktok.com/@creator/photo/streamed-metadata', {
+      maxPhotoMetadataBytes: 8,
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        url: 'https://www.tiktok.com/@creator/photo/streamed-metadata',
+        headers: { get: () => null },
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(oversized.subarray(0, 8));
+            controller.enqueue(oversized.subarray(8));
+            controller.close();
+          },
+        }),
+      }),
+    }),
+    /size limit/i,
   );
 });
 

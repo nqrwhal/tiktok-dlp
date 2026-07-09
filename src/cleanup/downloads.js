@@ -6,49 +6,68 @@ export async function cleanupExpiredDownloads({ config, store, now = Date.now(),
     throw new Error('cleanupExpiredDownloads requires config.downloadDir and compatible store methods.');
   }
 
-  const files = store.listFilesWithoutActiveLinks(now);
-  if (!files.length) return { files: 0, deleted: 0, failed: 0 };
+  const batchSize = Math.max(1, Math.min(1_000, Number(config.cleanupBatchSize) || 100));
+  const totals = { files: 0, deleted: 0, failed: 0, expiredTokens: 0, prunedJobs: 0 };
+  totals.expiredTokens = Number(store.deleteExpiredTokens?.(now) ?? 0);
+  const retentionMs = Math.max(1, Number(config.retentionDays) || 30) * 24 * 60 * 60 * 1000;
+  totals.prunedJobs = Number(store.pruneOldJobs?.(now - retentionMs, batchSize) ?? 0);
 
-  const removal = await removeStoredFiles(files, config);
-  const removableIds = files
-    .filter((file) => !removal.failed.some((failure) => failure.file.id === file.id))
-    .map((file) => file.id);
-  const deletedRecords = store.deleteFileRecords(removableIds);
+  while (true) {
+    const files = store.claimFilesForDeletion?.(now, batchSize)
+      ?? store.listFilesWithoutActiveLinks(now, batchSize);
+    if (!files.length) break;
 
-  if (removal.failed.length) {
-    log?.warn?.(`[cleanup] ${removal.failed.length} expired download file(s) could not be removed from disk.`);
+    const removal = await removeStoredFiles(files, config);
+    for (const failure of removal.failed) {
+      store.markFileDeletionFailed?.(failure.file.id, failure.error, now);
+    }
+    const failedIds = new Set(removal.failed.map((failure) => failure.file.id));
+    const removableIds = files.filter((file) => !failedIds.has(file.id)).map((file) => file.id);
+    const deletedRecords = store.deleteFileRecords(removableIds);
+    totals.files += deletedRecords;
+    totals.deleted += removal.deleted;
+    totals.failed += removal.failed.length;
+
+    if (!removableIds.length || files.length < batchSize) break;
   }
 
-  return {
-    files: deletedRecords,
-    deleted: removal.deleted,
-    failed: removal.failed.length,
-  };
+  if (totals.failed) {
+    log?.warn?.(`[cleanup] ${totals.failed} expired download file(s) could not be removed from disk.`);
+  }
+  return totals;
 }
 
 export async function removeStoredFiles(files, config) {
-  const seen = new Set();
+  const byPath = new Map();
   const failed = [];
   let deleted = 0;
 
   for (const file of files) {
     const filePath = resolveStoredDownloadPath(config.downloadDir, file.path);
-    if (!filePath || seen.has(filePath)) continue;
-    const paths = await resolveRelatedStoredDownloadPaths(filePath);
+    if (!filePath) {
+      failed.push({ file, error: new Error('Stored download path is outside the configured download directory.') });
+      continue;
+    }
+    const group = byPath.get(filePath) ?? [];
+    group.push(file);
+    byPath.set(filePath, group);
+  }
 
-    for (const relatedPath of paths) {
-      if (seen.has(relatedPath)) continue;
-      seen.add(relatedPath);
-
-      try {
+  for (const [filePath, group] of byPath) {
+    let error = null;
+    try {
+      const paths = await resolveRelatedStoredDownloadPaths(filePath);
+      for (const relatedPath of paths) {
         await rm(relatedPath, { force: true });
         deleted += 1;
-      } catch (error) {
-        failed.push({ file: { ...file, path: relatedPath }, error });
       }
+      await removeEmptyParents(path.dirname(filePath), config.downloadDir);
+    } catch (caught) {
+      error = caught;
     }
-
-    await removeEmptyParents(path.dirname(filePath), config.downloadDir);
+    if (error) {
+      for (const file of group) failed.push({ file, error });
+    }
   }
 
   return { deleted, failed };

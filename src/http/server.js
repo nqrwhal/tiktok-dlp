@@ -11,22 +11,22 @@ export function createHttpHandler({ config, store }) {
     try {
       const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
 
-      if (req.method === 'GET' && url.pathname === '/health') {
-        return sendJson(res, 200, buildHealthPayload(config, store));
+      if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname === '/health') {
+        return sendJson(res, 200, buildHealthPayload(config, store), { head: req.method === 'HEAD' });
       }
 
-      if (req.method === 'GET') {
+      if (req.method === 'GET' || req.method === 'HEAD') {
         const token = matchFileToken(url.pathname);
         if (token) {
           return handleFileRequest(req, res, { config, store, token });
         }
       }
 
-      return sendJson(res, 404, { error: 'Not found' });
+      return sendJson(res, 404, { error: 'Not found' }, { head: req.method === 'HEAD' });
     } catch (error) {
       return sendJson(res, 500, {
         error: 'Internal server error',
-      });
+      }, { head: req.method === 'HEAD' });
     }
   };
 }
@@ -64,23 +64,37 @@ export async function handleFileRequest(req, res, { config, store, token, now = 
     }
 
     const filename = record.filename || path.basename(filePath);
-    res.writeHead(200, {
+    const range = parseRangeHeader(req.headers.range, fileStats.size);
+    if (range?.invalid) {
+      res.writeHead(416, {
+        'Content-Range': `bytes */${fileStats.size}`,
+      });
+      res.end();
+      return;
+    }
+    const start = range?.start ?? 0;
+    const end = range?.end ?? fileStats.size - 1;
+    const contentLength = end - start + 1;
+    const headers = {
       'Content-Type': 'application/octet-stream',
-      'Content-Length': String(fileStats.size),
+      'Content-Length': String(contentLength),
       'Content-Disposition': `attachment; filename="${escapeContentDisposition(filename)}"`,
-    });
+      'Accept-Ranges': 'bytes',
+    };
+    if (range) headers['Content-Range'] = `bytes ${start}-${end}/${fileStats.size}`;
+    res.writeHead(range ? 206 : 200, headers);
 
     if (req.method === 'HEAD') {
       res.end();
       return;
     }
 
-    await pipeline(createReadStream(filePath), res);
+    await pipeline(createReadStream(filePath, { start, end }), res);
   } catch (error) {
     if (!res.headersSent) {
       return sendJson(res, error?.code === 'ENOENT' ? 404 : 500, {
         error: error?.code === 'ENOENT' ? 'File not found' : 'Internal server error',
-      });
+      }, { head: req.method === 'HEAD' });
     }
     res.destroy(error);
   }
@@ -97,10 +111,30 @@ export function resolveDownloadPath(downloadDir, filePath) {
 export function buildHealthPayload(config, store) {
   return {
     status: 'ok',
-    now: new Date().toISOString(),
-    downloadDir: config.downloadDir,
-    stats: store.stats(),
   };
+}
+
+export function parseRangeHeader(header, size) {
+  const value = String(header ?? '').trim();
+  if (!value) return null;
+  const match = value.match(/^bytes=(\d*)-(\d*)$/i);
+  if (!match || !size) return { invalid: true };
+  const [, rawStart, rawEnd] = match;
+  if (!rawStart && !rawEnd) return { invalid: true };
+  if (!rawStart) {
+    const suffixLength = Number(rawEnd);
+    if (!Number.isInteger(suffixLength) || suffixLength <= 0) return { invalid: true };
+    return {
+      start: Math.max(0, size - suffixLength),
+      end: size - 1,
+    };
+  }
+  const start = Number(rawStart);
+  const requestedEnd = rawEnd ? Number(rawEnd) : size - 1;
+  if (!Number.isInteger(start) || !Number.isInteger(requestedEnd) || start < 0 || start >= size || requestedEnd < start) {
+    return { invalid: true };
+  }
+  return { start, end: Math.min(size - 1, requestedEnd) };
 }
 
 export function matchFileToken(pathname) {
@@ -113,13 +147,13 @@ export function matchFileToken(pathname) {
   }
 }
 
-export function sendJson(res, statusCode, payload) {
+export function sendJson(res, statusCode, payload, { head = false } = {}) {
   const body = JSON.stringify(payload);
   res.writeHead(statusCode, {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': Buffer.byteLength(body),
   });
-  res.end(body);
+  res.end(head ? undefined : body);
 }
 
 function escapeContentDisposition(filename) {
@@ -130,7 +164,7 @@ function assertServerDeps(config, store) {
   if (!config?.downloadDir) {
     throw new Error('config.downloadDir is required');
   }
-  if (!store || typeof store.getValidToken !== 'function' || typeof store.stats !== 'function') {
-    throw new Error('store must provide getValidToken() and stats()');
+  if (!store || typeof store.getValidToken !== 'function') {
+    throw new Error('store must provide getValidToken()');
   }
 }

@@ -39,12 +39,17 @@ export function loadConfig(env = process.env, cwd = process.cwd()) {
   const uploadLimitMb = parsePositiveInt(env.DISCORD_UPLOAD_LIMIT_MB, 10);
   const httpPort = parsePositiveInt(env.HTTP_PORT, 8080);
   const downloadLinkTtlMinutes = parsePositiveInt(env.DOWNLOAD_LINK_TTL_MINUTES, 30);
+  const slideshowItemLimitMb = parsePositiveInt(env.MAX_SLIDESHOW_ITEM_MB, 20);
+  const slideshowTotalLimitMb = parsePositiveInt(env.MAX_SLIDESHOW_TOTAL_MB, 250);
+  const mediaLimitMb = parsePositiveInt(env.MAX_MEDIA_DOWNLOAD_MB, 2_048);
 
   return {
     discordToken: env.DISCORD_TOKEN ?? '',
     discordClientId: env.DISCORD_CLIENT_ID ?? '',
     discordGuildId: env.DISCORD_GUILD_ID ?? '',
     discordChannelId: env.DISCORD_CHANNEL_ID ?? '',
+    discordOwnerId: env.DISCORD_OWNER_ID ?? '',
+    watchManagerRoleId: env.WATCH_MANAGER_ROLE_ID ?? '',
     publicBaseUrl,
     httpPort,
     dataDir,
@@ -59,11 +64,23 @@ export function loadConfig(env = process.env, cwd = process.cwd()) {
     downloadLinkTtlHours: Math.max(1, Math.ceil(downloadLinkTtlMinutes / 60)),
     retentionDays: parsePositiveInt(env.RETENTION_DAYS, 30),
     maxConcurrentDownloads: parsePositiveInt(env.MAX_CONCURRENT_DOWNLOADS, 1),
+    maxDownloadQueueSize: parsePositiveInt(env.MAX_DOWNLOAD_QUEUE_SIZE, 50),
+    maxQueuedDownloadsPerUser: parsePositiveInt(env.MAX_QUEUED_DOWNLOADS_PER_USER, 3),
+    maxQueuedDownloadsPerGuild: parsePositiveInt(env.MAX_QUEUED_DOWNLOADS_PER_GUILD, 12),
+    cleanupBatchSize: parsePositiveInt(env.CLEANUP_BATCH_SIZE, 100),
+    deletionCheckConcurrency: parsePositiveInt(env.DELETION_CHECK_CONCURRENCY, 2),
+    deletionCheckBatchSize: parsePositiveInt(env.DELETION_CHECK_BATCH_SIZE, 25),
+    fetchTimeoutSeconds: parsePositiveInt(env.FETCH_TIMEOUT_SECONDS, 30),
+    maxSlideshowImages: parsePositiveInt(env.MAX_SLIDESHOW_IMAGES, 35),
+    maxSlideshowItemBytes: slideshowItemLimitMb * 1024 * 1024,
+    maxSlideshowTotalBytes: slideshowTotalLimitMb * 1024 * 1024,
+    maxMediaDownloadBytes: mediaLimitMb * 1024 * 1024,
     pingMode: String(env.PING_MODE ?? 'none').toLowerCase(),
     pingRoleId: env.PING_ROLE_ID ?? '',
     ytdlpPath: env.YTDLP_PATH ?? 'yt-dlp',
     ytdlpCookiesFile: env.YTDLP_COOKIES_FILE ? resolvePath(env.YTDLP_COOKIES_FILE, cwd) : '',
     ytdlpRetries: parsePositiveInt(env.YTDLP_RETRIES, 3),
+    ytdlpTimeoutMs: parsePositiveInt(env.YTDLP_TIMEOUT_SECONDS, 60) * 1000,
     registerCommandsOnStart: parseBoolean(env.REGISTER_COMMANDS_ON_START, false),
   };
 }
@@ -78,7 +95,6 @@ export function validateRuntimeConfig(config, { requireDiscord = true } = {}) {
   if (requireDiscord) {
     if (!config.discordToken) missing.push('DISCORD_TOKEN');
     if (!config.discordClientId) missing.push('DISCORD_CLIENT_ID');
-    if (!config.discordChannelId) missing.push('DISCORD_CHANNEL_ID');
   }
   if (config.pingMode === 'role' && !config.pingRoleId) missing.push('PING_ROLE_ID');
   if (missing.length) {
