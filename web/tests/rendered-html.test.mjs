@@ -24,6 +24,7 @@ async function render(pathname) {
 
 const routes = [
   ["/", /Show video controls/i],
+  ["/?video=v-1041", /Show video controls/i],
   ["/dashboard", /Open feed/i],
   ["/dashboard/videos", /Search title or creator/i],
   ["/dashboard/creators", /Add creator/i],
@@ -40,6 +41,9 @@ for (const [pathname, expectedContent] of routes) {
     assert.match(html, /<title>[^<]*Rewind<\/title>/i);
     assert.match(html, expectedContent);
     if (pathname === "/") assert.match(html, />Bookmarks<\/button>/i);
+    if (pathname === "/dashboard" || pathname === "/dashboard/videos") {
+      assert.match(html, /href="\/\?video=v-/i);
+    }
     assert.doesNotMatch(html, /codex-preview|Your site is taking shape/i);
   });
 }

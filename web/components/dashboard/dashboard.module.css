@@ -314,6 +314,15 @@
   border-top: 1px solid rgba(255, 255, 255, 0.07);
 }
 
+.recentRow:hover {
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.recentRow:focus-visible {
+  outline: 1px solid var(--acid);
+  outline-offset: 3px;
+}
+
 .videoThumb,
 .libraryThumb {
   position: relative;
@@ -690,6 +699,22 @@
   border-top: 0;
 }
 
+.videoRow:hover {
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.videoRowLink {
+  position: absolute;
+  z-index: 1;
+  inset: 0;
+}
+
+.videoRowLink:focus-visible {
+  border-radius: 8px;
+  outline: 1px solid var(--acid);
+  outline-offset: -3px;
+}
+
 .checkboxWrap {
   position: absolute;
   z-index: 3;
@@ -774,6 +799,8 @@
 }
 
 .rowActions {
+  position: relative;
+  z-index: 3;
   display: flex;
   align-items: center;
   justify-content: flex-end;
