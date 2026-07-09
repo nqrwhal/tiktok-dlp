@@ -9,6 +9,7 @@ import {
   Search,
   Trash2,
 } from "lucide-react";
+import Link from "next/link";
 import { useMemo, useState } from "react";
 import { CreatorPicker } from "../CreatorPicker";
 import { mockStats } from "../../lib/mock-data";
@@ -101,6 +102,11 @@ export function VideoLibrary({
         </div>
         {filtered.map((video) => (
           <article className={styles.videoRow} key={video.id}>
+            <Link
+              className={styles.videoRowLink}
+              href={`/?video=${encodeURIComponent(video.id)}`}
+              aria-label={`Play ${video.title}`}
+            />
             <label className={styles.checkboxWrap}>
               <input
                 type="checkbox"

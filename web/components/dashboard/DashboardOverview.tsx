@@ -46,7 +46,7 @@ export function DashboardOverview({
           </div>
           <div className={styles.recentList}>
             {videos.slice(0, 5).map((video) => (
-              <div className={styles.recentRow} key={video.id}>
+              <Link className={styles.recentRow} href={`/?video=${encodeURIComponent(video.id)}`} key={video.id}>
                 <div className={styles.videoThumb} style={{ "--thumb": video.accent } as React.CSSProperties}>
                   {video.thumbnailUrl ? (
                     // Live preview thumbnails come from a configurable local bridge URL.
@@ -60,7 +60,7 @@ export function DashboardOverview({
                   <span>@{video.username}</span>
                 </div>
                 <span className={styles.recentTime}>{video.savedAtLabel}</span>
-              </div>
+              </Link>
             ))}
           </div>
         </div>

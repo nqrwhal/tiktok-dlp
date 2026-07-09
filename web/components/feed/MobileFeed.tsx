@@ -13,6 +13,7 @@ import {
   VolumeX,
 } from "lucide-react";
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CreatorPicker } from "../CreatorPicker";
 import { mockStats } from "../../lib/mock-data";
@@ -28,6 +29,9 @@ interface MobileFeedProps {
 const BOOKMARK_STORAGE_KEY = "rewind-bookmarks";
 
 export function MobileFeed({ creators, videos }: MobileFeedProps) {
+  const searchParams = useSearchParams();
+  const requestedVideoId = searchParams.get("video") || "";
+  const requestedJumpHandled = useRef(!requestedVideoId);
   const archive = useArchiveData({
     fallbackCreators: creators,
     fallbackVideos: videos,
@@ -36,7 +40,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
   const liveCreators = archive.creators;
   const liveVideos = archive.videos;
   const [creatorId, setCreatorId] = useState("all");
-  const [activeId, setActiveId] = useState(liveVideos[0]?.id ?? "");
+  const [activeId, setActiveId] = useState(requestedVideoId || liveVideos[0]?.id || "");
   const [muted, setMuted] = useState(true);
   const [paused, setPaused] = useState(false);
   const [controlsVisible, setControlsVisible] = useState(false);
@@ -60,9 +64,15 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
       : creatorVideos,
     [creatorVideos, feedView, saved],
   );
-  const currentActiveId = filteredVideos.some((video) => video.id === activeId)
+  const hasActiveVideo = filteredVideos.some((video) => video.id === activeId);
+  const requestedVideoPending = Boolean(requestedVideoId)
+    && archive.source === "loading"
+    && !hasActiveVideo;
+  const currentActiveId = hasActiveVideo
     ? activeId
-    : filteredVideos[0]?.id ?? "";
+    : requestedVideoPending
+      ? ""
+      : filteredVideos[0]?.id ?? "";
   const activeIndex = filteredVideos.findIndex((video) => video.id === currentActiveId);
 
   useEffect(() => {
@@ -85,6 +95,18 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
   }, [bookmarksReady, saved]);
 
   useEffect(() => {
+    if (requestedJumpHandled.current) return;
+    const target = Array.from(document.querySelectorAll<HTMLElement>("[data-video-id]"))
+      .find((node) => node.dataset.videoId === requestedVideoId);
+    if (target) {
+      requestedJumpHandled.current = true;
+      target.scrollIntoView({ block: "start" });
+      return;
+    }
+    if (archive.source !== "loading") requestedJumpHandled.current = true;
+  }, [archive.source, filteredVideos, requestedVideoId]);
+
+  useEffect(() => {
     const nodes = Array.from(
       document.querySelectorAll<HTMLElement>("[data-feed-card]"),
     );
@@ -94,7 +116,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
           .filter((entry) => entry.isIntersecting)
           .sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
         const id = visible?.target.getAttribute("data-video-id");
-        if (id) {
+        if (id && requestedJumpHandled.current) {
           setActiveId(id);
           setPaused(false);
           setControlsVisible(false);
