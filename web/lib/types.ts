@@ -1,6 +1,5 @@
 export type CreatorStatus = "healthy" | "syncing" | "attention";
 export type MediaType = "video" | "slideshow" | "story";
-export type VideoStatus = "ready" | "processing" | "archived";
 
 export interface Creator {
   id: string;
@@ -24,16 +23,14 @@ export interface SavedVideo {
   description: string;
   tags: string[];
   mediaType: MediaType;
-  status: VideoStatus;
   videoUrl: string;
+  thumbnailUrl: string;
   accent: string;
   savedAt: string;
   savedAtLabel: string;
   duration: string;
   sizeLabel: string;
   sourceUrl: string;
-  likes: number;
-  bookmarks: number;
 }
 
 export interface ArchiveStats {

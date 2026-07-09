@@ -14,20 +14,18 @@ export function useArchiveData({
   fallbackVideos: SavedVideo[];
   fallbackStats: ArchiveStats;
 }) {
+  const configuredBase = process.env.NEXT_PUBLIC_ARCHIVE_API_BASE;
   const [creators, setCreators] = useState(fallbackCreators);
   const [videos, setVideos] = useState(fallbackVideos);
   const [stats, setStats] = useState(fallbackStats);
-  const [source, setSource] = useState<ArchiveDataSource>("mock");
+  const [source, setSource] = useState<ArchiveDataSource>(configuredBase ? "loading" : "mock");
   const [error, setError] = useState("");
 
   useEffect(() => {
-    const configuredBase = process.env.NEXT_PUBLIC_ARCHIVE_API_BASE;
     if (!configuredBase) return;
 
     const controller = new AbortController();
     const base = configuredBase.replace(/\/+$/, "");
-    setSource("loading");
-    setError("");
 
     Promise.all([
       fetch(`${base}/api/creators`, {
@@ -56,7 +54,7 @@ export function useArchiveData({
       });
 
     return () => controller.abort();
-  }, []);
+  }, [configuredBase]);
 
   return { creators, videos, stats, source, error };
 }

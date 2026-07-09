@@ -7,7 +7,7 @@ import {
   RefreshCw,
   Search,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { mockStats, mockVideos } from "../../lib/mock-data";
 import type { Creator } from "../../lib/types";
 import { useArchiveData } from "../../lib/useArchiveData";
@@ -21,9 +21,7 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
   });
   const liveCreators = archive.creators;
   const [query, setQuery] = useState("");
-  const [enabled, setEnabled] = useState<Record<string, boolean>>(() =>
-    Object.fromEntries(creators.map((creator) => [creator.id, creator.enabled])),
-  );
+  const [enabled, setEnabled] = useState<Record<string, boolean>>({});
 
   const filtered = useMemo(() => {
     const normalized = query.trim().toLowerCase();
@@ -35,22 +33,11 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
     );
   }, [liveCreators, query]);
 
-  useEffect(() => {
-    setEnabled((current) => ({
-      ...Object.fromEntries(liveCreators.map((creator) => [creator.id, creator.enabled])),
-      ...current,
-    }));
-  }, [liveCreators]);
-
   return (
     <>
       <div className={styles.pageHeader}>
         <div>
-          <span className={styles.pageEyebrow}>
-            {archive.source === "live" ? "Live monitoring" : "Monitoring"}
-          </span>
           <h1>Creators</h1>
-          <p>Choose who to monitor and review each creator’s archive health.</p>
         </div>
         <button className={styles.primaryButton} type="button">
           <Plus size={17} /> Add creator
@@ -103,17 +90,17 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
             <div className={styles.creatorCardFooter}>
               <span>Monitoring</span>
               <button
-                className={`${styles.switch} ${enabled[creator.id] ? styles.switchOn : ""}`}
+                className={`${styles.switch} ${(enabled[creator.id] ?? creator.enabled) ? styles.switchOn : ""}`}
                 onClick={() =>
                   setEnabled((current) => ({
                     ...current,
-                    [creator.id]: !current[creator.id],
+                    [creator.id]: !(current[creator.id] ?? creator.enabled),
                   }))
                 }
                 type="button"
                 role="switch"
-                aria-checked={enabled[creator.id]}
-                aria-label={`${enabled[creator.id] ? "Disable" : "Enable"} monitoring for ${creator.username}`}
+                aria-checked={enabled[creator.id] ?? creator.enabled}
+                aria-label={`${(enabled[creator.id] ?? creator.enabled) ? "Disable" : "Enable"} monitoring for ${creator.username}`}
               >
                 <span />
               </button>

@@ -10,6 +10,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { useMemo, useState } from "react";
+import { CreatorPicker } from "../CreatorPicker";
 import { mockStats } from "../../lib/mock-data";
 import type { Creator, SavedVideo } from "../../lib/types";
 import { useArchiveData } from "../../lib/useArchiveData";
@@ -58,11 +59,7 @@ export function VideoLibrary({
     <>
       <div className={styles.pageHeader}>
         <div>
-          <span className={styles.pageEyebrow}>
-            {archive.source === "live" ? "Live library" : "Library"}
-          </span>
-          <h1>Saved videos</h1>
-          <p>Review, filter, download, or remove files from your archive.</p>
+          <h1>Videos</h1>
         </div>
         <button className={styles.primaryButton} type="button">
           <Download size={17} /> Export selected
@@ -79,15 +76,7 @@ export function VideoLibrary({
             placeholder="Search title or creator"
           />
         </label>
-        <label className={styles.selectField}>
-          <span className="sr-only">Filter by creator</span>
-          <select value={creatorId} onChange={(event) => setCreatorId(event.target.value)}>
-            <option value="all">All creators</option>
-            {liveCreators.map((creator) => (
-              <option value={creator.id} key={creator.id}>@{creator.username}</option>
-            ))}
-          </select>
-        </label>
+        <CreatorPicker creators={liveCreators} value={creatorId} onChange={setCreatorId} />
         <span className={styles.resultCount}>{filtered.length} results</span>
       </div>
 
@@ -108,7 +97,6 @@ export function VideoLibrary({
           <span>Creator</span>
           <span>Saved</span>
           <span>Size</span>
-          <span>Status</span>
           <span />
         </div>
         {filtered.map((video) => (
@@ -127,7 +115,12 @@ export function VideoLibrary({
                 className={styles.libraryThumb}
                 style={{ "--thumb": video.accent } as React.CSSProperties}
               >
-                <Play size={15} fill="currentColor" />
+                {video.thumbnailUrl ? (
+                  // Live preview thumbnails come from a configurable local bridge URL.
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img src={video.thumbnailUrl} alt="" loading="lazy" />
+                ) : null}
+                <span className={styles.thumbPlay}><Play size={14} fill="currentColor" /></span>
                 <small>{video.duration}</small>
               </div>
               <div>
@@ -138,9 +131,6 @@ export function VideoLibrary({
             <span className={styles.tableCreator}>@{video.username}</span>
             <span className={styles.tableMuted}>{video.savedAtLabel}</span>
             <span className={styles.tableMuted}>{video.sizeLabel}</span>
-            <span className={`${styles.statusPill} ${styles[video.status]}`}>
-              {video.status}
-            </span>
             <div className={styles.rowActions}>
               <a href={video.sourceUrl} target="_blank" rel="noreferrer" aria-label="Open original">
                 <ExternalLink size={16} />

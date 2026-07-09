@@ -1,8 +1,6 @@
 .dashboardShell {
   min-height: 100dvh;
-  background:
-    radial-gradient(circle at 78% 0%, rgba(117, 230, 216, 0.05), transparent 26%),
-    #0b0d0c;
+  background: #0b0d0c;
 }
 
 .mobileHeader {
@@ -55,15 +53,15 @@
   z-index: 50;
   top: 0;
   bottom: 0;
-  left: 0;
+  right: 0;
   display: flex;
   width: min(82vw, 292px);
   flex-direction: column;
   padding: max(28px, env(safe-area-inset-top)) 20px 22px;
-  border-right: 1px solid var(--line);
+  border-left: 1px solid var(--line);
   background: #0f1210;
-  box-shadow: 24px 0 80px rgba(0, 0, 0, 0.45);
-  transform: translateX(-102%);
+  box-shadow: -24px 0 80px rgba(0, 0, 0, 0.45);
+  transform: translateX(102%);
   transition: transform 180ms ease;
 }
 
@@ -132,39 +130,6 @@
   color: #8b9389;
   font-size: 12px;
   font-weight: 600;
-}
-
-.connectionCard {
-  display: flex;
-  align-items: center;
-  gap: 11px;
-  padding: 13px;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: #141714;
-}
-
-.connectionDot {
-  width: 8px;
-  height: 8px;
-  flex: 0 0 auto;
-  border-radius: 50%;
-  background: var(--acid);
-  box-shadow: 0 0 0 5px rgba(201, 255, 74, 0.07);
-}
-
-.connectionCard div {
-  display: grid;
-  gap: 3px;
-}
-
-.connectionCard strong {
-  font-size: 11px;
-}
-
-.connectionCard small {
-  color: #727a70;
-  font-size: 9px;
 }
 
 .menuScrim {
@@ -247,9 +212,9 @@
 
 .metricCard {
   display: flex;
-  min-height: 166px;
+  min-height: 112px;
   flex-direction: column;
-  align-items: flex-start;
+  justify-content: space-between;
   border-radius: 13px;
   padding: 16px;
 }
@@ -285,13 +250,12 @@
 
 .metricCard > span {
   color: #929a90;
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 600;
 }
 
 .metricCard > strong {
-  margin-top: 4px;
-  font-size: 26px;
+  font-size: 25px;
   font-weight: 680;
   letter-spacing: -0.045em;
 }
@@ -322,7 +286,7 @@
 }
 
 .cardHeading h2 {
-  margin: 4px 0 0;
+  margin: 0;
   font-size: 18px;
   font-weight: 640;
   letter-spacing: -0.035em;
@@ -360,6 +324,31 @@
     radial-gradient(circle at 62% 35%, rgba(255, 255, 255, 0.24), transparent 24%),
     linear-gradient(145deg, color-mix(in srgb, var(--thumb) 85%, white), #111 120%);
   color: white;
+}
+
+.videoThumb img,
+.libraryThumb img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.videoThumb > svg,
+.thumbPlay {
+  position: relative;
+  z-index: 2;
+  filter: drop-shadow(0 1px 4px rgba(0, 0, 0, 0.8));
+}
+
+.thumbPlay {
+  display: grid;
+  width: 25px;
+  height: 25px;
+  place-items: center;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.42);
 }
 
 .videoThumb {
@@ -433,6 +422,35 @@
   gap: 16px;
   color: #747c72;
   font-size: 9px;
+}
+
+.utilityList {
+  display: grid;
+  margin: 0;
+}
+
+.utilityList > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 11px 0;
+  border-top: 1px solid var(--line);
+}
+
+.utilityList dt,
+.utilityList dd {
+  margin: 0;
+  font-size: 10px;
+}
+
+.utilityList dt {
+  color: #7f877d;
+}
+
+.utilityList dd {
+  color: var(--paper);
+  font-weight: 650;
 }
 
 .storageLegend span {
@@ -755,31 +773,6 @@
   display: none;
 }
 
-.statusPill {
-  align-self: end;
-  justify-self: start;
-  border-radius: 99px;
-  padding: 5px 8px;
-  font-size: 8px;
-  font-weight: 700;
-  text-transform: capitalize;
-}
-
-.ready {
-  background: rgba(201, 255, 74, 0.09);
-  color: var(--acid);
-}
-
-.processing {
-  background: rgba(117, 230, 216, 0.09);
-  color: var(--cyan);
-}
-
-.archived {
-  background: rgba(255, 255, 255, 0.06);
-  color: #969e94;
-}
-
 .rowActions {
   display: flex;
   align-items: center;
@@ -1099,8 +1092,12 @@
   .sidebar {
     position: sticky;
     top: 0;
+    right: auto;
+    left: 0;
     width: 228px;
     height: 100dvh;
+    border-right: 1px solid var(--line);
+    border-left: 0;
     box-shadow: none;
     transform: none;
   }
@@ -1128,7 +1125,7 @@
   .tableHeader,
   .videoRow {
     display: grid;
-    grid-template-columns: 32px minmax(260px, 1.8fr) minmax(100px, 0.7fr) 90px 70px 80px 72px;
+    grid-template-columns: 32px minmax(260px, 1.8fr) minmax(100px, 0.7fr) 90px 70px 72px;
     align-items: center;
     gap: 14px;
   }
@@ -1169,9 +1166,6 @@
     display: inline;
   }
 
-  .statusPill {
-    align-self: center;
-  }
 }
 
 @media (min-width: 1260px) {

@@ -23,11 +23,11 @@ async function render(pathname) {
 }
 
 const routes = [
-  ["/", /Saved feed/i],
-  ["/dashboard", /Archive overview/i],
-  ["/dashboard/videos", /Saved videos/i],
-  ["/dashboard/creators", /Choose who to monitor/i],
-  ["/dashboard/settings", /Configure playback/i],
+  ["/", /Show video controls/i],
+  ["/dashboard", /Open feed/i],
+  ["/dashboard/videos", /Search title or creator/i],
+  ["/dashboard/creators", /Add creator/i],
+  ["/dashboard/settings", /Save changes/i],
 ];
 
 for (const [pathname, expectedContent] of routes) {

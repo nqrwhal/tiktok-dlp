@@ -11,9 +11,7 @@ export default function SettingsPage() {
     <div className={styles.pageWrap}>
       <div className={styles.pageHeader}>
         <div>
-          <span className={styles.pageEyebrow}>Preferences</span>
           <h1>Settings</h1>
-          <p>Configure playback, monitoring, and storage defaults.</p>
         </div>
       </div>
       <SettingsForm />

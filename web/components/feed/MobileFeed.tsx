@@ -2,29 +2,19 @@
 
 import {
   Bookmark,
-  ChevronDown,
-  Heart,
-  Home,
+  ExternalLink,
   LayoutDashboard,
   Library,
-  MessageCircle,
   MoreHorizontal,
-  Music2,
   Pause,
   Play,
-  Search,
   Share2,
   Volume2,
   VolumeX,
 } from "lucide-react";
 import Link from "next/link";
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { CreatorPicker } from "../CreatorPicker";
 import { mockStats } from "../../lib/mock-data";
 import type { Creator, SavedVideo } from "../../lib/types";
 import { useArchiveData } from "../../lib/useArchiveData";
@@ -33,13 +23,6 @@ import styles from "./mobile-feed.module.css";
 interface MobileFeedProps {
   creators: Creator[];
   videos: SavedVideo[];
-}
-
-function compactNumber(value: number) {
-  return new Intl.NumberFormat("en", {
-    notation: "compact",
-    maximumFractionDigits: 1,
-  }).format(value);
 }
 
 export function MobileFeed({ creators, videos }: MobileFeedProps) {
@@ -54,8 +37,10 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
   const [activeId, setActiveId] = useState(liveVideos[0]?.id ?? "");
   const [muted, setMuted] = useState(true);
   const [paused, setPaused] = useState(false);
-  const [liked, setLiked] = useState<Set<string>>(() => new Set());
+  const [controlsVisible, setControlsVisible] = useState(false);
+  const [menuVideoId, setMenuVideoId] = useState("");
   const [saved, setSaved] = useState<Set<string>>(() => new Set());
+  const [progress, setProgress] = useState(0);
   const videoRefs = useRef(new Map<string, HTMLVideoElement>());
 
   const filteredVideos = useMemo(
@@ -65,13 +50,10 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
         : liveVideos.filter((video) => video.creatorId === creatorId),
     [creatorId, liveVideos],
   );
-  const activeIndex = filteredVideos.findIndex((video) => video.id === activeId);
-
-  useEffect(() => {
-    if (!filteredVideos.some((video) => video.id === activeId)) {
-      setActiveId(filteredVideos[0]?.id ?? "");
-    }
-  }, [activeId, filteredVideos]);
+  const currentActiveId = filteredVideos.some((video) => video.id === activeId)
+    ? activeId
+    : filteredVideos[0]?.id ?? "";
+  const activeIndex = filteredVideos.findIndex((video) => video.id === currentActiveId);
 
   useEffect(() => {
     const nodes = Array.from(
@@ -86,6 +68,9 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
         if (id) {
           setActiveId(id);
           setPaused(false);
+          setControlsVisible(false);
+          setMenuVideoId("");
+          setProgress(0);
         }
       },
       { threshold: [0.65, 0.82] },
@@ -97,13 +82,13 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
   useEffect(() => {
     for (const [id, video] of videoRefs.current) {
       video.muted = muted;
-      if (id === activeId && !paused) {
+      if (id === currentActiveId && !paused) {
         video.play().catch(() => undefined);
       } else {
         video.pause();
       }
     }
-  }, [activeId, muted, paused]);
+  }, [currentActiveId, muted, paused]);
 
   const setVideoRef = useCallback(
     (id: string, node: HTMLVideoElement | null) => {
@@ -113,11 +98,8 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
     [],
   );
 
-  function toggleSet(
-    setter: React.Dispatch<React.SetStateAction<Set<string>>>,
-    id: string,
-  ) {
-    setter((current) => {
+  function toggleSaved(id: string) {
+    setSaved((current) => {
       const next = new Set(current);
       if (next.has(id)) next.delete(id);
       else next.add(id);
@@ -125,101 +107,53 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
     });
   }
 
+  async function shareVideo(video: SavedVideo) {
+    if (navigator.share) {
+      await navigator.share({ title: video.title, url: video.sourceUrl }).catch(() => undefined);
+      return;
+    }
+    await navigator.clipboard?.writeText(video.sourceUrl).catch(() => undefined);
+  }
+
   return (
     <main className={styles.appShell}>
-      <aside className={styles.desktopRail} aria-label="Primary navigation">
-        <Link className={styles.wordmark} href="/" aria-label="Rewind feed">
-          <span className={styles.mark}>R</span>
-          <span>rewind</span>
-        </Link>
-
-        <nav className={styles.railNav}>
-          <Link className={`${styles.railLink} ${styles.railLinkActive}`} href="/">
-            <Home size={20} /> Feed
-          </Link>
-          <Link className={styles.railLink} href="/dashboard/videos">
-            <Library size={20} /> Library
-          </Link>
-          <Link className={styles.railLink} href="/dashboard">
-            <LayoutDashboard size={20} /> Dashboard
-          </Link>
-        </nav>
-
-        <div className={styles.creatorSection}>
-          <div className={styles.railLabel}>Creators</div>
-          {liveCreators.slice(0, 5).map((creator) => (
-            <button
-              className={`${styles.creatorShortcut} ${
-                creatorId === creator.id ? styles.creatorShortcutActive : ""
-              }`}
-              key={creator.id}
-              onClick={() => setCreatorId(creator.id)}
-              type="button"
-            >
-              <span
-                className={styles.miniAvatar}
-                style={{ "--avatar": creator.accent } as React.CSSProperties}
-              >
-                {creator.initials}
-              </span>
-              <span>@{creator.username}</span>
-            </button>
-          ))}
-        </div>
-
-        <div className={styles.railFooter}>
-          <span className={styles.liveDot} /> {archive.source === "live" ? "Live archive connected" : "Preview archive"}
-        </div>
-      </aside>
-
       <section className={styles.stage} aria-label="Saved video feed">
-        <header className={styles.feedHeader}>
-          <button className={styles.iconButton} type="button" aria-label="Search archive">
-            <Search size={21} />
-          </button>
-          <div className={styles.feedTabs}>
-            <button className={styles.tabMuted} type="button">
-              Latest
+        <div className={`${styles.controlBar} ${controlsVisible ? styles.controlBarVisible : ""}`}>
+          <CreatorPicker
+            creators={liveCreators}
+            value={creatorId}
+            onChange={setCreatorId}
+            compact
+          />
+          <div className={styles.controlActions}>
+            <Link className={styles.iconButton} href="/dashboard/videos" aria-label="Open video library">
+              <Library size={19} />
+            </Link>
+            <button
+              className={styles.iconButton}
+              onClick={() => setMuted((value) => !value)}
+              type="button"
+              aria-label={muted ? "Turn sound on" : "Mute videos"}
+            >
+              {muted ? <VolumeX size={19} /> : <Volume2 size={19} />}
             </button>
-            <button className={styles.tabActive} type="button">
-              Saved feed
+            <button
+              className={styles.iconButton}
+              onClick={() => setPaused((value) => !value)}
+              type="button"
+              aria-label={paused ? "Play video" : "Pause video"}
+            >
+              {paused ? <Play size={18} fill="currentColor" /> : <Pause size={18} fill="currentColor" />}
             </button>
           </div>
-          <button
-            className={styles.iconButton}
-            onClick={() => setMuted((value) => !value)}
-            type="button"
-            aria-label={muted ? "Turn sound on" : "Mute videos"}
-          >
-            {muted ? <VolumeX size={21} /> : <Volume2 size={21} />}
-          </button>
-        </header>
-
-        <div className={styles.creatorFilter}>
-          <label>
-            <span className="sr-only">Filter by creator</span>
-            <select
-              value={creatorId}
-              onChange={(event) => setCreatorId(event.target.value)}
-            >
-              <option value="all">All creators</option>
-              {liveCreators.map((creator) => (
-                <option value={creator.id} key={creator.id}>
-                  @{creator.username}
-                </option>
-              ))}
-            </select>
-            <ChevronDown size={14} aria-hidden="true" />
-          </label>
-          <span>{filteredVideos.length} in preview</span>
         </div>
 
         <div className={styles.feedScroller}>
           {filteredVideos.map((video, index) => {
-            const isActive = video.id === activeId;
+            const isActive = video.id === currentActiveId;
             const shouldLoad = activeIndex >= 0 && Math.abs(index - activeIndex) <= 1;
-            const isLiked = liked.has(video.id);
             const isSaved = saved.has(video.id);
+            const showControls = isActive && controlsVisible;
             return (
               <article
                 className={styles.feedCard}
@@ -237,13 +171,27 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
                   playsInline
                   preload={isActive ? "auto" : shouldLoad ? "metadata" : "none"}
                   aria-label={`${video.title} by ${video.displayName}`}
+                  onTimeUpdate={(event) => {
+                    if (!isActive) return;
+                    const element = event.currentTarget;
+                    setProgress(element.duration ? element.currentTime / element.duration : 0);
+                  }}
+                  onLoadedMetadata={(event) => {
+                    if (!isActive) return;
+                    const element = event.currentTarget;
+                    setProgress(element.duration ? element.currentTime / element.duration : 0);
+                  }}
                 />
-                <div className={styles.videoTint} />
+                <div className={`${styles.videoTint} ${showControls ? styles.videoTintVisible : ""}`} />
                 <button
                   className={styles.videoTapTarget}
                   type="button"
-                  onClick={() => isActive && setPaused((value) => !value)}
-                  aria-label={paused && isActive ? "Play video" : "Pause video"}
+                  onClick={() => {
+                    if (!isActive) return;
+                    setControlsVisible((value) => !value);
+                    setMenuVideoId("");
+                  }}
+                  aria-label={controlsVisible ? "Hide video controls" : "Show video controls"}
                 />
 
                 {isActive && paused ? (
@@ -253,80 +201,53 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
                     onClick={() => setPaused(false)}
                     aria-label="Play video"
                   >
-                    <Play size={34} fill="currentColor" />
+                    <Play size={32} fill="currentColor" />
                   </button>
                 ) : null}
 
-                <div className={styles.demoBadge}>
-                  {archive.source === "live"
-                    ? "Live · yufeihl"
-                    : archive.source === "loading"
-                      ? "Connecting…"
-                      : archive.source === "fallback"
-                        ? "Offline fallback"
-                        : "Preview media"}
-                </div>
-
-                <div className={styles.videoMeta}>
-                  <div className={styles.creatorLine}>
-                    <span>@{video.username}</span>
-                    <button type="button">View creator</button>
-                  </div>
+                <div className={`${styles.videoMeta} ${showControls ? styles.videoMetaVisible : ""}`}>
+                  <span className={styles.creatorName}>@{video.username}</span>
                   <h1>{video.title}</h1>
-                  <p>{video.description}</p>
-                  <div className={styles.tags}>
-                    {video.tags.map((tag) => (
-                      <span key={tag}>#{tag}</span>
-                    ))}
-                  </div>
-                  <div className={styles.soundLine}>
-                    <Music2 size={15} />
-                    <span>Original audio · {video.displayName}</span>
-                  </div>
+                  {video.description && video.description !== video.title ? (
+                    <p>{video.description}</p>
+                  ) : null}
+                  {video.tags.length ? (
+                    <div className={styles.tags}>
+                      {video.tags.map((tag) => <span key={tag}>#{tag}</span>)}
+                    </div>
+                  ) : null}
                 </div>
 
-                <div className={styles.actionRail}>
-                  <button className={styles.avatarAction} type="button" aria-label={`Open ${video.displayName}`}>
-                    <span style={{ background: video.accent }}>
-                      {video.displayName.slice(0, 1)}
-                    </span>
-                    <b>+</b>
+                <div className={`${styles.minimalActions} ${showControls ? styles.minimalActionsVisible : ""}`}>
+                  <button type="button" onClick={() => shareVideo(video)} aria-label="Share">
+                    <Share2 size={21} />
                   </button>
                   <button
-                    className={isLiked ? styles.actionActive : undefined}
-                    onClick={() => toggleSet(setLiked, video.id)}
                     type="button"
-                    aria-label={isLiked ? "Unlike" : "Like"}
-                    aria-pressed={isLiked}
+                    onClick={() => setMenuVideoId((current) => current === video.id ? "" : video.id)}
+                    aria-label="More actions"
+                    aria-expanded={menuVideoId === video.id}
                   >
-                    <span><Heart size={25} fill={isLiked ? "currentColor" : "none"} /></span>
-                    <small>{compactNumber(video.likes + (isLiked ? 1 : 0))}</small>
+                    <MoreHorizontal size={22} />
                   </button>
-                  <button type="button" aria-label="Open notes">
-                    <span><MessageCircle size={25} /></span>
-                    <small>Notes</small>
-                  </button>
-                  <button
-                    className={isSaved ? styles.savedActive : undefined}
-                    onClick={() => toggleSet(setSaved, video.id)}
-                    type="button"
-                    aria-label={isSaved ? "Remove bookmark" : "Bookmark"}
-                    aria-pressed={isSaved}
-                  >
-                    <span><Bookmark size={24} fill={isSaved ? "currentColor" : "none"} /></span>
-                    <small>{compactNumber(video.bookmarks + (isSaved ? 1 : 0))}</small>
-                  </button>
-                  <button type="button" aria-label="Share">
-                    <span><Share2 size={24} /></span>
-                    <small>Share</small>
-                  </button>
-                  <button type="button" aria-label="More actions">
-                    <span><MoreHorizontal size={25} /></span>
-                  </button>
+                  {menuVideoId === video.id ? (
+                    <div className={styles.moreMenu}>
+                      <button type="button" onClick={() => toggleSaved(video.id)}>
+                        <Bookmark size={17} fill={isSaved ? "currentColor" : "none"} />
+                        {isSaved ? "Remove bookmark" : "Bookmark"}
+                      </button>
+                      <a href={video.sourceUrl} target="_blank" rel="noreferrer">
+                        <ExternalLink size={17} /> Original post
+                      </a>
+                      <Link href="/dashboard">
+                        <LayoutDashboard size={17} /> Dashboard
+                      </Link>
+                    </div>
+                  ) : null}
                 </div>
 
-                <div className={styles.progressTrack}>
-                  <span className={isActive && !paused ? styles.progressActive : ""} />
+                <div className={styles.progressTrack} aria-hidden="true">
+                  <span style={{ width: isActive ? `${Math.max(0, Math.min(1, progress)) * 100}%` : "0%" }} />
                 </div>
               </article>
             );
@@ -334,41 +255,12 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
 
           {filteredVideos.length === 0 ? (
             <div className={styles.emptyFeed}>
-              <Pause size={28} />
-              <h2>No saved videos yet</h2>
-              <p>This creator’s next download will appear here automatically.</p>
+              <h2>No saved videos</h2>
+              <p>There are no files for this creator.</p>
             </div>
           ) : null}
         </div>
-
-        <nav className={styles.mobileNav} aria-label="Mobile navigation">
-          <Link className={styles.mobileNavActive} href="/">
-            <Home size={22} fill="currentColor" />
-            <span>Feed</span>
-          </Link>
-          <Link href="/dashboard/videos">
-            <Library size={22} />
-            <span>Library</span>
-          </Link>
-          <Link href="/dashboard">
-            <LayoutDashboard size={22} />
-            <span>Manage</span>
-          </Link>
-        </nav>
       </section>
-
-      <aside className={styles.desktopContext}>
-        <span className={styles.eyebrow}>Now viewing</span>
-        <h2>Saved feed</h2>
-        <p>Use ↑ and ↓ or your trackpad to move through the archive.</p>
-        <div className={styles.keyboardHint}>
-          <kbd>↑</kbd><kbd>↓</kbd><span>Navigate</span>
-        </div>
-        <div className={styles.contextDivider} />
-        <span className={styles.eyebrow}>Queue</span>
-        <strong>{filteredVideos.length} videos</strong>
-        <Link href="/dashboard/videos">Manage library <span>↗</span></Link>
-      </aside>
     </main>
   );
 }

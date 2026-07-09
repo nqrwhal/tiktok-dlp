@@ -15,7 +15,9 @@ const remoteProject = process.env.LIVE_REMOTE_PROJECT || "/home/yufei/tiktok-dis
 const remoteDb = `${remoteProject}/data/state.db`;
 const remoteDownloads = `${remoteProject}/data/downloads`;
 const inflightCopies = new Map();
+const inflightThumbnails = new Map();
 let videoCache = { loadedAt: 0, rows: [] };
+let metadataCache = { loadedAt: 0, byId: {} };
 
 const VIDEO_SQL = `
   SELECT
@@ -135,10 +137,13 @@ const server = http.createServer(async (request, response) => {
       const limit = Math.min(500, positiveInteger(url.searchParams.get("limit"), 100));
       const creatorId = String(url.searchParams.get("creatorId") || "").toLowerCase();
       const rows = await loadVideoRows();
+      const metadataById = await loadMetadataIndex();
       const filtered = creatorId
         ? rows.filter((row) => creatorKey(row.username) === creatorId || String(row.username).toLowerCase() === creatorId)
         : rows;
-      sendJson(response, 200, filtered.slice(0, limit).map((row) => toVideo(row, request)));
+      sendJson(response, 200, filtered.slice(0, limit).map((row) => (
+        toVideo(row, request, metadataById[String(row.video_id || "")] || {})
+      )));
       return;
     }
 
@@ -161,8 +166,15 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
+    const thumbnailMatch = url.pathname.match(/^\/thumbnail\/(\d+)\.jpg$/);
+    if ((request.method === "GET" || request.method === "HEAD") && thumbnailMatch) {
+      await serveThumbnail(request, response, Number(thumbnailMatch[1]));
+      return;
+    }
+
     sendJson(response, 404, { error: "Not found" });
   } catch (error) {
+    if (isClientDisconnect(error, request, response)) return;
     console.error("[live-bridge]", error);
     if (!response.headersSent) {
       sendJson(response, 500, { error: error instanceof Error ? error.message : String(error) });
@@ -186,6 +198,40 @@ async function loadVideoRows({ force = false } = {}) {
   const rows = await remoteSql(VIDEO_SQL);
   videoCache = { loadedAt: now, rows };
   return rows;
+}
+
+async function loadMetadataIndex({ force = false } = {}) {
+  const now = Date.now();
+  if (!force && now - metadataCache.loadedAt < 60_000) return metadataCache.byId;
+  const encodedRoot = Buffer.from(remoteDownloads, "utf8").toString("base64");
+  const script = [
+    "import base64, json, os",
+    `archive_root = base64.b64decode(${JSON.stringify(encodedRoot)}).decode('utf-8')`,
+    "result = {}",
+    "for current_root, _, filenames in os.walk(archive_root):",
+    "    for filename in filenames:",
+    "        if not filename.endswith('.info.json'):",
+    "            continue",
+    "        file_path = os.path.join(current_root, filename)",
+    "        try:",
+    "            with open(file_path, 'r', encoding='utf-8') as source:",
+    "                data = json.load(source)",
+    "        except Exception:",
+    "            continue",
+    "        video_id = str(data.get('id') or filename[:-10])",
+    "        raw_tags = data.get('tags')",
+    "        result[video_id] = {",
+    "            'title': str(data.get('title') or ''),",
+    "            'description': str(data.get('description') or ''),",
+    "            'tags': raw_tags if isinstance(raw_tags, list) else [],",
+    "            'duration': data.get('duration'),",
+    "            'timestamp': data.get('timestamp'),",
+    "        }",
+    "print(json.dumps(result, ensure_ascii=False))",
+  ].join("\n");
+  const byId = await remotePythonJson(script);
+  metadataCache = { loadedAt: now, byId };
+  return byId;
 }
 
 async function serveMedia(request, response, fileId) {
@@ -237,6 +283,28 @@ async function serveMedia(request, response, fileId) {
     return;
   }
   await pipeline(createReadStream(localPath), response);
+}
+
+async function serveThumbnail(request, response, fileId) {
+  const rows = await loadVideoRows();
+  const record = rows.find((row) => Number(row.id) === fileId);
+  if (!record) {
+    sendJson(response, 404, { error: "Video not found" });
+    return;
+  }
+
+  const thumbnailPath = await ensureThumbnail(record);
+  const thumbnailStats = await stat(thumbnailPath);
+  response.writeHead(200, {
+    "Cache-Control": "private, max-age=3600",
+    "Content-Length": String(thumbnailStats.size),
+    "Content-Type": "image/jpeg",
+  });
+  if (request.method === "HEAD") {
+    response.end();
+    return;
+  }
+  await pipeline(createReadStream(thumbnailPath), response);
 }
 
 async function ensureCached(record) {
@@ -298,6 +366,59 @@ async function copyFromRemote(record, localPath) {
   }
 }
 
+async function ensureThumbnail(record) {
+  const localPath = path.join(cacheDir, `thumb-${record.id}.jpg`);
+  try {
+    const existing = await stat(localPath);
+    if (existing.size > 0) return localPath;
+  } catch {
+    // Cache miss.
+  }
+
+  if (inflightThumbnails.has(record.id)) return inflightThumbnails.get(record.id);
+  const thumbnailPromise = copyThumbnailFromRemote(record, localPath)
+    .finally(() => inflightThumbnails.delete(record.id));
+  inflightThumbnails.set(record.id, thumbnailPromise);
+  return thumbnailPromise;
+}
+
+async function copyThumbnailFromRemote(record, localPath) {
+  const sourcePath = resolveRemotePath(record.path);
+  const relativePath = path.posix.relative(remoteDownloads, sourcePath);
+  const containerPath = path.posix.join("/app/data/downloads", relativePath);
+  const tempPath = `${localPath}.part-${process.pid}`;
+  const encodedPath = Buffer.from(containerPath, "utf8").toString("base64");
+  const encodedComposeFile = Buffer.from(`${remoteProject}/docker-compose.yml`, "utf8").toString("base64");
+  const script = [
+    "import base64, os",
+    `source_path = base64.b64decode(${JSON.stringify(encodedPath)}).decode('utf-8')`,
+    `compose_file = base64.b64decode(${JSON.stringify(encodedComposeFile)}).decode('utf-8')`,
+    "os.execvp('docker', ['docker', 'compose', '-f', compose_file, 'exec', '-T', 'tiktok-discord-downloader', 'ffmpeg', '-hide_banner', '-loglevel', 'error', '-ss', '0.25', '-i', source_path, '-frames:v', '1', '-vf', 'scale=320:-2', '-q:v', '4', '-f', 'image2pipe', '-vcodec', 'mjpeg', 'pipe:1'])",
+  ].join("\n");
+
+  await rm(tempPath, { force: true });
+  const child = spawn("ssh", sshArgs("python3 -"), { stdio: ["pipe", "pipe", "pipe"] });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  child.stdin.end(script);
+
+  try {
+    await Promise.all([
+      pipeline(child.stdout, createWriteStream(tempPath)),
+      waitForChild(child),
+    ]);
+    const generated = await stat(tempPath);
+    if (!generated.size) throw new Error("Thumbnail generation returned an empty image");
+    await rename(tempPath, localPath);
+    return localPath;
+  } catch (error) {
+    await rm(tempPath, { force: true });
+    const detail = stderr.trim();
+    throw new Error(detail || (error instanceof Error ? error.message : String(error)));
+  }
+}
+
 function resolveRemotePath(storedPath) {
   const normalized = path.posix.normalize(String(storedPath || ""));
   let relative;
@@ -314,6 +435,14 @@ function resolveRemotePath(storedPath) {
   return path.posix.join(remoteDownloads, relative);
 }
 
+function isClientDisconnect(error, request, response) {
+  const code = error && typeof error === "object" && "code" in error ? error.code : "";
+  return request.destroyed
+    || response.destroyed
+    || code === "ERR_STREAM_PREMATURE_CLOSE"
+    || code === "ECONNRESET";
+}
+
 async function remoteSql(sql) {
   const child = spawn("ssh", sshArgs(`sqlite3 -readonly -json ${remoteDb}`), {
     stdio: ["pipe", "pipe", "pipe"],
@@ -328,6 +457,22 @@ async function remoteSql(sql) {
   await waitForChild(child);
   if (stderr.trim()) throw new Error(stderr.trim());
   return stdout.trim() ? JSON.parse(stdout) : [];
+}
+
+async function remotePythonJson(script) {
+  const child = spawn("ssh", sshArgs("python3 -"), {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  child.stdin.end(script);
+  await waitForChild(child);
+  if (stderr.trim()) throw new Error(stderr.trim());
+  return stdout.trim() ? JSON.parse(stdout) : {};
 }
 
 function waitForChild(child) {
@@ -379,34 +524,66 @@ function toCreator(row) {
   };
 }
 
-function toVideo(row, request) {
+function toVideo(row, request, metadata = {}) {
   const username = String(row.username || "unknown");
   const origin = `http://${request.headers.host || `127.0.0.1:${port}`}`;
+  const createdAt = Number(row.created_at || Date.now());
+  const postedAt = Number(metadata.timestamp || 0) > 0
+    ? Number(metadata.timestamp) * 1000
+    : createdAt;
+  const originalDescription = String(metadata.description || "").trim();
+  const caption = originalDescription || String(metadata.title || row.title || "").trim();
+  const title = cleanTitle(caption, row.video_id, postedAt);
   return {
     id: String(row.id),
     creatorId: creatorKey(username),
     username,
     displayName: displayName(username),
-    title: cleanTitle(row.title, row.video_id),
-    description: "Saved from the live archive on yufeihl.",
-    tags: ["saved", "archive"],
+    title,
+    description: originalDescription,
+    tags: normalizeTags(metadata.tags, originalDescription),
     mediaType: "video",
-    status: "ready",
     videoUrl: `${origin}/media/${row.id}`,
+    thumbnailUrl: `${origin}/thumbnail/${row.id}.jpg`,
     accent: creatorAccent(username),
-    savedAt: new Date(Number(row.created_at || Date.now())).toISOString(),
-    savedAtLabel: relativeTime(Number(row.created_at || 0)),
-    duration: "--:--",
+    savedAt: new Date(createdAt).toISOString(),
+    savedAtLabel: relativeTime(createdAt),
+    duration: formatDuration(metadata.duration),
     sizeLabel: formatBytes(Number(row.size_bytes || 0)),
     sourceUrl: String(row.source_url || "https://www.tiktok.com/"),
-    likes: 0,
-    bookmarks: 0,
   };
 }
 
-function cleanTitle(value, videoId) {
+function normalizeTags(rawTags, description) {
+  const explicit = Array.isArray(rawTags) ? rawTags : [];
+  const extracted = String(description || "").match(/#[\p{L}\p{N}_]+/gu) || [];
+  return [...new Set([...explicit, ...extracted]
+    .map((tag) => String(tag).replace(/^#/, "").trim())
+    .filter(Boolean))]
+    .slice(0, 16);
+}
+
+function formatDuration(value) {
+  const seconds = Math.max(0, Math.round(Number(value || 0)));
+  if (!seconds) return "--:--";
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+function cleanTitle(value, videoId, createdAt) {
   const title = String(value || "").replace(/\.mp4$/i, "").trim();
-  if (!title || title === String(videoId || "")) return `Saved video ${videoId || ""}`.trim();
+  const isPlaceholder = !title
+    || title === String(videoId || "")
+    || /^TikTok (?:video|story)(?: #?\d+)?$/i.test(title)
+    || /^Story #?\d+$/i.test(title)
+    || /^\d{10,}$/.test(title);
+  if (isPlaceholder) {
+    return new Intl.DateTimeFormat("en", {
+      month: "short",
+      day: "numeric",
+      year: "numeric",
+    }).format(new Date(createdAt));
+  }
   return title;
 }
 

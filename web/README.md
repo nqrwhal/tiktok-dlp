@@ -35,8 +35,13 @@ npm run dev:live
 ```
 
 The bridge reads creators and video records from the live SQLite database over
-SSH. Requested MP4 files are copied into the ignored `.live-cache/` directory
-on demand and served locally with HTTP byte-range support. It does not modify or
+SSH. It also reads the saved `*.info.json` sidecars so the frontend preserves
+the original captions, hashtags, duration, and post date. Captionless items use
+their post date instead of generated titles.
+
+Thumbnails are extracted from the archived MP4s on the server and cached in the
+ignored `.live-cache/` directory. Requested MP4 files are copied on demand and
+served locally with HTTP byte-range support. The bridge does not modify or
 restart the backend server.
 
 ## Backend integration contract
@@ -45,6 +50,7 @@ Replace `mockArchiveApi` with an implementation of `ArchiveApi` backed by:
 
 - `GET /api/creators`
 - `GET /api/videos?creatorId=&cursor=&limit=`
+- `GET /thumbnail/:fileId.jpg`
 - `GET /media/:fileId` with HTTP range support
 
 The shared frontend types live in `lib/types.ts`.

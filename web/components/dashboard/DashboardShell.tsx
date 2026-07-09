@@ -71,13 +71,6 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
             <Home size={18} />
             Return to feed
           </Link>
-          <div className={styles.connectionCard}>
-            <span className={styles.connectionDot} />
-            <div>
-              <strong>Archive online</strong>
-              <small>Last checked just now</small>
-            </div>
-          </div>
         </div>
       </aside>
 
