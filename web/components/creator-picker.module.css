@@ -28,6 +28,7 @@
   width: min(280px, calc(100vw - 32px));
   max-height: min(430px, 64vh);
   overflow-y: auto;
+  overscroll-behavior: contain;
   border: 1px solid rgba(244, 247, 239, 0.15);
   border-radius: 10px;
   padding: 6px;
@@ -93,8 +94,15 @@
   font-size: 10px;
 }
 
+.compact .menu {
+  right: auto;
+  left: 0;
+  width: min(280px, calc(100vw - 28px));
+  max-height: min(430px, calc(100dvh - 118px));
+}
+
 @media (max-width: 600px) {
-  .menu {
+  .picker:not(.compact) .menu {
     right: 0;
     left: auto;
   }

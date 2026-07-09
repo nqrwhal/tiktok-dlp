@@ -1,14 +1,23 @@
 "use client";
 
 import { Check, Save } from "lucide-react";
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
+import {
+  readRememberSound,
+  writeRememberSound,
+} from "../../lib/playback-preferences";
 import styles from "./dashboard.module.css";
 
 export function SettingsForm() {
   const [saved, setSaved] = useState(false);
   const [autoplay, setAutoplay] = useState(true);
-  const [sound, setSound] = useState(false);
+  const [sound, setSound] = useState(true);
   const [deletionAlerts, setDeletionAlerts] = useState(true);
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setSound(readRememberSound(window.localStorage));
+  }, []);
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -35,7 +44,10 @@ export function SettingsForm() {
             label="Remember sound"
             description="Keep your last mute setting on this device."
             checked={sound}
-            onChange={setSound}
+            onChange={(remember) => {
+              setSound(remember);
+              writeRememberSound(window.localStorage, remember);
+            }}
           />
           <label className={styles.formField}>
             <span>Default feed</span>

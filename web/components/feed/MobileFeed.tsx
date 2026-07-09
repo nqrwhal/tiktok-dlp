@@ -17,6 +17,10 @@ import { useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CreatorPicker } from "../CreatorPicker";
 import { mockStats } from "../../lib/mock-data";
+import {
+  readMutedPreference,
+  writeMutedPreference,
+} from "../../lib/playback-preferences";
 import type { Creator, SavedVideo } from "../../lib/types";
 import { useArchiveData } from "../../lib/useArchiveData";
 import styles from "./mobile-feed.module.css";
@@ -27,6 +31,8 @@ interface MobileFeedProps {
 }
 
 const BOOKMARK_STORAGE_KEY = "rewind-bookmarks";
+const PRELOAD_BEHIND = 1;
+const PRELOAD_AHEAD = 2;
 
 export function MobileFeed({ creators, videos }: MobileFeedProps) {
   const searchParams = useSearchParams();
@@ -42,6 +48,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
   const [creatorId, setCreatorId] = useState("all");
   const [activeId, setActiveId] = useState(requestedVideoId || liveVideos[0]?.id || "");
   const [muted, setMuted] = useState(true);
+  const [mutePreferenceReady, setMutePreferenceReady] = useState(false);
   const [paused, setPaused] = useState(false);
   const [controlsVisible, setControlsVisible] = useState(false);
   const [menuVideoId, setMenuVideoId] = useState("");
@@ -74,6 +81,18 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
       ? ""
       : filteredVideos[0]?.id ?? "";
   const activeIndex = filteredVideos.findIndex((video) => video.id === currentActiveId);
+
+  useEffect(() => {
+    // Start muted for autoplay, then restore this device's last explicit choice.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setMuted(readMutedPreference(window.localStorage));
+    setMutePreferenceReady(true);
+  }, []);
+
+  useEffect(() => {
+    if (!mutePreferenceReady) return;
+    writeMutedPreference(window.localStorage, muted);
+  }, [mutePreferenceReady, muted]);
 
   useEffect(() => {
     try {
@@ -222,7 +241,9 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
         <div className={styles.feedScroller}>
           {filteredVideos.map((video, index) => {
             const isActive = video.id === currentActiveId;
-            const shouldLoad = activeIndex >= 0 && Math.abs(index - activeIndex) <= 1;
+            const shouldPreload = activeIndex >= 0
+              && index >= activeIndex - PRELOAD_BEHIND
+              && index <= activeIndex + PRELOAD_AHEAD;
             const isSaved = saved.has(video.id);
             const showControls = isActive && controlsVisible;
             return (
@@ -236,11 +257,12 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
                 <video
                   className={styles.video}
                   ref={(node) => setVideoRef(video.id, node)}
-                  src={shouldLoad ? video.videoUrl : undefined}
+                  src={shouldPreload ? video.videoUrl : undefined}
+                  poster={shouldPreload && video.thumbnailUrl ? video.thumbnailUrl : undefined}
                   muted={muted}
                   loop
                   playsInline
-                  preload={isActive ? "auto" : shouldLoad ? "metadata" : "none"}
+                  preload={shouldPreload ? "auto" : "none"}
                   aria-label={`${video.title} by ${video.displayName}`}
                   onTimeUpdate={(event) => {
                     if (!isActive) return;

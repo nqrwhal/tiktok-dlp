@@ -40,7 +40,10 @@ for (const [pathname, expectedContent] of routes) {
     const html = await response.text();
     assert.match(html, /<title>[^<]*Rewind<\/title>/i);
     assert.match(html, expectedContent);
-    if (pathname === "/") assert.match(html, />Bookmarks<\/button>/i);
+    if (pathname === "/") {
+      assert.match(html, />Bookmarks<\/button>/i);
+      assert.match(html, /preload="auto"/i);
+    }
     if (pathname === "/dashboard" || pathname === "/dashboard/videos") {
       assert.match(html, /href="\/\?video=v-/i);
     }
