@@ -58,3 +58,18 @@ Replace `mockArchiveApi` with an implementation of `ArchiveApi` backed by:
 - `GET /media/:fileId` with HTTP range support
 
 The shared frontend types live in `lib/types.ts`.
+
+## Server deployment
+
+The root Compose stack includes a `rewind-web` service for the private hosted
+archive. It reads the mounted archive database and media directory directly,
+serves the production frontend, and proxies all browser-facing archive routes
+through one origin. The data mount is read-only; creator imports are sent to the
+backend over the private Docker network with `IMPORT_API_TOKEN`.
+
+Set `REWIND_PUBLIC_URL` if the archive is hosted somewhere other than
+`https://rewind.yufei.dev`, then start the normal Cloudflare profile:
+
+```bash
+docker compose --profile cloudflare up --build -d
+```
