@@ -24,7 +24,7 @@ ENV NEXT_PUBLIC_ARCHIVE_API_BASE=${NEXT_PUBLIC_ARCHIVE_API_BASE}
 
 RUN npm run build \
   && mkdir -p .live-cache \
-  && chown -R node:node /app/web
+  && chown node:node .live-cache
 
 USER node
 
