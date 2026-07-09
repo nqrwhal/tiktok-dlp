@@ -160,6 +160,19 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
+    const importApiRoute = url.pathname === "/api/imports" || /^\/api\/imports\/\d+$/.test(url.pathname);
+    if (importApiRoute && (request.method === "GET" || request.method === "POST")) {
+      const body = request.method === "POST" ? await readBodyText(request) : "";
+      const upstream = await remoteImportRequest(request.method, `${url.pathname}${url.search}`, body);
+      response.writeHead(upstream.status, {
+        "Cache-Control": "no-store",
+        "Content-Length": Buffer.byteLength(upstream.body),
+        "Content-Type": upstream.contentType || "application/json; charset=utf-8",
+      });
+      response.end(upstream.body);
+      return;
+    }
+
     const mediaMatch = url.pathname.match(/^\/media\/(\d+)$/);
     if ((request.method === "GET" || request.method === "HEAD") && mediaMatch) {
       await serveMedia(request, response, Number(mediaMatch[1]));
@@ -475,6 +488,57 @@ async function remotePythonJson(script) {
   return stdout.trim() ? JSON.parse(stdout) : {};
 }
 
+async function remoteImportRequest(method, requestPath, body = "") {
+  const script = [
+    `const method = ${JSON.stringify(method)};`,
+    `const requestPath = ${JSON.stringify(requestPath)};`,
+    `const body = ${JSON.stringify(body)};`,
+    "const port = process.env.HTTP_PORT || '8080';",
+    "const response = await fetch(`http://127.0.0.1:${port}${requestPath}`, {",
+    "  method,",
+    "  headers: body ? { 'content-type': 'application/json' } : undefined,",
+    "  body: body || undefined,",
+    "});",
+    "const responseBody = await response.text();",
+    "process.stdout.write(JSON.stringify({",
+    "  status: response.status,",
+    "  contentType: response.headers.get('content-type') || '',",
+    "  body: responseBody,",
+    "}));",
+  ].join("\n");
+  const command = `docker compose -f ${shellQuote(`${remoteProject}/docker-compose.yml`)} exec -T tiktok-discord-downloader node --input-type=module -`;
+  const child = spawn("ssh", sshArgs(command), { stdio: ["pipe", "pipe", "pipe"] });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  child.stdin.end(script);
+  await waitForChild(child);
+  try {
+    return JSON.parse(stdout);
+  } catch {
+    throw new Error(stderr.trim() || "Remote import API returned an invalid response");
+  }
+}
+
+async function readBodyText(request, maxBytes = 16 * 1024) {
+  const chunks = [];
+  let bytes = 0;
+  for await (const chunk of request) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    bytes += buffer.length;
+    if (bytes > maxBytes) throw new Error("Request body is too large");
+    chunks.push(buffer);
+  }
+  return Buffer.concat(chunks, bytes).toString("utf8");
+}
+
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", `'"'"'`)}'`;
+}
+
 function waitForChild(child) {
   return new Promise((resolve, reject) => {
     child.once("error", reject);
@@ -637,7 +701,7 @@ function positiveInteger(value, fallback) {
 function applyCors(response, origin) {
   const allowed = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin);
   response.setHeader("Access-Control-Allow-Origin", allowed ? origin : "http://localhost:3000");
-  response.setHeader("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+  response.setHeader("Access-Control-Allow-Methods", "GET, POST, HEAD, OPTIONS");
   response.setHeader("Access-Control-Allow-Headers", "Content-Type, Range");
   response.setHeader("Vary", "Origin");
 }

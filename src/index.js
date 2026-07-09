@@ -7,6 +7,7 @@ import { TikTokMonitor, resolveVideoMediaType } from './tiktok/monitor.js';
 import { fetchVideoMetadata } from './tiktok/ytdlp.js';
 import { cleanupExpiredDownloads } from './cleanup/downloads.js';
 import { createDownloadService } from './download/service.js';
+import { createCreatorImportService } from './import/creator.js';
 
 await loadEnvFile();
 
@@ -26,6 +27,7 @@ cleanupExpiredDownloads({ config, store }).catch((error) => {
   console.error('[cleanup] Initial expired download cleanup failed:', error);
 });
 const downloadService = createDownloadService({ config, store });
+const creatorImportService = createCreatorImportService({ config, store, downloadService });
 const downloadOne = downloadService.request.bind(downloadService);
 
 async function checkVideoAvailable(video) {
@@ -129,7 +131,7 @@ const monitor = new TikTokMonitor({
   },
 });
 
-const httpService = await startHttpServer({ config, store, monitor });
+const httpService = await startHttpServer({ config, store, monitor, creatorImportService });
 discordClient = await startDiscordBot({ config, store, monitor, downloadOne, downloadService, registerCommands });
 
 async function shutdown(signal) {

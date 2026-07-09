@@ -5,7 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { loadConfig } from '../src/config.js';
-import { parseRangeHeader, startHttpServer, resolveDownloadPath } from '../src/http/server.js';
+import { isImportAuthorized, parseRangeHeader, startHttpServer, resolveDownloadPath } from '../src/http/server.js';
 import { Store } from '../src/state/store.js';
 
 test('resolveDownloadPath keeps files inside the download directory', () => {
@@ -79,7 +79,31 @@ test('serves files only for valid tokens with private health, HEAD, and Range su
     expiresAt: Date.now() - 60_000,
   });
 
-  const { server, address } = await startHttpServer({ config, store, host: '127.0.0.1', port: 0 });
+  const imports = [];
+  const creatorImportService = {
+    start(input) {
+      const record = {
+        id: 1,
+        username: input.username,
+        status: 'queued',
+        max_duration_seconds: input.maxDurationSeconds,
+        created_at: Date.now(),
+        updated_at: Date.now(),
+      };
+      imports.unshift(record);
+      return { import: record, reused: false };
+    },
+    list: () => imports,
+    get: (id) => imports.find((entry) => entry.id === id) ?? null,
+    status: () => ({ active: 0, queued: imports.length, concurrency: 1 }),
+  };
+  const { server, address } = await startHttpServer({
+    config,
+    store,
+    creatorImportService,
+    host: '127.0.0.1',
+    port: 0,
+  });
   t.after(async () => {
     await new Promise((resolve) => server.close(resolve));
     store.close();
@@ -116,6 +140,26 @@ test('serves files only for valid tokens with private health, HEAD, and Range su
   const invalidRangeResponse = await fetch(`${baseUrl}/files/valid-token`, { headers: { Range: 'bytes=99-100' } });
   assert.equal(invalidRangeResponse.status, 416);
 
+  const importResponse = await fetch(`${baseUrl}/api/imports`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: '@creator', maxDurationSeconds: 150 }),
+  });
+  assert.equal(importResponse.status, 202);
+  const createdImport = await importResponse.json();
+  assert.equal(createdImport.import.username, '@creator');
+  assert.equal(createdImport.import.maxDurationSeconds, 150);
+
+  const importsResponse = await fetch(`${baseUrl}/api/imports`);
+  assert.equal(importsResponse.status, 200);
+  const listedImports = await importsResponse.json();
+  assert.equal(listedImports.imports.length, 1);
+  assert.equal(listedImports.service.queued, 1);
+
+  const importDetailResponse = await fetch(`${baseUrl}/api/imports/1`);
+  assert.equal(importDetailResponse.status, 200);
+  assert.equal((await importDetailResponse.json()).import.id, 1);
+
   const missingResponse = await fetch(`${baseUrl}/files/missing-token`);
   assert.equal(missingResponse.status, 404);
   assert.equal((await missingResponse.json()).error, 'File not found');
@@ -125,4 +169,21 @@ test('serves files only for valid tokens with private health, HEAD, and Range su
 
   const traversalResponse = await fetch(`${baseUrl}/files/traversal-token`);
   assert.equal(traversalResponse.status, 404);
+});
+
+test('creator import API requires a bearer token outside loopback', () => {
+  const request = (remoteAddress, authorization = '') => ({
+    socket: { remoteAddress },
+    headers: { authorization },
+  });
+  assert.equal(isImportAuthorized(request('127.0.0.1'), {}), true);
+  assert.equal(isImportAuthorized(request('10.0.0.4'), { importApiToken: 'secret' }), false);
+  assert.equal(isImportAuthorized(
+    request('10.0.0.4', 'Bearer secret'),
+    { importApiToken: 'secret' },
+  ), true);
+  assert.equal(isImportAuthorized(
+    request('10.0.0.4', 'Bearer wrong'),
+    { importApiToken: 'secret' },
+  ), false);
 });

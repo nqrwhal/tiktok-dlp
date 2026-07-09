@@ -49,6 +49,9 @@ test('loadConfig resolves paths and upload limits', () => {
   assert.equal(config.monitorConcurrency, 2);
   assert.equal(config.maxDownloadQueueSize, 50);
   assert.equal(config.maxQueuedDownloadsPerUser, 3);
+  assert.equal(config.importMaxDurationSeconds, 120);
+  assert.equal(config.importConcurrency, 1);
+  assert.equal(config.importProfileTimeoutMs, 600_000);
   assert.equal(config.deletionCheckConcurrency, 2);
   assert.equal(config.maxSlideshowImages, 35);
   assert.equal(config.ytdlpTimeoutMs, 60_000);
