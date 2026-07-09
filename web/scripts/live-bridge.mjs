@@ -1,5 +1,5 @@
 import { createReadStream, createWriteStream } from "node:fs";
-import { mkdir, rename, rm, stat } from "node:fs/promises";
+import { mkdir, readdir, rename, rm, stat } from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -172,6 +172,25 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
+    const videoRoute = /^\/api\/videos\/\d+$/.test(url.pathname);
+    if (videoRoute && request.method === "DELETE") {
+      const body = await readBodyText(request);
+      const upstream = await remoteAdminRequest(request.method, `${url.pathname}${url.search}`, body);
+      if (upstream.status >= 200 && upstream.status < 300) {
+        const fileId = Number(url.pathname.split("/").at(-1));
+        videoCache = { loadedAt: 0, rows: [] };
+        metadataCache = { loadedAt: 0, byId: {} };
+        await clearCachedFile(fileId);
+      }
+      response.writeHead(upstream.status, {
+        "Cache-Control": "no-store",
+        "Content-Length": Buffer.byteLength(upstream.body),
+        "Content-Type": upstream.contentType || "application/json; charset=utf-8",
+      });
+      response.end(upstream.body);
+      return;
+    }
+
     const mediaMatch = url.pathname.match(/^\/media\/(\d+)$/);
     if ((request.method === "GET" || request.method === "HEAD") && mediaMatch) {
       await serveMedia(request, response, Number(mediaMatch[1]));
@@ -211,6 +230,17 @@ async function loadVideoRows({ force = false } = {}) {
   const rows = await remoteSql(buildVideoSql());
   videoCache = { loadedAt: now, rows };
   return rows;
+}
+
+async function clearCachedFile(fileId) {
+  try {
+    const entries = await readdir(cacheDir);
+    await Promise.all(entries
+      .filter((entry) => entry === `thumb-${fileId}.jpg` || entry.startsWith(`${fileId}-`))
+      .map((entry) => rm(path.join(cacheDir, entry), { force: true })));
+  } catch {
+    // Cache cleanup is best effort; the archive record is already gone.
+  }
 }
 
 function buildVideoSql({ username = "", limit = 500 } = {}) {

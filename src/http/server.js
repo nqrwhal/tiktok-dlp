@@ -37,6 +37,15 @@ export function createHttpHandler({ config, store, creatorImportService = null }
         return handleCreatorVideosRequest(req, res, { config, store, username });
       }
 
+      const videoMatch = url.pathname.match(/^\/api\/videos\/(\d+)$/);
+      if (videoMatch) {
+        return handleVideoRequest(req, res, {
+          config,
+          store,
+          fileId: Number(videoMatch[1]),
+        });
+      }
+
       if (req.method === 'GET' || req.method === 'HEAD') {
         const token = matchFileToken(url.pathname);
         if (token) {
@@ -51,6 +60,47 @@ export function createHttpHandler({ config, store, creatorImportService = null }
       }, { head: req.method === 'HEAD' });
     }
   };
+}
+
+export async function handleVideoRequest(req, res, { config, store, fileId }) {
+  if (!isImportAuthorized(req, config)) {
+    return sendJson(res, 401, { error: 'Unauthorized' });
+  }
+  if (req.method !== 'DELETE') {
+    return sendJson(res, 405, { error: 'Method not allowed' });
+  }
+
+  try {
+    const body = await readJsonBody(req);
+    if (Number(body.confirmFileId) !== Number(fileId)) {
+      return sendJson(res, 400, { error: 'Confirm the video before deleting it' });
+    }
+
+    const file = store.getVideoFilePurgePlan(fileId);
+    if (!file) return sendJson(res, 404, { error: 'Video not found' });
+
+    const removal = Number(file.has_other_path_ref)
+      ? { deleted: 0, failed: [] }
+      : await removeStoredFiles([file], config);
+    if (removal.failed.length) {
+      store.markFileDeletionFailed?.(file.id, removal.failed[0].error);
+      return sendJson(res, 500, { error: 'The archived video could not be removed' });
+    }
+    const deletedVideo = store.deleteFileRecords([file.id]) === 1;
+
+    return sendJson(res, 200, {
+      fileId: Number(file.id),
+      videoId: String(file.video_id ?? ''),
+      username: String(file.username ?? ''),
+      deletedVideo,
+      deletedStoredFiles: removal.deleted,
+    });
+  } catch (error) {
+    const statusCode = Number(error?.statusCode) || 400;
+    return sendJson(res, statusCode, {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 }
 
 export async function handleCreatorVideosRequest(req, res, { config, store, username }) {
@@ -76,7 +126,10 @@ export async function handleCreatorVideosRequest(req, res, { config, store, user
     }
 
     const files = store.listCreatorVideoPurgePlan(normalizedUsername);
-    const removal = await removeStoredFiles(files, config);
+    const removal = await removeStoredFiles(
+      files.filter((file) => !Number(file.has_external_path_ref)),
+      config,
+    );
     for (const failure of removal.failed) {
       store.markFileDeletionFailed?.(failure.file.id, failure.error);
     }

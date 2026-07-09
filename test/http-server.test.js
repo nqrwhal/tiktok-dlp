@@ -293,3 +293,104 @@ test('creator video deletion requires typed confirmation and removes only that c
   assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM files WHERE id = ?').get(unrelatedFileId).count, 1);
   assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM link_tokens WHERE token = ?').get('creator-token').count, 0);
 });
+
+test('individual video deletion confirms the file id and preserves sibling records and shared bytes', async (t) => {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-video-delete-'));
+  const downloadDir = path.join(rootDir, 'downloads');
+  const dbPath = path.join(rootDir, 'state.db');
+  const creatorDir = path.join(downloadDir, 'creator');
+  await mkdir(creatorDir, { recursive: true });
+
+  const config = loadConfig({
+    DATA_DIR: rootDir,
+    DOWNLOAD_DIR: downloadDir,
+    STATE_DB: dbPath,
+    HTTP_PORT: '0',
+  }, rootDir);
+  const store = new Store(dbPath);
+  const deletedPath = path.join(creatorDir, '200.mp4');
+  const deletedSidecarPath = path.join(creatorDir, '200.info.json');
+  const siblingPath = path.join(creatorDir, '201.mp4');
+  await Promise.all([
+    writeFile(deletedPath, 'delete this video'),
+    writeFile(deletedSidecarPath, 'delete this metadata'),
+    writeFile(siblingPath, 'keep this video'),
+  ]);
+
+  const deletedFileId = store.createFileRecord({
+    videoId: '200',
+    username: 'creator',
+    sourceUrl: 'https://www.tiktok.com/@creator/video/200',
+    filePath: deletedPath,
+    filename: '200.mp4',
+    sizeBytes: 17,
+  });
+  const siblingFileId = store.createFileRecord({
+    videoId: '201',
+    username: 'creator',
+    sourceUrl: 'https://www.tiktok.com/@creator/video/201',
+    filePath: siblingPath,
+    filename: '201.mp4',
+    sizeBytes: 15,
+  });
+  const sharedFileId = store.createFileRecord({
+    videoId: '201-copy',
+    username: 'creator',
+    sourceUrl: 'https://www.tiktok.com/@creator/video/201',
+    filePath: siblingPath,
+    filename: '201.mp4',
+    sizeBytes: 15,
+  });
+
+  const { server, address } = await startHttpServer({
+    config,
+    store,
+    host: '127.0.0.1',
+    port: 0,
+  });
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const unconfirmed = await fetch(`${baseUrl}/api/videos/${deletedFileId}`, {
+    method: 'DELETE',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ confirmFileId: siblingFileId }),
+  });
+  assert.equal(unconfirmed.status, 400);
+  await access(deletedPath);
+
+  const deleted = await fetch(`${baseUrl}/api/videos/${deletedFileId}`, {
+    method: 'DELETE',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ confirmFileId: deletedFileId }),
+  });
+  assert.equal(deleted.status, 200);
+  assert.deepEqual(await deleted.json(), {
+    fileId: deletedFileId,
+    videoId: '200',
+    username: 'creator',
+    deletedVideo: true,
+    deletedStoredFiles: 2,
+  });
+
+  await assert.rejects(access(deletedPath), { code: 'ENOENT' });
+  await assert.rejects(access(deletedSidecarPath), { code: 'ENOENT' });
+  await access(siblingPath);
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM files WHERE id = ?').get(deletedFileId).count, 0);
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM files WHERE id = ?').get(siblingFileId).count, 1);
+
+  const deletedSharedRecord = await fetch(`${baseUrl}/api/videos/${siblingFileId}`, {
+    method: 'DELETE',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ confirmFileId: siblingFileId }),
+  });
+  assert.equal(deletedSharedRecord.status, 200);
+  assert.equal((await deletedSharedRecord.json()).deletedStoredFiles, 0);
+  await access(siblingPath);
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM files WHERE id = ?').get(siblingFileId).count, 0);
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM files WHERE id = ?').get(sharedFileId).count, 1);
+});

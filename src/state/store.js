@@ -1314,12 +1314,48 @@ export class Store {
     const normalized = String(username ?? '').trim().replace(/^@/, '');
     if (!normalized) return [];
     return this.db.prepare(`
-      SELECT id, path, filename, video_id
+      SELECT
+        files.id,
+        files.path,
+        files.filename,
+        files.video_id,
+        EXISTS (
+          SELECT 1
+          FROM files AS shared_files
+          WHERE shared_files.path = files.path
+            AND shared_files.id <> files.id
+            AND (
+              lower(COALESCE(shared_files.username, '')) <> lower(?)
+              OR lower(shared_files.filename) NOT LIKE '%.mp4'
+            )
+        ) AS has_external_path_ref
       FROM files
-      WHERE lower(username) = lower(?)
-        AND lower(filename) LIKE '%.mp4'
-      ORDER BY created_at ASC, id ASC
-    `).all(normalized);
+      WHERE lower(files.username) = lower(?)
+        AND lower(files.filename) LIKE '%.mp4'
+      ORDER BY files.created_at ASC, files.id ASC
+    `).all(normalized, normalized);
+  }
+
+  getVideoFilePurgePlan(fileId) {
+    const numericId = Number(fileId);
+    if (!Number.isInteger(numericId) || numericId <= 0) return null;
+    return this.db.prepare(`
+      SELECT
+        files.id,
+        files.path,
+        files.filename,
+        files.video_id,
+        files.username,
+        EXISTS (
+          SELECT 1
+          FROM files AS shared_files
+          WHERE shared_files.path = files.path
+            AND shared_files.id <> files.id
+        ) AS has_other_path_ref
+      FROM files
+      WHERE files.id = ?
+        AND lower(files.filename) LIKE '%.mp4'
+    `).get(numericId) ?? null;
   }
 
   purgeDownloads({ requestedBy = '', removeFileIds = null, now = Date.now() } = {}) {
