@@ -41,6 +41,24 @@ export interface ArchiveStats {
   newThisWeek: number;
 }
 
+export interface CreatorImport {
+  id: number;
+  username: string;
+  status: "queued" | "running" | "completed" | "failed";
+  maxDurationSeconds: number;
+  discoveredCount: number;
+  processedCount: number;
+  downloadedCount: number;
+  skippedExistingCount: number;
+  skippedDurationCount: number;
+  failedCount: number;
+  lastError: string | null;
+  createdAt: number;
+  startedAt: number | null;
+  completedAt: number | null;
+  updatedAt: number;
+}
+
 export interface FeedPage {
   items: SavedVideo[];
   nextCursor: string | null;

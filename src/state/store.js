@@ -110,6 +110,24 @@ export class Store {
         UNIQUE(username, guild_id)
       );
 
+      CREATE TABLE IF NOT EXISTS creator_imports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL,
+        status TEXT NOT NULL,
+        max_duration_seconds INTEGER NOT NULL,
+        discovered_count INTEGER NOT NULL DEFAULT 0,
+        processed_count INTEGER NOT NULL DEFAULT 0,
+        downloaded_count INTEGER NOT NULL DEFAULT 0,
+        skipped_existing_count INTEGER NOT NULL DEFAULT 0,
+        skipped_duration_count INTEGER NOT NULL DEFAULT 0,
+        failed_count INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        created_at INTEGER NOT NULL,
+        started_at INTEGER,
+        completed_at INTEGER,
+        updated_at INTEGER NOT NULL
+      );
+
       CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_files_video_id ON files(video_id);
       CREATE INDEX IF NOT EXISTS idx_link_tokens_expires_at ON link_tokens(expires_at);
@@ -152,6 +170,8 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_watched_users_next_check_at ON watched_users(next_check_at);
       CREATE INDEX IF NOT EXISTS idx_watch_username_history_detected_at ON watch_username_history(detected_at DESC);
       CREATE INDEX IF NOT EXISTS idx_watch_subscriptions_guild_id_username ON watch_subscriptions(guild_id, username);
+      CREATE INDEX IF NOT EXISTS idx_creator_imports_created_at ON creator_imports(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_creator_imports_username_status ON creator_imports(username, status);
     `);
     this.migrateLegacyDeliveryOwnership();
     this.migrateLegacyWatchSubscriptions();
@@ -615,6 +635,77 @@ export class Store {
 
   listJobs(limit = 10) {
     return this.db.prepare('SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?').all(limit);
+  }
+
+  createCreatorImport({ username, maxDurationSeconds }, now = Date.now()) {
+    const result = this.db.prepare(`
+      INSERT INTO creator_imports (
+        username,
+        status,
+        max_duration_seconds,
+        created_at,
+        updated_at
+      ) VALUES (?, 'queued', ?, ?, ?)
+    `).run(String(username), Number(maxDurationSeconds), now, now);
+    return Number(result.lastInsertRowid);
+  }
+
+  updateCreatorImport(id, changes, now = Date.now()) {
+    const allowed = [
+      'status',
+      'max_duration_seconds',
+      'discovered_count',
+      'processed_count',
+      'downloaded_count',
+      'skipped_existing_count',
+      'skipped_duration_count',
+      'failed_count',
+      'last_error',
+      'started_at',
+      'completed_at',
+    ];
+    const entries = Object.entries(changes).filter(([key]) => allowed.includes(key));
+    if (!entries.length) return;
+    const assignments = entries.map(([key]) => `${key} = ?`).join(', ');
+    this.db.prepare(`UPDATE creator_imports SET ${assignments}, updated_at = ? WHERE id = ?`)
+      .run(...entries.map(([, value]) => value), now, Number(id));
+  }
+
+  getCreatorImport(id) {
+    const numericId = Number(id);
+    if (!Number.isInteger(numericId) || numericId <= 0) return null;
+    return this.db.prepare('SELECT * FROM creator_imports WHERE id = ?').get(numericId) ?? null;
+  }
+
+  listCreatorImports(limit = 20) {
+    return this.db.prepare(`
+      SELECT *
+      FROM creator_imports
+      ORDER BY created_at DESC, id DESC
+      LIMIT ?
+    `).all(Math.max(1, Math.min(100, Number(limit) || 20)));
+  }
+
+  findActiveCreatorImport(username) {
+    return this.db.prepare(`
+      SELECT *
+      FROM creator_imports
+      WHERE lower(username) = lower(?)
+        AND status IN ('queued', 'running')
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1
+    `).get(String(username)) ?? null;
+  }
+
+  failIncompleteCreatorImports(now = Date.now()) {
+    return this.db.prepare(`
+      UPDATE creator_imports
+      SET status = 'failed',
+          last_error = COALESCE(last_error, 'Import interrupted by a service restart.'),
+          completed_at = ?,
+          updated_at = ?
+      WHERE status IN ('queued', 'running')
+    `).run(now, now).changes;
   }
 
   createFileRecord({ videoId = '', username = '', requestedBy = '', sourceUrl, filePath, filename, sizeBytes }, now = Date.now()) {

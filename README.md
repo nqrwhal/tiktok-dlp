@@ -86,6 +86,28 @@ username, the bot updates the watch record and posts a username-change notice.
 This depends on TikTok or `yt-dlp` still resolving the old profile URL far
 enough to expose the creator identity.
 
+## Creator profile imports
+
+The backend can queue a full public-profile import through `POST /api/imports`:
+
+```json
+{
+  "username": "creator",
+  "maxDurationSeconds": 120
+}
+```
+
+It enumerates the complete profile, skips files already present on disk, skips
+videos longer than the requested limit, and downloads the remaining posts as
+permanent archive files. `IMPORT_MAX_DURATION_SECONDS` sets the default to 120
+seconds; callers can override it from 1 to 3600 seconds. Full-profile discovery
+uses `IMPORT_PROFILE_TIMEOUT_SECONDS` (600 by default), and
+`IMPORT_CONCURRENCY` controls concurrent profile jobs.
+
+Use `GET /api/imports` or `GET /api/imports/:id` to read progress. Import routes
+accept loopback requests, which is how the local dashboard bridge calls them.
+Non-loopback callers must send `Authorization: Bearer <IMPORT_API_TOKEN>`.
+
 ## Docker
 
 ```bash
@@ -156,6 +178,9 @@ curl https://example.com/health
 - Watched-user deliveries are kept permanently on the server by default, but a
   monitor delivery never changes the expiry of another requester's link to the
   same asset.
+- Profile imports use the same download queue and immutable asset store as
+  manual and monitored downloads. Imported files receive permanent archive
+  links so cleanup does not remove them after the job completes.
 - `/downloads purge scope:mine` removes only the caller's deliveries. A shared
   asset remains until no active delivery references it. Disk bytes are removed
   before their database record, and failed removals keep a persisted retry

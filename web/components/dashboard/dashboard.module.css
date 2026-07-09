@@ -838,6 +838,135 @@
   font-size: 9px;
 }
 
+.importPanel {
+  display: grid;
+  gap: 14px;
+  margin-bottom: 18px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  padding: 16px;
+  background: rgba(18, 21, 18, 0.88);
+}
+
+.importForm {
+  display: grid;
+  gap: 12px;
+}
+
+.importForm .primaryButton {
+  align-self: end;
+}
+
+.importForm .primaryButton:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.importNote,
+.importError {
+  margin: 0;
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.importNote {
+  color: #7d857b;
+}
+
+.importError {
+  color: #ff8074;
+}
+
+.importList {
+  display: grid;
+  gap: 8px;
+  padding-top: 4px;
+}
+
+.importRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px 14px;
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+
+.importRow > div:first-child {
+  display: grid;
+  gap: 3px;
+}
+
+.importRow > div:first-child strong {
+  font-size: 11px;
+}
+
+.importRow > div:first-child span,
+.importRow > p {
+  color: #777f76;
+  font-size: 8px;
+}
+
+.importStatus {
+  display: inline-flex;
+  height: 25px;
+  align-items: center;
+  gap: 5px;
+  border-radius: 999px;
+  padding: 0 9px;
+  background: rgba(255, 255, 255, 0.05);
+  color: #a8afa6;
+  font-size: 8px;
+  text-transform: capitalize;
+}
+
+.importStatus[data-status="completed"] {
+  color: var(--acid);
+}
+
+.importStatus[data-status="failed"] {
+  color: #ff8074;
+}
+
+.importRow dl {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+  margin: 0;
+}
+
+.importRow dl div {
+  display: grid;
+  gap: 3px;
+  border-radius: 7px;
+  padding: 8px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.importRow dt {
+  color: #747c72;
+  font-size: 7px;
+}
+
+.importRow dd {
+  margin: 0;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.importRow > p {
+  grid-column: 1 / -1;
+  margin: 0;
+}
+
+.spinning {
+  animation: spin 800ms linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
 .creatorGrid {
   display: grid;
   gap: 12px;
@@ -1082,6 +1211,11 @@
 }
 
 @media (min-width: 700px) {
+  .importForm {
+    grid-template-columns: minmax(240px, 1fr) minmax(180px, 0.45fr) auto;
+    align-items: end;
+  }
+
   .pageWrap {
     padding: 42px 28px 80px;
   }

@@ -27,7 +27,7 @@ const routes = [
   ["/?video=v-1041", /Show video controls/i],
   ["/dashboard", /Open feed/i],
   ["/dashboard/videos", /Search title or creator/i],
-  ["/dashboard/creators", /Add creator/i],
+  ["/dashboard/creators", /Import creator/i],
   ["/dashboard/settings", /Save changes/i],
 ];
 

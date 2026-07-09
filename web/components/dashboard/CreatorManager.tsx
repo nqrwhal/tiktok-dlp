@@ -2,14 +2,16 @@
 
 import {
   CircleAlert,
+  DownloadCloud,
+  LoaderCircle,
   MoreHorizontal,
-  Plus,
   RefreshCw,
   Search,
+  X,
 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { mockStats, mockVideos } from "../../lib/mock-data";
-import type { Creator } from "../../lib/types";
+import type { Creator, CreatorImport } from "../../lib/types";
 import { useArchiveData } from "../../lib/useArchiveData";
 import styles from "./dashboard.module.css";
 
@@ -20,8 +22,32 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
     fallbackStats: mockStats,
   });
   const liveCreators = archive.creators;
+  const apiBase = process.env.NEXT_PUBLIC_ARCHIVE_API_BASE?.replace(/\/+$/, "") || "";
   const [query, setQuery] = useState("");
   const [enabled, setEnabled] = useState<Record<string, boolean>>({});
+  const [importOpen, setImportOpen] = useState(false);
+  const [importUsername, setImportUsername] = useState("");
+  const [maxMinutes, setMaxMinutes] = useState("2");
+  const [imports, setImports] = useState<CreatorImport[]>([]);
+  const [importError, setImportError] = useState("");
+  const [submittingImport, setSubmittingImport] = useState(false);
+
+  const loadImports = useCallback(async () => {
+    if (!apiBase) return;
+    const response = await fetch(`${apiBase}/api/imports?limit=8`, { cache: "no-store" });
+    const payload = await response.json() as { imports?: CreatorImport[]; error?: string };
+    if (!response.ok) throw new Error(payload.error || `Import status failed (${response.status})`);
+    setImports(payload.imports || []);
+  }, [apiBase]);
+
+  const hasActiveImport = imports.some((entry) => entry.status === "queued" || entry.status === "running");
+  useEffect(() => {
+    if (!importOpen || !hasActiveImport) return;
+    const timer = window.setInterval(() => {
+      void loadImports().catch(() => undefined);
+    }, 4_000);
+    return () => window.clearInterval(timer);
+  }, [hasActiveImport, importOpen, loadImports]);
 
   const filtered = useMemo(() => {
     const normalized = query.trim().toLowerCase();
@@ -33,16 +59,133 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
     );
   }, [liveCreators, query]);
 
+  function toggleImportPanel() {
+    const nextOpen = !importOpen;
+    setImportOpen(nextOpen);
+    if (nextOpen && apiBase) {
+      void loadImports().catch((error: unknown) => {
+        setImportError(error instanceof Error ? error.message : String(error));
+      });
+    }
+  }
+
+  async function submitImport(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setImportError("");
+    const minutes = Number(maxMinutes);
+    if (!Number.isFinite(minutes) || minutes < 0.25 || minutes > 60) {
+      setImportError("Maximum length must be between 15 seconds and 60 minutes.");
+      return;
+    }
+    if (!apiBase) {
+      setImportError("The live backend connection is required to start an import.");
+      return;
+    }
+
+    setSubmittingImport(true);
+    try {
+      const response = await fetch(`${apiBase}/api/imports`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          username: importUsername,
+          maxDurationSeconds: Math.round(minutes * 60),
+        }),
+      });
+      const payload = await response.json() as { import?: CreatorImport; error?: string };
+      if (!response.ok || !payload.import) {
+        throw new Error(payload.error || `Import failed (${response.status})`);
+      }
+      setImports((current) => [
+        payload.import as CreatorImport,
+        ...current.filter((entry) => entry.id !== payload.import?.id),
+      ].slice(0, 8));
+      setImportUsername("");
+    } catch (error) {
+      setImportError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSubmittingImport(false);
+    }
+  }
+
   return (
     <>
       <div className={styles.pageHeader}>
         <div>
           <h1>Creators</h1>
         </div>
-        <button className={styles.primaryButton} type="button">
-          <Plus size={17} /> Add creator
+        <button
+          className={styles.primaryButton}
+          type="button"
+          onClick={toggleImportPanel}
+          aria-expanded={importOpen}
+        >
+          {importOpen ? <X size={17} /> : <DownloadCloud size={17} />}
+          {importOpen ? "Close" : "Import creator"}
         </button>
       </div>
+
+      {importOpen ? (
+        <section className={styles.importPanel} aria-label="Import creator profile">
+          <form className={styles.importForm} onSubmit={submitImport}>
+            <label className={styles.formField}>
+              <span>Creator</span>
+              <input
+                value={importUsername}
+                onChange={(event) => setImportUsername(event.target.value)}
+                placeholder="@username or TikTok profile URL"
+                required
+              />
+            </label>
+            <label className={styles.formField}>
+              <span>Maximum video length</span>
+              <div className={styles.inputSuffix}>
+                <input
+                  value={maxMinutes}
+                  onChange={(event) => setMaxMinutes(event.target.value)}
+                  type="number"
+                  min="0.25"
+                  max="60"
+                  step="0.25"
+                  required
+                />
+                <span>minutes</span>
+              </div>
+            </label>
+            <button className={styles.primaryButton} type="submit" disabled={submittingImport}>
+              {submittingImport ? <LoaderCircle className={styles.spinning} size={16} /> : <DownloadCloud size={16} />}
+              {submittingImport ? "Starting" : "Import profile"}
+            </button>
+          </form>
+          <p className={styles.importNote}>
+            Existing files and videos longer than the selected limit are skipped. The default is 2 minutes.
+          </p>
+          {importError ? <p className={styles.importError} role="alert">{importError}</p> : null}
+          {imports.length ? (
+            <div className={styles.importList} aria-live="polite">
+              {imports.map((entry) => (
+                <article className={styles.importRow} key={entry.id}>
+                  <div>
+                    <strong>@{entry.username}</strong>
+                    <span>{formatImportStatus(entry)}</span>
+                  </div>
+                  <span className={styles.importStatus} data-status={entry.status}>
+                    {entry.status === "running" ? <LoaderCircle className={styles.spinning} size={13} /> : null}
+                    {entry.status}
+                  </span>
+                  <dl>
+                    <div><dt>Saved</dt><dd>{entry.downloadedCount}</dd></div>
+                    <div><dt>Existing</dt><dd>{entry.skippedExistingCount}</dd></div>
+                    <div><dt>Too long</dt><dd>{entry.skippedDurationCount}</dd></div>
+                    <div><dt>Failed</dt><dd>{entry.failedCount}</dd></div>
+                  </dl>
+                  {entry.lastError && entry.status === "failed" ? <p>{entry.lastError}</p> : null}
+                </article>
+              ))}
+            </div>
+          ) : null}
+        </section>
+      ) : null}
 
       <div className={styles.filterBar}>
         <label className={styles.searchField}>
@@ -110,4 +253,15 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
       </section>
     </>
   );
+}
+
+function formatImportStatus(entry: CreatorImport) {
+  if (entry.status === "queued") return `Waiting · ${entry.maxDurationSeconds}s limit`;
+  if (entry.status === "running") {
+    return entry.discoveredCount
+      ? `${entry.processedCount} of ${entry.discoveredCount} processed`
+      : "Scanning profile";
+  }
+  if (entry.status === "failed") return "Import stopped";
+  return `${entry.processedCount} processed`;
 }
