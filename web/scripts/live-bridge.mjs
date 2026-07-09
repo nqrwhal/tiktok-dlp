@@ -11,9 +11,16 @@ const projectDir = path.resolve(here, "..");
 const cacheDir = path.join(projectDir, ".live-cache");
 const host = process.env.LIVE_SSH_HOST || "yufeihl";
 const port = positiveInteger(process.env.LIVE_BRIDGE_PORT, 8787);
+const localMode = /^(1|true|yes)$/i.test(process.env.LIVE_LOCAL_MODE || "");
+const listenHost = process.env.LIVE_BRIDGE_HOST || (localMode ? "0.0.0.0" : "127.0.0.1");
 const remoteProject = process.env.LIVE_REMOTE_PROJECT || "/home/yufei/tiktok-discord-downloader";
 const remoteDb = `${remoteProject}/data/state.db`;
 const remoteDownloads = `${remoteProject}/data/downloads`;
+const archiveDb = process.env.LIVE_DB_PATH || (localMode ? "/app/data/state.db" : remoteDb);
+const archiveDownloads = process.env.LIVE_DOWNLOADS_PATH || (localMode ? "/app/data/downloads" : remoteDownloads);
+const backendUrl = (process.env.LIVE_BACKEND_URL || "http://tiktok-discord-downloader:8080").replace(/\/+$/, "");
+const importApiToken = process.env.LIVE_IMPORT_API_TOKEN || "";
+const publicBaseUrl = (process.env.LIVE_PUBLIC_BASE_URL || "").replace(/\/+$/, "");
 const inflightCopies = new Map();
 const inflightThumbnails = new Map();
 let videoCache = { loadedAt: 0, rows: [] };
@@ -197,8 +204,9 @@ const server = http.createServer(async (request, response) => {
   }
 });
 
-server.listen(port, "127.0.0.1", () => {
-  console.log(`[live-bridge] Live archive available at http://127.0.0.1:${port}`);
+server.listen(port, listenHost, () => {
+  const source = localMode ? archiveDb : host;
+  console.log(`[live-bridge] Live archive (${source}) available at http://${listenHost}:${port}`);
 });
 
 for (const signal of ["SIGINT", "SIGTERM"]) {
@@ -216,7 +224,7 @@ async function loadVideoRows({ force = false } = {}) {
 async function loadMetadataIndex({ force = false } = {}) {
   const now = Date.now();
   if (!force && now - metadataCache.loadedAt < 60_000) return metadataCache.byId;
-  const encodedRoot = Buffer.from(remoteDownloads, "utf8").toString("base64");
+  const encodedRoot = Buffer.from(archiveDownloads, "utf8").toString("base64");
   const script = [
     "import base64, json, os",
     `archive_root = base64.b64decode(${JSON.stringify(encodedRoot)}).decode('utf-8')`,
@@ -242,7 +250,7 @@ async function loadMetadataIndex({ force = false } = {}) {
     "        }",
     "print(json.dumps(result, ensure_ascii=False))",
   ].join("\n");
-  const byId = await remotePythonJson(script);
+  const byId = await archivePythonJson(script);
   metadataCache = { loadedAt: now, byId };
   return byId;
 }
@@ -321,6 +329,8 @@ async function serveThumbnail(request, response, fileId) {
 }
 
 async function ensureCached(record) {
+  if (localMode) return resolveArchivePath(record.path);
+
   const safeName = String(record.filename || `${record.id}.mp4`).replace(/[^A-Za-z0-9._-]/g, "_");
   const localPath = path.join(cacheDir, `${record.id}-${safeName}`);
   const expectedSize = Number(record.size_bytes || 0);
@@ -339,7 +349,7 @@ async function ensureCached(record) {
 }
 
 async function copyFromRemote(record, localPath) {
-  const sourcePath = resolveRemotePath(record.path);
+  const sourcePath = resolveArchivePath(record.path);
   const tempPath = `${localPath}.part-${process.pid}`;
   const encodedPath = Buffer.from(sourcePath, "utf8").toString("base64");
   const script = [
@@ -396,8 +406,10 @@ async function ensureThumbnail(record) {
 }
 
 async function copyThumbnailFromRemote(record, localPath) {
-  const sourcePath = resolveRemotePath(record.path);
-  const relativePath = path.posix.relative(remoteDownloads, sourcePath);
+  if (localMode) return generateLocalThumbnail(record, localPath);
+
+  const sourcePath = resolveArchivePath(record.path);
+  const relativePath = path.posix.relative(archiveDownloads, sourcePath);
   const containerPath = path.posix.join("/app/data/downloads", relativePath);
   const tempPath = `${localPath}.part-${process.pid}`;
   const encodedPath = Buffer.from(containerPath, "utf8").toString("base64");
@@ -432,11 +444,40 @@ async function copyThumbnailFromRemote(record, localPath) {
   }
 }
 
-function resolveRemotePath(storedPath) {
+async function generateLocalThumbnail(record, localPath) {
+  const sourcePath = resolveArchivePath(record.path);
+  const tempPath = `${localPath}.part-${process.pid}`;
+  await rm(tempPath, { force: true });
+  const child = spawn("ffmpeg", [
+    "-hide_banner", "-loglevel", "error", "-ss", "0.25", "-i", sourcePath,
+    "-frames:v", "1", "-vf", "scale=320:-2", "-q:v", "4", "-f", "image2pipe",
+    "-vcodec", "mjpeg", "pipe:1",
+  ], { stdio: ["ignore", "pipe", "pipe"] });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  try {
+    await Promise.all([
+      pipeline(child.stdout, createWriteStream(tempPath)),
+      waitForChild(child),
+    ]);
+    const generated = await stat(tempPath);
+    if (!generated.size) throw new Error("Thumbnail generation returned an empty image");
+    await rename(tempPath, localPath);
+    return localPath;
+  } catch (error) {
+    await rm(tempPath, { force: true });
+    throw new Error(stderr.trim() || (error instanceof Error ? error.message : String(error)));
+  }
+}
+
+function resolveArchivePath(storedPath) {
   const normalized = path.posix.normalize(String(storedPath || ""));
   let relative;
   if (normalized.startsWith("/app/data/downloads/")) {
     relative = normalized.slice("/app/data/downloads/".length);
+  } else if (normalized.startsWith(`${archiveDownloads}/`)) {
+    relative = normalized.slice(archiveDownloads.length + 1);
   } else if (normalized.startsWith(`${remoteDownloads}/`)) {
     relative = normalized.slice(remoteDownloads.length + 1);
   } else {
@@ -445,7 +486,7 @@ function resolveRemotePath(storedPath) {
   if (!relative || relative.startsWith("../") || relative.includes("/../")) {
     throw new Error("Invalid media path");
   }
-  return path.posix.join(remoteDownloads, relative);
+  return path.posix.join(archiveDownloads, relative);
 }
 
 function isClientDisconnect(error, request, response) {
@@ -457,7 +498,9 @@ function isClientDisconnect(error, request, response) {
 }
 
 async function remoteSql(sql) {
-  const child = spawn("ssh", sshArgs(`sqlite3 -readonly -json ${remoteDb}`), {
+  const child = localMode
+    ? spawn("sqlite3", ["-readonly", "-json", archiveDb], { stdio: ["pipe", "pipe", "pipe"] })
+    : spawn("ssh", sshArgs(`sqlite3 -readonly -json ${remoteDb}`), {
     stdio: ["pipe", "pipe", "pipe"],
   });
   let stdout = "";
@@ -472,8 +515,10 @@ async function remoteSql(sql) {
   return stdout.trim() ? JSON.parse(stdout) : [];
 }
 
-async function remotePythonJson(script) {
-  const child = spawn("ssh", sshArgs("python3 -"), {
+async function archivePythonJson(script) {
+  const child = localMode
+    ? spawn("python3", ["-"], { stdio: ["pipe", "pipe", "pipe"] })
+    : spawn("ssh", sshArgs("python3 -"), {
     stdio: ["pipe", "pipe", "pipe"],
   });
   let stdout = "";
@@ -489,6 +534,22 @@ async function remotePythonJson(script) {
 }
 
 async function remoteImportRequest(method, requestPath, body = "") {
+  if (localMode) {
+    const headers = {};
+    if (body) headers["content-type"] = "application/json";
+    if (importApiToken) headers.authorization = `Bearer ${importApiToken}`;
+    const response = await fetch(`${backendUrl}${requestPath}`, {
+      method,
+      headers,
+      body: body || undefined,
+    });
+    return {
+      status: response.status,
+      contentType: response.headers.get("content-type") || "",
+      body: await response.text(),
+    };
+  }
+
   const script = [
     `const method = ${JSON.stringify(method)};`,
     `const requestPath = ${JSON.stringify(requestPath)};`,
@@ -544,7 +605,7 @@ function waitForChild(child) {
     child.once("error", reject);
     child.once("close", (code) => {
       if (code === 0) resolve();
-      else reject(new Error(`SSH command exited with status ${code}`));
+      else reject(new Error(`Archive command exited with status ${code}`));
     });
   });
 }
@@ -590,7 +651,9 @@ function toCreator(row) {
 
 function toVideo(row, request, metadata = {}) {
   const username = String(row.username || "unknown");
-  const origin = `http://${request.headers.host || `127.0.0.1:${port}`}`;
+  const forwardedProtocol = String(request.headers["x-forwarded-proto"] || "").split(",")[0].trim();
+  const protocol = forwardedProtocol || (request.socket.encrypted ? "https" : "http");
+  const origin = publicBaseUrl || `${protocol}://${request.headers.host || `127.0.0.1:${port}`}`;
   const createdAt = Number(row.created_at || Date.now());
   const postedAt = Number(metadata.timestamp || 0) > 0
     ? Number(metadata.timestamp) * 1000

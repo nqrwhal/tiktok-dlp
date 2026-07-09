@@ -5,3 +5,6 @@ node_modules
 data
 test
 *.log
+web/.live-cache
+web/.next
+web/dist

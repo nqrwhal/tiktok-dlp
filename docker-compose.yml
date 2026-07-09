@@ -53,6 +53,27 @@ services:
       - ./cookies:/app/cookies:ro
     restart: unless-stopped
 
+  rewind-web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+      args:
+        NEXT_PUBLIC_ARCHIVE_API_BASE: ${REWIND_PUBLIC_URL:-https://rewind.yufei.dev}
+    environment:
+      LIVE_LOCAL_MODE: "true"
+      LIVE_DB_PATH: /app/data/state.db
+      LIVE_DOWNLOADS_PATH: /app/data/downloads
+      LIVE_BACKEND_URL: http://tiktok-discord-downloader:${HTTP_PORT:-8080}
+      LIVE_IMPORT_API_TOKEN: ${IMPORT_API_TOKEN:-}
+      LIVE_PUBLIC_BASE_URL: ${REWIND_PUBLIC_URL:-https://rewind.yufei.dev}
+    expose:
+      - "3000"
+    volumes:
+      - ./data:/app/data:ro
+    depends_on:
+      - tiktok-discord-downloader
+    restart: unless-stopped
+
   cloudflared:
     image: cloudflare/cloudflared:latest
     profiles:
@@ -62,6 +83,7 @@ services:
       - cloudflare_tunnel_token
     depends_on:
       - tiktok-discord-downloader
+      - rewind-web
     restart: unless-stopped
 
 secrets:

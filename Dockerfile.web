@@ -1,0 +1,37 @@
+FROM node:22-slim
+
+WORKDIR /app/web
+
+ENV NODE_ENV=production
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    ffmpeg \
+    python3 \
+    sqlite3 \
+    tini \
+  && apt-get clean \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY web/package*.json ./
+RUN npm ci
+
+COPY web ./
+
+ARG NEXT_PUBLIC_ARCHIVE_API_BASE=https://rewind.yufei.dev
+ENV NEXT_PUBLIC_ARCHIVE_API_BASE=${NEXT_PUBLIC_ARCHIVE_API_BASE}
+
+RUN npm run build \
+  && mkdir -p .live-cache \
+  && chown -R node:node /app/web
+
+USER node
+
+EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD node -e "require('http').get('http://127.0.0.1:3000/api/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
+
+ENTRYPOINT ["tini", "--"]
+CMD ["npm", "run", "start:live"]
