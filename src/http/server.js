@@ -4,6 +4,8 @@ import { stat } from 'node:fs/promises';
 import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { createReadStream } from 'node:fs';
+import { removeStoredFiles } from '../cleanup/downloads.js';
+import { normalizeUsername } from '../util/files.js';
 
 export function createHttpHandler({ config, store, creatorImportService = null }) {
   assertServerDeps(config, store);
@@ -24,6 +26,17 @@ export function createHttpHandler({ config, store, creatorImportService = null }
         });
       }
 
+      const creatorVideosMatch = url.pathname.match(/^\/api\/creators\/([^/]+)\/videos$/);
+      if (creatorVideosMatch) {
+        let username = '';
+        try {
+          username = decodeURIComponent(creatorVideosMatch[1]);
+        } catch {
+          return sendJson(res, 400, { error: 'Creator username is invalid' });
+        }
+        return handleCreatorVideosRequest(req, res, { config, store, username });
+      }
+
       if (req.method === 'GET' || req.method === 'HEAD') {
         const token = matchFileToken(url.pathname);
         if (token) {
@@ -38,6 +51,53 @@ export function createHttpHandler({ config, store, creatorImportService = null }
       }, { head: req.method === 'HEAD' });
     }
   };
+}
+
+export async function handleCreatorVideosRequest(req, res, { config, store, username }) {
+  if (!isImportAuthorized(req, config)) {
+    return sendJson(res, 401, { error: 'Unauthorized' });
+  }
+  if (req.method !== 'DELETE') {
+    return sendJson(res, 405, { error: 'Method not allowed' });
+  }
+
+  try {
+    const normalizedUsername = normalizeUsername(username);
+    const body = await readJsonBody(req);
+    const confirmedUsername = normalizeUsername(body.confirmUsername);
+    if (confirmedUsername.toLowerCase() !== normalizedUsername.toLowerCase()) {
+      return sendJson(res, 400, { error: `Type @${normalizedUsername} to confirm deletion` });
+    }
+    const activeImport = store.findActiveCreatorImport?.(normalizedUsername);
+    if (activeImport) {
+      return sendJson(res, 409, {
+        error: `Wait for the active @${normalizedUsername} import to finish before deleting its videos`,
+      });
+    }
+
+    const files = store.listCreatorVideoPurgePlan(normalizedUsername);
+    const removal = await removeStoredFiles(files, config);
+    for (const failure of removal.failed) {
+      store.markFileDeletionFailed?.(failure.file.id, failure.error);
+    }
+    const failedIds = new Set(removal.failed.map((failure) => Number(failure.file.id)));
+    const removableIds = files
+      .filter((file) => !failedIds.has(Number(file.id)))
+      .map((file) => Number(file.id));
+    const deletedVideos = store.deleteFileRecords(removableIds);
+
+    return sendJson(res, 200, {
+      username: normalizedUsername,
+      deletedVideos,
+      deletedStoredFiles: removal.deleted,
+      failedVideos: removal.failed.length,
+    });
+  } catch (error) {
+    const statusCode = Number(error?.statusCode) || 400;
+    return sendJson(res, statusCode, {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 }
 
 export async function startHttpServer({

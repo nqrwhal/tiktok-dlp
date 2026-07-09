@@ -162,6 +162,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_jobs_file_id ON jobs(file_id);
       CREATE INDEX IF NOT EXISTS idx_files_requested_by ON files(requested_by);
       CREATE INDEX IF NOT EXISTS idx_files_delete_requested_at ON files(delete_requested_at);
+      CREATE INDEX IF NOT EXISTS idx_files_username_created_at ON files(username COLLATE NOCASE, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_link_tokens_file_id_expires_at ON link_tokens(file_id, expires_at);
       CREATE INDEX IF NOT EXISTS idx_link_tokens_owner_id_created_at ON link_tokens(owner_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_link_tokens_scope_id_created_at ON link_tokens(scope_id, created_at DESC);
@@ -1307,6 +1308,18 @@ export class Store {
   // committing a purge. New callers should use listPurgePlan() explicitly.
   listFilesForPurge(options = {}) {
     return this.listPurgePlan(options);
+  }
+
+  listCreatorVideoPurgePlan(username) {
+    const normalized = String(username ?? '').trim().replace(/^@/, '');
+    if (!normalized) return [];
+    return this.db.prepare(`
+      SELECT id, path, filename, video_id
+      FROM files
+      WHERE lower(username) = lower(?)
+        AND lower(filename) LIKE '%.mp4'
+      ORDER BY created_at ASC, id ASC
+    `).all(normalized);
   }
 
   purgeDownloads({ requestedBy = '', removeFileIds = null, now = Date.now() } = {}) {

@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { useMemo, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import { CreatorPicker } from "../CreatorPicker";
 import { mockStats } from "../../lib/mock-data";
 import type { Creator, SavedVideo } from "../../lib/types";
@@ -24,28 +25,43 @@ export function VideoLibrary({
   creators: Creator[];
   videos: SavedVideo[];
 }) {
+  const searchParams = useSearchParams();
+  const requestedCreatorId = searchParams.get("creator") || "all";
+  const requestedUsername = searchParams.get("username") || "";
+  const [creatorFilter, setCreatorFilter] = useState({
+    id: requestedCreatorId,
+    username: requestedCreatorId === "all" ? "" : requestedUsername,
+  });
   const archive = useArchiveData({
     fallbackCreators: creators,
     fallbackVideos: videos,
     fallbackStats: mockStats,
+    videoCreatorId: creatorFilter.id === "all" ? "" : creatorFilter.id,
+    videoUsername: creatorFilter.username,
   });
   const liveCreators = archive.creators;
   const liveVideos = archive.videos;
   const [query, setQuery] = useState("");
-  const [creatorId, setCreatorId] = useState("all");
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
 
   const filtered = useMemo(() => {
     const normalized = query.trim().toLowerCase();
     return liveVideos.filter((video) => {
-      const matchesCreator = creatorId === "all" || video.creatorId === creatorId;
+      const matchesCreator = creatorFilter.id === "all" || video.creatorId === creatorFilter.id;
       const matchesQuery =
         !normalized ||
         video.title.toLowerCase().includes(normalized) ||
         video.username.toLowerCase().includes(normalized);
       return matchesCreator && matchesQuery;
     });
-  }, [creatorId, liveVideos, query]);
+  }, [creatorFilter.id, liveVideos, query]);
+
+  function selectCreator(id: string) {
+    setCreatorFilter({
+      id,
+      username: id === "all" ? "" : liveCreators.find((creator) => creator.id === id)?.username || "",
+    });
+  }
 
   function toggleSelected(id: string) {
     setSelected((current) => {
@@ -77,7 +93,7 @@ export function VideoLibrary({
             placeholder="Search title or creator"
           />
         </label>
-        <CreatorPicker creators={liveCreators} value={creatorId} onChange={setCreatorId} />
+        <CreatorPicker creators={liveCreators} value={creatorFilter.id} onChange={selectCreator} />
         <span className={styles.resultCount}>{filtered.length} results</span>
       </div>
 

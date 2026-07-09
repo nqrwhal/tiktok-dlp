@@ -76,22 +76,25 @@ export async function removeStoredFiles(files, config) {
 async function resolveRelatedStoredDownloadPaths(filePath) {
   const resolved = path.resolve(filePath);
   const paths = [resolved];
-  if (path.extname(resolved).toLowerCase() !== '.zip') return paths;
-
   const dir = path.dirname(resolved);
-  const prefix = `${path.basename(resolved, '.zip')}__`;
+  const extension = path.extname(resolved).toLowerCase();
+  const stem = path.basename(resolved, extension);
+  const galleryPrefix = extension === '.zip' ? `${stem}__` : '';
   try {
     const entries = await readdir(dir, { withFileTypes: true });
     for (const entry of entries) {
       if (!entry.isFile()) continue;
-      if (!entry.name.startsWith(prefix)) continue;
-      if (!/\.(jpe?g|png|webp|gif|heic)$/i.test(entry.name)) continue;
+      const isVideoSidecar = extension === '.mp4' && entry.name.startsWith(`${stem}.`);
+      const isGalleryImage = galleryPrefix
+        && entry.name.startsWith(galleryPrefix)
+        && /\.(jpe?g|png|webp|gif|heic)$/i.test(entry.name);
+      if (!isVideoSidecar && !isGalleryImage) continue;
       paths.push(path.join(dir, entry.name));
     }
   } catch {
     return paths;
   }
-  return paths;
+  return [...new Set(paths)];
 }
 
 async function removeEmptyParents(startDir, downloadDir) {

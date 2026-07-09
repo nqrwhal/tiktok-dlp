@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -186,4 +186,110 @@ test('creator import API requires a bearer token outside loopback', () => {
     request('10.0.0.4', 'Bearer wrong'),
     { importApiToken: 'secret' },
   ), false);
+});
+
+test('creator video deletion requires typed confirmation and removes only that creator media', async (t) => {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-creator-delete-'));
+  const downloadDir = path.join(rootDir, 'downloads');
+  const dbPath = path.join(rootDir, 'state.db');
+  const creatorDir = path.join(downloadDir, 'creator');
+  await mkdir(creatorDir, { recursive: true });
+
+  const config = loadConfig({
+    DATA_DIR: rootDir,
+    DOWNLOAD_DIR: downloadDir,
+    STATE_DB: dbPath,
+    HTTP_PORT: '0',
+  }, rootDir);
+  const store = new Store(dbPath);
+  const creatorVideoPath = path.join(creatorDir, '100.mp4');
+  const sidecarPaths = [
+    path.join(creatorDir, '100.info.json'),
+    path.join(creatorDir, '100.description'),
+    path.join(creatorDir, '100.image'),
+  ];
+  const unrelatedPath = path.join(creatorDir, '1000.mp4');
+  await Promise.all([
+    writeFile(creatorVideoPath, 'creator video'),
+    ...sidecarPaths.map((sidecar) => writeFile(sidecar, 'metadata')),
+    writeFile(unrelatedPath, 'other video'),
+  ]);
+
+  const creatorFileId = store.createFileRecord({
+    videoId: '100',
+    username: 'Creator',
+    sourceUrl: 'https://www.tiktok.com/@creator/video/100',
+    filePath: creatorVideoPath,
+    filename: '100.mp4',
+    sizeBytes: 13,
+  });
+  store.createLinkToken({
+    token: 'creator-token',
+    fileId: creatorFileId,
+    expiresAt: 0,
+  });
+  const unrelatedFileId = store.createFileRecord({
+    videoId: '1000',
+    username: 'someone-else',
+    sourceUrl: 'https://www.tiktok.com/@someone-else/video/1000',
+    filePath: unrelatedPath,
+    filename: '1000.mp4',
+    sizeBytes: 11,
+  });
+
+  const { server, address } = await startHttpServer({
+    config,
+    store,
+    host: '127.0.0.1',
+    port: 0,
+  });
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const unconfirmed = await fetch(`${baseUrl}/api/creators/Creator/videos`, {
+    method: 'DELETE',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ confirmUsername: '@wrong-creator' }),
+  });
+  assert.equal(unconfirmed.status, 400);
+  await access(creatorVideoPath);
+
+  const activeImportId = store.createCreatorImport({
+    username: 'creator',
+    maxDurationSeconds: 120,
+  });
+  const blockedByImport = await fetch(`${baseUrl}/api/creators/Creator/videos`, {
+    method: 'DELETE',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ confirmUsername: '@creator' }),
+  });
+  assert.equal(blockedByImport.status, 409);
+  await access(creatorVideoPath);
+  store.updateCreatorImport(activeImportId, { status: 'completed', completed_at: Date.now() });
+
+  const deleted = await fetch(`${baseUrl}/api/creators/Creator/videos`, {
+    method: 'DELETE',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ confirmUsername: '@creator' }),
+  });
+  assert.equal(deleted.status, 200);
+  assert.deepEqual(await deleted.json(), {
+    username: 'Creator',
+    deletedVideos: 1,
+    deletedStoredFiles: 4,
+    failedVideos: 0,
+  });
+
+  await assert.rejects(access(creatorVideoPath), { code: 'ENOENT' });
+  for (const sidecarPath of sidecarPaths) {
+    await assert.rejects(access(sidecarPath), { code: 'ENOENT' });
+  }
+  await access(unrelatedPath);
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM files WHERE id = ?').get(creatorFileId).count, 0);
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM files WHERE id = ?').get(unrelatedFileId).count, 1);
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM link_tokens WHERE token = ?').get('creator-token').count, 0);
 });

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type { ArchiveStats, Creator, SavedVideo } from "./types";
 
 export type ArchiveDataSource = "mock" | "loading" | "live" | "fallback";
@@ -9,10 +9,14 @@ export function useArchiveData({
   fallbackCreators,
   fallbackVideos,
   fallbackStats,
+  videoCreatorId = "",
+  videoUsername = "",
 }: {
   fallbackCreators: Creator[];
   fallbackVideos: SavedVideo[];
   fallbackStats: ArchiveStats;
+  videoCreatorId?: string;
+  videoUsername?: string;
 }) {
   const configuredBase = process.env.NEXT_PUBLIC_ARCHIVE_API_BASE;
   const [creators, setCreators] = useState(fallbackCreators);
@@ -20,19 +24,26 @@ export function useArchiveData({
   const [stats, setStats] = useState(fallbackStats);
   const [source, setSource] = useState<ArchiveDataSource>(configuredBase ? "loading" : "mock");
   const [error, setError] = useState("");
+  const [revision, setRevision] = useState(0);
+  const refresh = useCallback(() => setRevision((current) => current + 1), []);
 
   useEffect(() => {
     if (!configuredBase) return;
 
     const controller = new AbortController();
     const base = configuredBase.replace(/\/+$/, "");
+    const videoParams = new URLSearchParams({
+      limit: videoCreatorId || videoUsername ? "2000" : "500",
+    });
+    if (videoCreatorId) videoParams.set("creatorId", videoCreatorId);
+    if (videoUsername) videoParams.set("username", videoUsername);
 
     Promise.all([
       fetch(`${base}/api/creators`, {
         cache: "no-store",
         signal: controller.signal,
       }).then(assertJsonResponse<Creator[]>),
-      fetch(`${base}/api/videos?limit=250`, {
+      fetch(`${base}/api/videos?${videoParams}`, {
         cache: "no-store",
         signal: controller.signal,
       }).then(assertJsonResponse<SavedVideo[]>),
@@ -54,9 +65,9 @@ export function useArchiveData({
       });
 
     return () => controller.abort();
-  }, [configuredBase]);
+  }, [configuredBase, revision, videoCreatorId, videoUsername]);
 
-  return { creators, videos, stats, source, error };
+  return { creators, videos, stats, source, error, refresh };
 }
 
 async function assertJsonResponse<T>(response: Response): Promise<T> {

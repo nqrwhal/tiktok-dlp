@@ -26,34 +26,6 @@ const inflightThumbnails = new Map();
 let videoCache = { loadedAt: 0, rows: [] };
 let metadataCache = { loadedAt: 0, byId: {} };
 
-const VIDEO_SQL = `
-  SELECT
-    files.id,
-    files.video_id,
-    files.username,
-    files.source_url,
-    files.path,
-    files.filename,
-    files.size_bytes,
-    files.created_at,
-    COALESCE(
-      (
-        SELECT jobs.title
-        FROM jobs
-        WHERE jobs.file_id = files.id
-          AND jobs.title IS NOT NULL
-          AND jobs.title <> ''
-        ORDER BY jobs.created_at DESC, jobs.id DESC
-        LIMIT 1
-      ),
-      files.filename
-    ) AS title
-  FROM files
-  WHERE lower(files.filename) LIKE '%.mp4'
-  ORDER BY files.created_at DESC, files.id DESC
-  LIMIT 500;
-`;
-
 const CREATOR_SQL = `
   WITH saved AS (
     SELECT
@@ -141,11 +113,14 @@ const server = http.createServer(async (request, response) => {
     }
 
     if (request.method === "GET" && url.pathname === "/api/videos") {
-      const limit = Math.min(500, positiveInteger(url.searchParams.get("limit"), 100));
       const creatorId = String(url.searchParams.get("creatorId") || "").toLowerCase();
-      const rows = await loadVideoRows();
+      const username = String(url.searchParams.get("username") || "").trim();
+      const limit = Math.min(username ? 2_000 : 500, positiveInteger(url.searchParams.get("limit"), 100));
+      const rows = username
+        ? await remoteSql(buildVideoSql({ username, limit }))
+        : await loadVideoRows();
       const metadataById = await loadMetadataIndex();
-      const filtered = creatorId
+      const filtered = creatorId && !username
         ? rows.filter((row) => creatorKey(row.username) === creatorId || String(row.username).toLowerCase() === creatorId)
         : rows;
       sendJson(response, 200, filtered.slice(0, limit).map((row) => (
@@ -170,7 +145,24 @@ const server = http.createServer(async (request, response) => {
     const importApiRoute = url.pathname === "/api/imports" || /^\/api\/imports\/\d+$/.test(url.pathname);
     if (importApiRoute && (request.method === "GET" || request.method === "POST")) {
       const body = request.method === "POST" ? await readBodyText(request) : "";
-      const upstream = await remoteImportRequest(request.method, `${url.pathname}${url.search}`, body);
+      const upstream = await remoteAdminRequest(request.method, `${url.pathname}${url.search}`, body);
+      response.writeHead(upstream.status, {
+        "Cache-Control": "no-store",
+        "Content-Length": Buffer.byteLength(upstream.body),
+        "Content-Type": upstream.contentType || "application/json; charset=utf-8",
+      });
+      response.end(upstream.body);
+      return;
+    }
+
+    const creatorVideosRoute = /^\/api\/creators\/[^/]+\/videos$/.test(url.pathname);
+    if (creatorVideosRoute && request.method === "DELETE") {
+      const body = await readBodyText(request);
+      const upstream = await remoteAdminRequest(request.method, `${url.pathname}${url.search}`, body);
+      if (upstream.status >= 200 && upstream.status < 300) {
+        videoCache = { loadedAt: 0, rows: [] };
+        metadataCache = { loadedAt: 0, byId: {} };
+      }
       response.writeHead(upstream.status, {
         "Cache-Control": "no-store",
         "Content-Length": Buffer.byteLength(upstream.body),
@@ -216,9 +208,44 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
 async function loadVideoRows({ force = false } = {}) {
   const now = Date.now();
   if (!force && now - videoCache.loadedAt < 15_000) return videoCache.rows;
-  const rows = await remoteSql(VIDEO_SQL);
+  const rows = await remoteSql(buildVideoSql());
   videoCache = { loadedAt: now, rows };
   return rows;
+}
+
+function buildVideoSql({ username = "", limit = 500 } = {}) {
+  const boundedLimit = Math.min(username ? 2_000 : 500, positiveInteger(limit, 500));
+  const creatorClause = username
+    ? `AND lower(files.username) = lower(${sqliteString(username)})`
+    : "";
+  return `
+    SELECT
+      files.id,
+      files.video_id,
+      files.username,
+      files.source_url,
+      files.path,
+      files.filename,
+      files.size_bytes,
+      files.created_at,
+      COALESCE(
+        (
+          SELECT jobs.title
+          FROM jobs
+          WHERE jobs.file_id = files.id
+            AND jobs.title IS NOT NULL
+            AND jobs.title <> ''
+          ORDER BY jobs.created_at DESC, jobs.id DESC
+          LIMIT 1
+        ),
+        files.filename
+      ) AS title
+    FROM files
+    WHERE lower(files.filename) LIKE '%.mp4'
+      ${creatorClause}
+    ORDER BY files.created_at DESC, files.id DESC
+    LIMIT ${boundedLimit};
+  `;
 }
 
 async function loadMetadataIndex({ force = false } = {}) {
@@ -533,7 +560,7 @@ async function archivePythonJson(script) {
   return stdout.trim() ? JSON.parse(stdout) : {};
 }
 
-async function remoteImportRequest(method, requestPath, body = "") {
+async function remoteAdminRequest(method, requestPath, body = "") {
   if (localMode) {
     const headers = {};
     if (body) headers["content-type"] = "application/json";
@@ -580,7 +607,7 @@ async function remoteImportRequest(method, requestPath, body = "") {
   try {
     return JSON.parse(stdout);
   } catch {
-    throw new Error(stderr.trim() || "Remote import API returned an invalid response");
+    throw new Error(stderr.trim() || "Remote admin API returned an invalid response");
   }
 }
 
@@ -598,6 +625,10 @@ async function readBodyText(request, maxBytes = 16 * 1024) {
 
 function shellQuote(value) {
   return `'${String(value).replaceAll("'", `'"'"'`)}'`;
+}
+
+function sqliteString(value) {
+  return `'${String(value).replaceAll("'", "''")}'`;
 }
 
 function waitForChild(child) {
@@ -764,8 +795,8 @@ function positiveInteger(value, fallback) {
 function applyCors(response, origin) {
   const allowed = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin);
   response.setHeader("Access-Control-Allow-Origin", allowed ? origin : "http://localhost:3000");
-  response.setHeader("Access-Control-Allow-Methods", "GET, POST, HEAD, OPTIONS");
-  response.setHeader("Access-Control-Allow-Headers", "Content-Type, Range");
+  response.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, HEAD, OPTIONS");
+  response.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, Range");
   response.setHeader("Vary", "Origin");
 }
 
