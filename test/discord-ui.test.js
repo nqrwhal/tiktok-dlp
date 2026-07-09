@@ -306,7 +306,7 @@ test('monitor delete button removes saved post records and slideshow sidecars', 
     await assert.rejects(access(zipPath));
     await assert.rejects(access(sidecarPath));
     assert.deepEqual(updates[0], { components: [] });
-    assert.equal(followUps[0].embeds[0].data.title, 'Saved Post Deleted');
+    assert.equal(followUps[0].embeds[0].data.title, 'Monitored Delivery Deleted');
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });

@@ -15,7 +15,7 @@ import {
   slugify,
 } from '../src/util/files.js';
 import { createStore } from '../src/state/store.js';
-import { buildDeliveryPayload, handleLinkButton, shouldIgnoreMessage, shouldShowHelp } from '../src/discord/client.js';
+import { buildDeliveryPayload, canManageWatches, handleLinkButton, shouldIgnoreMessage, shouldShowHelp } from '../src/discord/client.js';
 import { cleanupExpiredDownloads } from '../src/cleanup/downloads.js';
 
 test('loadEnvFile reads simple env files without overriding existing values', async () => {
@@ -47,6 +47,11 @@ test('loadConfig resolves paths and upload limits', () => {
   assert.equal(config.profileScanLimit, 5);
   assert.equal(config.profileBurstScanLimit, 20);
   assert.equal(config.monitorConcurrency, 2);
+  assert.equal(config.maxDownloadQueueSize, 50);
+  assert.equal(config.maxQueuedDownloadsPerUser, 3);
+  assert.equal(config.deletionCheckConcurrency, 2);
+  assert.equal(config.maxSlideshowImages, 35);
+  assert.equal(config.ytdlpTimeoutMs, 60_000);
 });
 
 test('loadConfig supports minute TTL and ignores legacy hour TTL', () => {
@@ -120,8 +125,8 @@ test('store persists watches, seen videos, jobs, files, and link tokens', async 
     const jobId = store.createJob({ type: 'manual', sourceUrl: 'https://www.tiktok.com/@openai/video/v1' }, 3000);
     const fileId = store.createFileRecord({
       videoId: 'v1',
-      username: 'openai',
       requestedBy: 'user-1',
+      username: 'openai',
       sourceUrl: 'https://www.tiktok.com/@openai/video/v1',
       filePath: path.join(dir, 'video.mp4'),
       filename: 'video.mp4',
@@ -189,11 +194,75 @@ test('expired downloads remove both file records and disk files', async () => {
       log: { warn() {} },
     });
 
-    assert.deepEqual(result, { files: 1, deleted: 1, failed: 0 });
+    assert.equal(result.files, 1);
+    assert.equal(result.deleted, 1);
+    assert.equal(result.failed, 0);
+    assert.equal(result.expiredTokens, 1);
     assert.equal(store.getToken('expired'), null);
     assert.equal(store.getToken('kept').filename, 'kept.mp4');
     await assert.rejects(access(filePath));
     await access(keptPath);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('cleanup never removes a shared path while another asset row has an active link', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-shared-cleanup-'));
+  const store = createStore(path.join(dir, 'state.db'));
+  try {
+    const filePath = path.join(dir, 'shared.mp4');
+    await writeFile(filePath, 'shared');
+    const expiredId = store.createFileRecord({
+      videoId: 'old', sourceUrl: 'https://example.test/old', filePath, filename: 'shared.mp4', sizeBytes: 6,
+    }, 1000);
+    const activeId = store.createFileRecord({
+      videoId: 'new', sourceUrl: 'https://example.test/new', filePath, filename: 'shared.mp4', sizeBytes: 6,
+    }, 1000);
+    store.createLinkToken({ token: 'expired-shared', fileId: expiredId, expiresAt: 2000 }, 1000);
+    store.createLinkToken({ token: 'active-shared', fileId: activeId, ownerId: 'user-2', expiresAt: 0 }, 1000);
+
+    const result = await cleanupExpiredDownloads({ config: { downloadDir: dir }, store, now: 3000, log: { warn() {} } });
+    assert.equal(result.files, 0);
+    assert.equal(store.getToken('active-shared')?.filename, 'shared.mp4');
+    await access(filePath);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('cleanup records failed disk deletions as retryable trash state', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-trash-state-'));
+  const store = createStore(path.join(dir, 'state.db'));
+  try {
+    const fileId = store.createFileRecord({
+      videoId: 'outside-file',
+      sourceUrl: 'https://www.tiktok.com/@openai/video/outside-file',
+      filePath: path.join(os.tmpdir(), 'outside-download.mp4'),
+      filename: 'outside-download.mp4',
+      sizeBytes: 1,
+    }, 1000);
+    store.createLinkToken({ token: 'outside-file', fileId, expiresAt: 2000 }, 1000);
+
+    const first = await cleanupExpiredDownloads({ config: { downloadDir: dir }, store, now: 3000, log: { warn() {} } });
+    assert.equal(first.failed, 1);
+    let state = store.db.prepare('SELECT delete_requested_at, delete_attempts, delete_error FROM files WHERE id = ?').get(fileId);
+    assert.equal(state.delete_requested_at, 3000);
+    assert.equal(state.delete_attempts, 1);
+    assert.match(state.delete_error, /outside the configured download directory/i);
+    assert.equal(store.getLatestFileByVideoId('outside-file'), null);
+
+    const second = await cleanupExpiredDownloads({ config: { downloadDir: dir }, store, now: 4000, log: { warn() {} } });
+    assert.equal(second.failed, 1);
+    state = store.db.prepare('SELECT delete_attempts FROM files WHERE id = ?').get(fileId);
+    assert.equal(state.delete_attempts, 2);
+
+    store.createLinkToken({ token: 'revived-file', fileId, ownerId: 'user-1', expiresAt: 0 }, 4000);
+    state = store.db.prepare('SELECT delete_requested_at, delete_error FROM files WHERE id = ?').get(fileId);
+    assert.equal(state.delete_requested_at, null);
+    assert.equal(state.delete_error, null);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -258,6 +327,7 @@ test('store migrates older databases before creating indexes for new columns', a
     const seenColumns = store.db.prepare('PRAGMA table_info(seen_videos)').all().map((column) => column.name);
     const jobColumns = store.db.prepare('PRAGMA table_info(jobs)').all().map((column) => column.name);
     const fileColumns = store.db.prepare('PRAGMA table_info(files)').all().map((column) => column.name);
+    const linkColumns = store.db.prepare('PRAGMA table_info(link_tokens)').all().map((column) => column.name);
     const indexes = store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all().map((index) => index.name);
     assert.ok(watchColumns.includes('creator_id'));
     assert.ok(watchColumns.includes('has_story'));
@@ -266,6 +336,11 @@ test('store migrates older databases before creating indexes for new columns', a
     assert.ok(indexes.includes('idx_seen_videos_next_deletion_check_at'));
     assert.ok(jobColumns.includes('requested_by'));
     assert.ok(fileColumns.includes('requested_by'));
+    assert.ok(fileColumns.includes('delete_attempts'));
+    assert.ok(linkColumns.includes('owner_id'));
+    assert.ok(linkColumns.includes('job_id'));
+    assert.ok(indexes.includes('idx_link_tokens_file_id_expires_at'));
+    assert.ok(indexes.includes('idx_jobs_file_id'));
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -333,30 +408,37 @@ test('download link listing can include monitored downloads', async () => {
     }, 2000);
     store.updateJob(monitorJobId, { status: 'complete', file_id: monitorFileId }, 2100);
     store.createLinkToken({ token: 'user-token', fileId: userFileId, expiresAt: 0 }, 1000);
-    store.createLinkToken({ token: 'monitor-token', fileId: monitorFileId, expiresAt: 0 }, 2000);
+    store.createLinkToken({
+      token: 'monitor-token',
+      fileId: monitorFileId,
+      jobId: monitorJobId,
+      scopeId: 'guild:guild-1',
+      deliveryType: 'monitor',
+      expiresAt: 0,
+    }, 2000);
 
     assert.deepEqual(
       store.listDownloadLinksByRequester('user-1').map((link) => link.token),
       ['user-token'],
     );
     assert.deepEqual(
-      store.listDownloadLinksByRequester('user-1', { includeMonitored: true }).map((link) => link.token),
+      store.listDownloadLinksByRequester('user-1', { includeMonitored: true, scopeId: 'guild:guild-1' }).map((link) => link.token),
       ['monitor-token', 'user-token'],
     );
     assert.deepEqual(
-      store.listDownloadLinksByRequester('user-1', { includeMonitored: true, limit: 1, offset: 1 }).map((link) => link.token),
+      store.listDownloadLinksByRequester('user-1', { includeMonitored: true, scopeId: 'guild:guild-1', limit: 1, offset: 1 }).map((link) => link.token),
       ['user-token'],
     );
-    assert.equal(store.countDownloadLinksByRequester('user-1', { includeMonitored: true }), 2);
+    assert.equal(store.countDownloadLinksByRequester('user-1', { includeMonitored: true, scopeId: 'guild:guild-1' }), 2);
     assert.deepEqual(
-      store.listDownloadLinksByRequester('user-1', { includeMonitored: true, username: 'OPENAI' }).map((link) => link.token),
+      store.listDownloadLinksByRequester('user-1', { includeMonitored: true, scopeId: 'guild:guild-1', username: 'OPENAI' }).map((link) => link.token),
       ['monitor-token', 'user-token'],
     );
     assert.deepEqual(
-      store.listDownloadLinksByRequester('user-1', { includeMonitored: true, username: 'other' }).map((link) => link.token),
+      store.listDownloadLinksByRequester('user-1', { includeMonitored: true, scopeId: 'guild:guild-1', username: 'other' }).map((link) => link.token),
       [],
     );
-    assert.equal(store.countDownloadLinksByRequester('user-1', { includeMonitored: true, username: 'openai' }), 2);
+    assert.equal(store.countDownloadLinksByRequester('user-1', { includeMonitored: true, scopeId: 'guild:guild-1', username: 'openai' }), 2);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -395,12 +477,43 @@ test('store records watched username changes', async () => {
   }
 });
 
+test('watch subscriptions keep guild destinations independent while sharing one creator scan', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-watch-subscriptions-'));
+  const store = createStore(path.join(dir, 'state.db'));
+  try {
+    store.addWatch('creator', { guildId: 'guild-1', channelId: 'channel-1', createdBy: 'manager-1' }, 1000);
+    store.addWatch('creator', { guildId: 'guild-2', channelId: 'channel-2', createdBy: 'manager-2' }, 1100);
+    store.addWatch('creator', { guildId: 'dm:dm-channel-1', channelId: 'dm-channel-1', createdBy: 'owner-1' }, 1150);
+    store.addWatch('creator', { guildId: 'dm:dm-channel-2', channelId: 'dm-channel-2', createdBy: 'owner-2' }, 1160);
+
+    assert.equal(store.listWatches().length, 1);
+    assert.equal(store.listWatchesForScope({ guildId: 'guild-1' })[0].subscription_channel_id, 'channel-1');
+    assert.equal(store.listWatchesForScope({ guildId: 'guild-2' })[0].subscription_channel_id, 'channel-2');
+    assert.equal(store.hasWatchSubscription('creator', { guildId: 'guild-1' }), true);
+    assert.equal(store.listWatchSubscriptions('creator').length, 4);
+    store.migrateLegacyWatchSubscriptions();
+    assert.equal(store.listWatchSubscriptions('creator').length, 4);
+    assert.equal(store.getWatchSubscription('creator', { guildId: '' }), null);
+    assert.equal(store.removeWatch('creator', { guildId: 'guild-1' }), true);
+    assert.equal(store.getWatch('creator')?.username, 'creator');
+
+    store.recordWatchIdentity('creator', { currentUsername: 'renamed.creator' }, 1200);
+    assert.equal(store.getWatch('creator'), null);
+    assert.equal(store.getWatch('renamed.creator')?.username, 'renamed.creator');
+    assert.equal(store.getWatchSubscription('renamed.creator', { guildId: 'guild-2' })?.channel_id, 'channel-2');
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('store schedules and marks deletion checks for seen videos', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-deletion-checks-'));
   const store = createStore(path.join(dir, 'state.db'));
   try {
     const fileId = store.createFileRecord({
       videoId: 'v1',
+      requestedBy: 'user-1',
       username: 'openai',
       sourceUrl: 'https://www.tiktok.com/@openai/video/v1',
       filePath: path.join(dir, 'video.mp4'),
@@ -435,63 +548,58 @@ test('store schedules and marks deletion checks for seen videos', async () => {
   }
 });
 
-test('store can make existing monitor download links permanent', async () => {
-  const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-monitor-permanent-'));
-  const store = createStore(path.join(dir, 'state.db'));
+test('shared assets keep delivery ownership and extended expiries across restart', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-shared-retention-'));
+  const dbPath = path.join(dir, 'state.db');
+  let store = createStore(dbPath);
   try {
-    const manualFileId = store.createFileRecord({
-      requestedBy: 'user-1',
+    const fileId = store.createFileRecord({
+      videoId: 'shared-video',
       username: 'openai',
-      sourceUrl: 'https://www.tiktok.com/@openai/video/1',
-      filePath: path.join(dir, 'manual.mp4'),
-      filename: 'manual.mp4',
+      sourceUrl: 'https://www.tiktok.com/@openai/video/shared-video',
+      filePath: path.join(dir, 'shared.mp4'),
+      filename: 'shared.mp4',
       sizeBytes: 1,
     }, 1000);
-    const monitorFileId = store.createFileRecord({
-      username: 'openai',
-      sourceUrl: 'https://www.tiktok.com/@openai/video/2',
-      filePath: path.join(dir, 'monitor.mp4'),
-      filename: 'monitor.mp4',
-      sizeBytes: 2,
+    const manualJobId = store.createJob({
+      type: 'manual',
+      requestedBy: 'user-1',
+      sourceUrl: 'https://www.tiktok.com/@openai/video/shared-video',
     }, 1000);
     const monitorJobId = store.createJob({
       type: 'monitor',
-      username: 'openai',
-      sourceUrl: 'https://www.tiktok.com/@openai/video/2',
+      sourceUrl: 'https://www.tiktok.com/@openai/video/shared-video',
     }, 1000);
-    store.updateJob(monitorJobId, { file_id: monitorFileId }, 1000);
-    store.createLinkToken({ token: 'manual-token', fileId: manualFileId, expiresAt: 2000 }, 1000);
-    store.createLinkToken({ token: 'monitor-token', fileId: monitorFileId, expiresAt: 2000 }, 1000);
+    store.updateJob(manualJobId, { file_id: fileId }, 1000);
+    store.updateJob(monitorJobId, { file_id: fileId }, 1000);
+    store.createLinkToken({
+      token: 'manual-token',
+      fileId,
+      jobId: manualJobId,
+      ownerId: 'user-1',
+      expiresAt: 20_000,
+    }, 1000);
+    store.createLinkToken({
+      token: 'monitor-token',
+      fileId,
+      jobId: monitorJobId,
+      scopeId: 'guild:guild-1',
+      deliveryType: 'monitor',
+      expiresAt: 0,
+    }, 1000);
+    store.extendLinkToken('manual-token', 30_000, 5_000);
+    const extendedExpiry = store.getToken('manual-token').expires_at;
 
-    assert.equal(store.setMonitorLinkTokensPermanent(), 1);
-    assert.equal(store.getToken('manual-token').expires_at, 2000);
-    assert.equal(store.getToken('monitor-token').expires_at, 0);
-  } finally {
     store.close();
-    await rm(dir, { recursive: true, force: true });
-  }
-});
+    store = createStore(dbPath);
 
-test('store caps existing temporary link TTL without changing permanent links', async () => {
-  const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-cap-ttl-'));
-  const store = createStore(path.join(dir, 'state.db'));
-  try {
-    const fileId = store.createFileRecord({
-      requestedBy: 'user-1',
-      username: 'openai',
-      sourceUrl: 'https://www.tiktok.com/@openai/video/1',
-      filePath: path.join(dir, 'video.mp4'),
-      filename: 'video.mp4',
-      sizeBytes: 1,
-    }, 1000);
-    store.createLinkToken({ token: 'long-temp', fileId, expiresAt: 15 * 24 * 60 * 60 * 1000 }, 2000);
-    store.createLinkToken({ token: 'short-temp', fileId, expiresAt: 5000 }, 2000);
-    store.createLinkToken({ token: 'permanent', fileId, expiresAt: 0 }, 2000);
-
-    assert.equal(store.capTemporaryLinkTokenTtl(30 * 60 * 1000), 1);
-    assert.equal(store.getToken('long-temp').expires_at, 2000 + 30 * 60 * 1000);
-    assert.equal(store.getToken('short-temp').expires_at, 5000);
-    assert.equal(store.getToken('permanent').expires_at, 0);
+    assert.equal(store.getToken('manual-token').expires_at, extendedExpiry);
+    assert.equal(store.getToken('monitor-token').expires_at, 0);
+    assert.equal(store.getToken('manual-token').owner_id, 'user-1');
+    assert.equal(store.listPurgePlan({ requestedBy: 'user-1', now: 6_000 }).length, 0);
+    assert.deepEqual(store.purgeDownloads({ requestedBy: 'user-1', now: 6_000 }), { files: 0, links: 1, jobs: 1 });
+    assert.equal(store.getToken('monitor-token').file_id ?? store.getToken('monitor-token').id, fileId);
+    assert.equal(store.stats().fileCount, 1);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -679,12 +787,25 @@ test('message handler ignores bot, webhook, system, and own messages', () => {
   assert.equal(shouldIgnoreMessage({ author: { id: 'user-1', bot: false }, client: { user: { id: 'bot-1' } } }), false);
 });
 
+test('watch controls require an owner, manager permission, or configured role', () => {
+  assert.equal(canManageWatches({ user: { id: 'owner' } }, { discordOwnerId: 'owner' }), true);
+  assert.equal(canManageWatches({ guildId: 'guild', memberPermissions: { has: () => true } }, {}), true);
+  assert.equal(canManageWatches({
+    guildId: 'guild',
+    memberPermissions: { has: () => false },
+    member: { roles: { cache: { has: (roleId) => roleId === 'watch-role' } } },
+  }, { watchManagerRoleId: 'watch-role' }), true);
+  assert.equal(canManageWatches({ guildId: 'guild', memberPermissions: { has: () => false } }, {}), false);
+  assert.equal(canManageWatches({ user: { id: 'not-owner' } }, { discordOwnerId: 'owner' }), false);
+});
+
 test('link button actions create, extend, and persist links', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-buttons-'));
   const store = createStore(path.join(dir, 'state.db'));
   try {
     const fileId = store.createFileRecord({
       videoId: 'v1',
+      requestedBy: 'user-1',
       username: 'openai',
       sourceUrl: 'https://www.tiktok.com/@openai/video/v1',
       filePath: path.join(dir, 'video.mp4'),
@@ -694,8 +815,9 @@ test('link button actions create, extend, and persist links', async () => {
     store.createLinkToken({ token: 'tok', fileId, expiresAt: 2000 }, 1000);
 
     const replies = [];
-    const makeInteraction = (customId) => ({
+    const makeInteraction = (customId, userId = 'user-1') => ({
       customId,
+      user: { id: userId },
       reply: async (payload) => replies.push(payload),
     });
     const config = { publicBaseUrl: 'https://example.com', downloadLinkTtlMinutes: 30 };
@@ -714,6 +836,9 @@ test('link button actions create, extend, and persist links', async () => {
     assert.ok(newToken.expires_at >= beforeNew + 30 * 60 * 1000);
     assert.ok(newToken.expires_at < beforeNew + 31 * 60 * 1000);
     assert.equal(replies.length, 3);
+
+    await handleLinkButton({ interaction: makeInteraction('link:permanent:tok', 'user-2'), config, store });
+    assert.equal(replies.at(-1).embeds[0].data.title, 'Permission Required');
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });

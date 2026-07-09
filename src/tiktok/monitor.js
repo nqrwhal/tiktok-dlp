@@ -5,6 +5,9 @@ const DEFAULT_SCAN_LIMIT = 5;
 const DEFAULT_BURST_SCAN_LIMIT = 20;
 const DEFAULT_CHECK_CONCURRENCY = 2;
 const DEFAULT_DOWNLOAD_CONCURRENCY = 1;
+const DEFAULT_DELETION_CHECK_CONCURRENCY = 2;
+const DEFAULT_DELETION_CHECK_BATCH_SIZE = 25;
+const DEFAULT_DELETION_CHECK_LEASE_MS = 10 * 60 * 1000;
 const DEFAULT_BACKOFF_BASE_MS = 60 * 1000;
 const DEFAULT_BACKOFF_MAX_MS = 60 * 60 * 1000;
 const DELETION_CHECK_DELAYS_MS = [
@@ -266,6 +269,9 @@ export class TikTokMonitor {
     burstScanLimit = DEFAULT_BURST_SCAN_LIMIT,
     checkConcurrency = DEFAULT_CHECK_CONCURRENCY,
     downloadConcurrency = DEFAULT_DOWNLOAD_CONCURRENCY,
+    deletionCheckConcurrency = DEFAULT_DELETION_CHECK_CONCURRENCY,
+    deletionCheckBatchSize = DEFAULT_DELETION_CHECK_BATCH_SIZE,
+    deletionCheckLeaseMs = DEFAULT_DELETION_CHECK_LEASE_MS,
     backoffBaseMs = DEFAULT_BACKOFF_BASE_MS,
     backoffMaxMs = DEFAULT_BACKOFF_MAX_MS,
     now = () => Date.now(),
@@ -285,6 +291,9 @@ export class TikTokMonitor {
     this.burstScanLimit = Math.max(this.scanLimit, Number(burstScanLimit) || DEFAULT_BURST_SCAN_LIMIT);
     this.checkConcurrency = Math.max(1, Number(checkConcurrency) || DEFAULT_CHECK_CONCURRENCY);
     this.downloadConcurrency = Math.max(1, Number(downloadConcurrency) || DEFAULT_DOWNLOAD_CONCURRENCY);
+    this.deletionCheckConcurrency = Math.max(1, Number(deletionCheckConcurrency) || DEFAULT_DELETION_CHECK_CONCURRENCY);
+    this.deletionCheckBatchSize = Math.max(1, Number(deletionCheckBatchSize) || DEFAULT_DELETION_CHECK_BATCH_SIZE);
+    this.deletionCheckLeaseMs = Math.max(1, Number(deletionCheckLeaseMs) || DEFAULT_DELETION_CHECK_LEASE_MS);
     this.backoffBaseMs = backoffBaseMs;
     this.backoffMaxMs = backoffMaxMs;
     this.now = now;
@@ -306,6 +315,9 @@ export class TikTokMonitor {
   #downloadQueue = [];
   #activeDownloads = 0;
   #pendingDownloadIds = new Set();
+  #deletionQueue = [];
+  #activeDeletionChecks = 0;
+  #pendingDeletionIds = new Set();
   #runOncePromise = null;
   #metrics = {
     cycles: 0,
@@ -349,13 +361,13 @@ export class TikTokMonitor {
     }
   }
 
-  async #runOnceInternal({ waitForDownloads = false } = {}) {
+  async #runOnceInternal({ waitForDownloads = false, waitForDeletionChecks = false } = {}) {
     const cycleStartedAt = this.now();
     this.#lastPollAt = cycleStartedAt;
     this.#metrics.cycles += 1;
     this.#metrics.lastCycleStartedAt = cycleStartedAt;
     const watches = await Promise.resolve(this.store.listWatches());
-    await this.#runDeletionChecks();
+    const deletionPromises = await this.#queueDeletionChecks();
     const summary = {
       watchedUsers: 0,
       skippedUsers: 0,
@@ -392,6 +404,9 @@ export class TikTokMonitor {
         summary.downloadedVideos += result.value?.downloaded ? 1 : 0;
         summary.alertedVideos += result.value?.alerted ? 1 : 0;
       }
+    }
+    if (waitForDeletionChecks && deletionPromises.length) {
+      await Promise.allSettled(deletionPromises);
     }
 
     const cycleFinishedAt = this.now();
@@ -706,46 +721,89 @@ export class TikTokMonitor {
     }
   }
 
-  async #runDeletionChecks() {
-    if (!this.#checkVideoAvailable || typeof this.store.listVideosDueForDeletionCheck !== 'function') return;
+  async #queueDeletionChecks() {
+    if (!this.#checkVideoAvailable || typeof this.store.listVideosDueForDeletionCheck !== 'function') return [];
     const now = this.now();
-    const due = await Promise.resolve(this.store.listVideosDueForDeletionCheck(now, 25));
+    const claim = this.store.claimVideosDueForDeletionCheck?.bind(this.store)
+      ?? this.store.listVideosDueForDeletionCheck.bind(this.store);
+    const due = await Promise.resolve(claim(now, this.deletionCheckBatchSize, this.deletionCheckLeaseMs));
+    const promises = [];
     for (const video of due ?? []) {
-      try {
-        if (resolveVideoMediaType(video) === 'story') {
-          await Promise.resolve(this.store.markVideoStillAvailable?.(video.video_id, null, now));
-          continue;
-        }
+      const promise = this.#enqueueDeletionCheck(video);
+      if (promise) promises.push(promise);
+    }
+    return promises;
+  }
 
-        const result = await Promise.resolve(this.#checkVideoAvailable(video));
-        if (result?.available === false) {
-          const deleted = await Promise.resolve(this.store.markVideoDeleted?.(video.video_id, now)) ?? video;
-          await Promise.resolve(this.deletionAlert({
-            video: { ...video, ...deleted },
-            reason: result.reason || result.message || 'The post is no longer publicly available.',
-          }));
-          continue;
-        }
+  #enqueueDeletionCheck(video) {
+    const videoId = String(video?.video_id ?? video?.id ?? '');
+    if (!videoId || this.#pendingDeletionIds.has(videoId)) return null;
+    this.#pendingDeletionIds.add(videoId);
+    let resolvePromise;
+    let rejectPromise;
+    const promise = new Promise((resolve, reject) => {
+      resolvePromise = resolve;
+      rejectPromise = reject;
+    });
+    promise.catch(() => {});
+    this.#deletionQueue.push({ video, videoId, resolvePromise, rejectPromise });
+    this.#drainDeletionQueue();
+    return promise;
+  }
 
-        const completedChecks = Number(video.deletion_check_count ?? 0) + 1;
-        await Promise.resolve(
-          this.store.markVideoStillAvailable?.(
-            video.video_id,
-            now + nextDeletionCheckDelayMs(completedChecks),
-            now,
-          ),
-        );
-      } catch (error) {
-        await Promise.resolve(this.store.postponeVideoDeletionCheck?.(video.video_id, now + 5 * 60 * 1000, now));
-        this.logger?.warn?.(`Deletion check failed for ${video.video_id}: ${error instanceof Error ? error.message : String(error)}`);
+  #drainDeletionQueue() {
+    while (this.#activeDeletionChecks < this.deletionCheckConcurrency && this.#deletionQueue.length) {
+      const task = this.#deletionQueue.shift();
+      this.#activeDeletionChecks += 1;
+      void this.#runDeletionCheck(task.video)
+        .then(task.resolvePromise, task.rejectPromise)
+        .finally(() => {
+          this.#activeDeletionChecks -= 1;
+          this.#pendingDeletionIds.delete(task.videoId);
+          this.#drainDeletionQueue();
+        });
+    }
+  }
+
+  async #runDeletionCheck(video) {
+    const now = this.now();
+    try {
+      if (resolveVideoMediaType(video) === 'story') {
+        await Promise.resolve(this.store.markVideoStillAvailable?.(video.video_id, null, now));
+        return;
       }
+
+      const result = await Promise.resolve(this.#checkVideoAvailable(video));
+      if (result?.available === false) {
+        const deleted = await Promise.resolve(this.store.markVideoDeleted?.(video.video_id, now)) ?? video;
+        await Promise.resolve(this.deletionAlert({
+          video: { ...video, ...deleted },
+          reason: result.reason || result.message || 'The post is no longer publicly available.',
+        }));
+        return;
+      }
+
+      const completedChecks = Number(video.deletion_check_count ?? 0) + 1;
+      await Promise.resolve(
+        this.store.markVideoStillAvailable?.(
+          video.video_id,
+          now + nextDeletionCheckDelayMs(completedChecks),
+          now,
+        ),
+      );
+    } catch (error) {
+      await Promise.resolve(this.store.postponeVideoDeletionCheck?.(video.video_id, now + 5 * 60 * 1000, now));
+      this.logger?.warn?.(`Deletion check failed for ${video.video_id}: ${error instanceof Error ? error.message : String(error)}`);
+      throw error;
     }
   }
 
   async pollUsername(username, { force = false } = {}) {
     const normalized = normalizeWatchedUser(username);
-    const watch = await Promise.resolve(this.store.getWatch?.(normalized.username))
-      ?? { username: normalized.username, channel_id: '', failure_count: 0 };
+    const watch = await Promise.resolve(this.store.getWatch?.(normalized.username));
+    if (!watch) {
+      throw new Error(`@${normalized.username} is not registered as a watch.`);
+    }
     const originalListWatches = this.store.listWatches?.bind(this.store);
     if (!originalListWatches) throw new Error('Store must provide listWatches().');
     while (this.#runOncePromise) {
@@ -777,12 +835,21 @@ export class TikTokMonitor {
       queueLength: this.#downloadQueue.length,
       activeDownloads: this.#activeDownloads,
       pendingDownloads: this.#pendingDownloadIds.size,
+      deletionCheckConcurrency: this.deletionCheckConcurrency,
+      deletionQueueLength: this.#deletionQueue.length,
+      activeDeletionChecks: this.#activeDeletionChecks,
+      pendingDeletionChecks: this.#pendingDeletionIds.size,
       metrics: { ...this.#metrics },
     };
   }
 
   async waitForIdle() {
-    while (this.#activeDownloads > 0 || this.#downloadQueue.length > 0) {
+    while (
+      this.#activeDownloads > 0
+      || this.#downloadQueue.length > 0
+      || this.#activeDeletionChecks > 0
+      || this.#deletionQueue.length > 0
+    ) {
       await this.sleep(10);
     }
   }

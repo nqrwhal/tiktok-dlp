@@ -5,7 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { loadConfig } from '../src/config.js';
-import { startHttpServer, resolveDownloadPath } from '../src/http/server.js';
+import { parseRangeHeader, startHttpServer, resolveDownloadPath } from '../src/http/server.js';
 import { Store } from '../src/state/store.js';
 
 test('resolveDownloadPath keeps files inside the download directory', () => {
@@ -15,7 +15,14 @@ test('resolveDownloadPath keeps files inside the download directory', () => {
   assert.equal(resolveDownloadPath(downloadDir, path.join(downloadDir, 'nested', '..', 'clip.mp4')), path.join(downloadDir, 'clip.mp4'));
 });
 
-test('serves files only for valid tokens and reports health stats', async (t) => {
+test('parseRangeHeader accepts bounded and suffix byte ranges', () => {
+  assert.deepEqual(parseRangeHeader('bytes=2-4', 10), { start: 2, end: 4 });
+  assert.deepEqual(parseRangeHeader('bytes=-3', 10), { start: 7, end: 9 });
+  assert.deepEqual(parseRangeHeader('bytes=8-', 10), { start: 8, end: 9 });
+  assert.deepEqual(parseRangeHeader('bytes=20-25', 10), { invalid: true });
+});
+
+test('serves files only for valid tokens with private health, HEAD, and Range support', async (t) => {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-http-'));
   const downloadDir = path.join(rootDir, 'downloads');
   const dbPath = path.join(rootDir, 'state.db');
@@ -85,14 +92,29 @@ test('serves files only for valid tokens and reports health stats', async (t) =>
   assert.equal(healthResponse.status, 200);
   assert.equal(healthResponse.headers.get('content-type'), 'application/json; charset=utf-8');
   const health = await healthResponse.json();
-  assert.equal(health.status, 'ok');
-  assert.equal(health.stats.fileCount, 3);
-  assert.equal(health.stats.watchCount, 0);
+  assert.deepEqual(health, { status: 'ok' });
+
+  const healthHeadResponse = await fetch(`${baseUrl}/health`, { method: 'HEAD' });
+  assert.equal(healthHeadResponse.status, 200);
+  assert.equal(await healthHeadResponse.text(), '');
 
   const fileResponse = await fetch(`${baseUrl}/files/valid-token`);
   assert.equal(fileResponse.status, 200);
   assert.match(fileResponse.headers.get('content-disposition') ?? '', /attachment; filename="greeting.txt"/);
   assert.equal(await fileResponse.text(), 'hello from inside\n');
+
+  const headResponse = await fetch(`${baseUrl}/files/valid-token`, { method: 'HEAD' });
+  assert.equal(headResponse.status, 200);
+  assert.equal(headResponse.headers.get('content-length'), String(Buffer.byteLength('hello from inside\n')));
+  assert.equal(await headResponse.text(), '');
+
+  const rangeResponse = await fetch(`${baseUrl}/files/valid-token`, { headers: { Range: 'bytes=6-9' } });
+  assert.equal(rangeResponse.status, 206);
+  assert.equal(rangeResponse.headers.get('content-range'), 'bytes 6-9/18');
+  assert.equal(await rangeResponse.text(), 'from');
+
+  const invalidRangeResponse = await fetch(`${baseUrl}/files/valid-token`, { headers: { Range: 'bytes=99-100' } });
+  assert.equal(invalidRangeResponse.status, 416);
 
   const missingResponse = await fetch(`${baseUrl}/files/missing-token`);
   assert.equal(missingResponse.status, 404);

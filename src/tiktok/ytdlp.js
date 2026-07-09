@@ -1,5 +1,8 @@
 import { spawn as defaultSpawn } from 'node:child_process';
-import { mkdir, mkdtemp, readdir, stat, writeFile } from 'node:fs/promises';
+import { createReadStream, createWriteStream } from 'node:fs';
+import { mkdir, mkdtemp, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { once } from 'node:events';
+import { Readable } from 'node:stream';
 import os from 'node:os';
 import path from 'node:path';
 import { fileSize, isTikTokUrl, makeDownloadLayout, moveDirectoryContents, pickPrimaryVideo, profileUrl as makeProfileUrl, storyUrl as makeStoryUrl, slugify } from '../util/files.js';
@@ -81,6 +84,8 @@ export function buildDownloadArgs(sourceUrl, options = {}) {
     replaceArgValue(args, '--fragment-retries', String(options.ytdlpRetries));
     replaceArgValue(args, '--extractor-retries', String(options.ytdlpRetries));
   }
+  const maxBytes = normalizePositiveInt(options.maxMediaDownloadBytes);
+  if (maxBytes) args.push('--max-filesize', String(maxBytes));
   if (Array.isArray(options.extraArgs)) args.push(...options.extraArgs.map(String));
   args.push(String(sourceUrl));
   return args;
@@ -197,72 +202,78 @@ export async function downloadVideo(sourceUrl, options = {}) {
   const tempDir = options.outputDir
     ? path.resolve(options.outputDir)
     : await makeTempDownloadDir(tempParent);
+  const ownsTempDir = !options.outputDir;
 
-  await ensureTempDir(tempDir);
-
-  if (isPhotoPostMetadata(metadata)) {
-    return downloadPhotoPost(sourceUrl, metadata, tempDir, options);
-  }
-
-  if (isStoryMetadata(metadata)) {
-    return downloadStoryPost(sourceUrl, metadata, tempDir, options);
-  }
-
-  let stdout = '';
-  let stderr = '';
   try {
-    const result = await runYtDlp(ytdlpPath, buildDownloadArgs(sourceUrl, {
-      ...options,
-      outputDir: tempDir,
-    }), options);
-    stdout = result.stdout;
-    stderr = result.stderr;
-  } catch (error) {
-    if (!shouldTryPhotoFallback(sourceUrl, error, options)) throw error;
-    return downloadPhotoPost(sourceUrl, await fetchPhotoPostMetadata(sourceUrl, options), tempDir, options);
-  }
+    await ensureTempDir(tempDir);
 
-  let downloadDir = tempDir;
-  let files = await collectFiles(tempDir);
-  if (!files.length) {
-    throw Object.assign(new Error('yt-dlp completed without producing any files.'), {
-      kind: 'no_files',
+    if (isPhotoPostMetadata(metadata)) {
+      return await downloadPhotoPost(sourceUrl, metadata, tempDir, options);
+    }
+
+    if (isStoryMetadata(metadata)) {
+      return await downloadStoryPost(sourceUrl, metadata, tempDir, options);
+    }
+
+    let stdout = '';
+    let stderr = '';
+    try {
+      const result = await runYtDlp(ytdlpPath, buildDownloadArgs(sourceUrl, {
+        ...options,
+        outputDir: tempDir,
+      }), options);
+      stdout = result.stdout;
+      stderr = result.stderr;
+    } catch (error) {
+      if (!shouldTryPhotoFallback(sourceUrl, error, options)) throw error;
+      return await downloadPhotoPost(sourceUrl, await fetchPhotoPostMetadata(sourceUrl, options), tempDir, options);
+    }
+
+    let downloadDir = tempDir;
+    let files = await collectFiles(tempDir);
+    if (!files.length) {
+      throw Object.assign(new Error('yt-dlp completed without producing any files.'), {
+        kind: 'no_files',
+        sourceUrl: String(sourceUrl),
+        downloadDir: tempDir,
+        stdout,
+        stderr,
+      });
+    }
+
+    const normalized = normalizeMetadata(metadata, sourceUrl);
+    if (options.downloadDir) {
+      const layout = makeDownloadLayout({ downloadDir: options.downloadDir }, normalized);
+      downloadDir = layout.dir;
+      files = await moveDirectoryContents(tempDir, downloadDir);
+    }
+
+    const primaryFile = pickPrimaryVideo(files) || pickPrimaryFile(files);
+    const sizeBytes = primaryFile ? await fileSize(primaryFile) : 0;
+
+    return {
       sourceUrl: String(sourceUrl),
-      downloadDir: tempDir,
+      metadata: normalized,
+      downloadDir,
+      files,
+      primaryFile,
+      filePath: primaryFile,
+      filename: primaryFile ? path.basename(primaryFile) : '',
+      sizeBytes,
+      videoId: normalized.videoId || normalized.id || '',
+      username: normalized.uploader || '',
+      title: normalized.title || '',
+      description: normalized.description || '',
+      thumbnailUrl: normalized.thumbnail || '',
+      mediaType: normalized.mediaType || '',
+      duration: numberOrNull(normalized.duration) ?? 0,
       stdout,
       stderr,
-    });
+    };
+  } catch (error) {
+    if (ownsTempDir) await rm(tempDir, { recursive: true, force: true });
+    throw error;
   }
-
-  const normalized = normalizeMetadata(metadata, sourceUrl);
-  if (options.downloadDir) {
-    const layout = makeDownloadLayout({ downloadDir: options.downloadDir }, normalized);
-    downloadDir = layout.dir;
-    files = await moveDirectoryContents(tempDir, downloadDir);
-  }
-
-  const primaryFile = pickPrimaryVideo(files) || pickPrimaryFile(files);
-  const sizeBytes = primaryFile ? await fileSize(primaryFile) : 0;
-
-  return {
-    sourceUrl: String(sourceUrl),
-    metadata: normalized,
-    downloadDir,
-    files,
-    primaryFile,
-    filePath: primaryFile,
-    filename: primaryFile ? path.basename(primaryFile) : '',
-    sizeBytes,
-    videoId: normalized.videoId || normalized.id || '',
-    username: normalized.uploader || '',
-    title: normalized.title || '',
-    description: normalized.description || '',
-    thumbnailUrl: normalized.thumbnail || '',
-    mediaType: normalized.mediaType || '',
-    duration: numberOrNull(normalized.duration) ?? 0,
-    stdout,
-    stderr,
-  };
 }
 
 export async function fetchPhotoPostMetadata(sourceUrl, options = {}) {
@@ -271,19 +282,22 @@ export async function fetchPhotoPostMetadata(sourceUrl, options = {}) {
     throw new Error('Fetch API is not available for TikTok photo fallback.');
   }
 
-  const response = await fetchImpl(String(sourceUrl), {
-    redirect: 'follow',
+  const maxMetadataBytes = positiveOrDefault(options.maxPhotoMetadataBytes, 10 * 1024 * 1024);
+  const response = await fetchWithLimits(sourceUrl, fetchImpl, {
+    timeoutMs: fetchTimeoutMs(options),
+    maxBytes: maxMetadataBytes,
+    label: 'TikTok photo metadata',
     headers: {
       'user-agent': MOBILE_USER_AGENT,
       'accept-language': 'en-US,en;q=0.9',
       accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     },
   });
-  if (!response?.ok) {
-    throw new Error(`TikTok photo metadata request failed with status ${response?.status ?? 'unknown'}.`);
-  }
-
-  const html = await response.text();
+  const html = await readResponseText(response, {
+    maxBytes: maxMetadataBytes,
+    timeoutMs: fetchTimeoutMs(options),
+    label: 'TikTok photo metadata',
+  });
   return parsePhotoPostMetadata(html, response.url || sourceUrl);
 }
 
@@ -400,7 +414,7 @@ export function classifyYtdlpError(error) {
 
 async function runYtDlp(executable, args, options = {}) {
   const spawnImpl = options.spawnImpl ?? defaultSpawn;
-  const timeoutMs = Number(options.timeoutMs ?? 120000);
+  const timeoutMs = Number(options.timeoutMs ?? options.ytdlpTimeoutMs ?? 120000);
 
   return new Promise((resolve, reject) => {
     let timeout = null;
@@ -752,13 +766,49 @@ async function downloadPhotoPost(sourceUrl, metadata, tempDir, options = {}) {
   }
 
   const normalized = normalizeMetadata(metadata, sourceUrl);
+  const imageUrls = Array.isArray(metadata.imageUrls) ? metadata.imageUrls.filter(Boolean) : [];
+  const maxImages = positiveOrDefault(options.maxSlideshowImages, 35);
+  const maxItemBytes = positiveOrDefault(options.maxSlideshowItemBytes, 20 * 1024 * 1024);
+  const maxTotalBytes = positiveOrDefault(options.maxSlideshowTotalBytes, 250 * 1024 * 1024);
+  if (!imageUrls.length) {
+    throw Object.assign(new Error('TikTok photo post did not include downloadable images.'), { kind: 'photo_images_not_found' });
+  }
+  if (imageUrls.length > maxImages) {
+    throw Object.assign(new Error(`TikTok slideshow has ${imageUrls.length} images, exceeding the configured limit of ${maxImages}.`), {
+      kind: 'slideshow_image_limit',
+    });
+  }
+
+  const imageDir = path.join(tempDir, '.images');
+  await mkdir(imageDir, { recursive: true });
   const imageEntries = [];
-  for (const [index, imageUrl] of metadata.imageUrls.entries()) {
-    const image = await fetchImage(imageUrl, fetchImpl);
-    const filename = `${String(index + 1).padStart(3, '0')}.${image.extension}`;
+  let totalImageBytes = 0;
+  for (const [index, imageUrl] of imageUrls.entries()) {
+    const response = await fetchWithLimits(imageUrl, fetchImpl, {
+      timeoutMs: fetchTimeoutMs(options),
+      maxBytes: maxItemBytes,
+      headers: {
+        'user-agent': MOBILE_USER_AGENT,
+        accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+      },
+    });
+    const contentType = String(response.headers?.get?.('content-type') ?? '');
+    const filename = `${String(index + 1).padStart(3, '0')}.${extensionFromContentType(contentType) || extensionFromUrl(response.url || imageUrl) || 'jpg'}`;
+    const filePath = path.join(imageDir, filename);
+    const size = await writeResponseToFile(response, filePath, {
+      maxBytes: maxItemBytes,
+      timeoutMs: fetchTimeoutMs(options),
+    });
+    totalImageBytes += size;
+    if (totalImageBytes > maxTotalBytes) {
+      throw Object.assign(new Error(`TikTok slideshow exceeds the configured total size limit of ${formatByteLimit(maxTotalBytes)}.`), {
+        kind: 'slideshow_total_limit',
+      });
+    }
     imageEntries.push({
       name: filename,
-      data: image.data,
+      filePath,
+      size,
     });
   }
 
@@ -768,12 +818,9 @@ async function downloadPhotoPost(sourceUrl, metadata, tempDir, options = {}) {
   const zipPath = path.join(tempDir, zipFilename);
   const infoJson = `${videoId}.info.json`;
   const descriptionFile = `${videoId}.description`;
-  const galleryImageEntries = options.keepSlideshowImages && imageEntries.length <= 10
-    ? imageEntries.map((entry) => ({
-        ...entry,
-        name: `${zipBase}__${entry.name}`,
-      }))
-    : [];
+  const infoPath = path.join(tempDir, infoJson);
+  const manifestPath = path.join(tempDir, 'manifest.json');
+  const descriptionPath = path.join(tempDir, descriptionFile);
   const manifest = {
     id: videoId,
     sourceUrl: String(sourceUrl),
@@ -783,28 +830,27 @@ async function downloadPhotoPost(sourceUrl, metadata, tempDir, options = {}) {
     images: imageEntries.map((entry) => entry.name),
   };
 
+  await writeFile(infoPath, JSON.stringify(metadata, null, 2));
+  await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
+  if (normalized.description) {
+    await writeFile(descriptionPath, String(normalized.description));
+  }
   await createZipFile(zipPath, [
     ...imageEntries,
-    {
-      name: infoJson,
-      data: Buffer.from(JSON.stringify({ ...metadata, imageUrls: metadata.imageUrls }, null, 2)),
-    },
-    {
-      name: 'manifest.json',
-      data: Buffer.from(JSON.stringify(manifest, null, 2)),
-    },
-    ...(normalized.description ? [{
-      name: descriptionFile,
-      data: Buffer.from(String(normalized.description)),
-    }] : []),
+    { name: infoJson, filePath: infoPath },
+    { name: 'manifest.json', filePath: manifestPath },
+    ...(normalized.description ? [{ name: descriptionFile, filePath: descriptionPath }] : []),
   ]);
-  await writeFile(path.join(tempDir, infoJson), JSON.stringify(metadata, null, 2));
-  if (normalized.description) {
-    await writeFile(path.join(tempDir, descriptionFile), String(normalized.description));
+
+  const galleryImageNames = new Set();
+  if (options.keepSlideshowImages && imageEntries.length <= 10) {
+    for (const entry of imageEntries) {
+      const galleryName = `${zipBase}__${entry.name}`;
+      await rename(entry.filePath, path.join(tempDir, galleryName));
+      galleryImageNames.add(galleryName);
+    }
   }
-  for (const entry of galleryImageEntries) {
-    await writeFile(path.join(tempDir, entry.name), entry.data);
-  }
+  await rm(imageDir, { recursive: true, force: true });
 
   let downloadDir = tempDir;
   let files = await collectFiles(tempDir);
@@ -815,7 +861,6 @@ async function downloadPhotoPost(sourceUrl, metadata, tempDir, options = {}) {
   }
 
   const primaryFile = pickPrimaryFile(files);
-  const galleryImageNames = new Set(galleryImageEntries.map((entry) => entry.name));
   const slideshowImagePaths = files
     .filter((file) => galleryImageNames.has(path.basename(file)))
     .sort();
@@ -865,17 +910,16 @@ async function downloadStoryPost(sourceUrl, metadata, tempDir, options = {}) {
     });
   }
 
-  const response = await fetchImpl(directVideoUrl, {
-    redirect: 'follow',
+  const response = await fetchWithLimits(directVideoUrl, fetchImpl, {
+    timeoutMs: fetchTimeoutMs(options),
+    maxBytes: positiveOrDefault(options.maxMediaDownloadBytes, 2 * 1024 * 1024 * 1024),
     headers: {
       'user-agent': MOBILE_USER_AGENT,
       accept: 'video/mp4,video/*,*/*',
       referer: normalized.webpageUrl || String(sourceUrl),
     },
+    label: 'TikTok story video',
   });
-  if (!response?.ok) {
-    throw new Error(`TikTok story video request failed with status ${response?.status ?? 'unknown'}.`);
-  }
 
   const videoId = normalized.videoId || normalized.id || 'story';
   const contentType = String(response.headers?.get?.('content-type') ?? '');
@@ -883,7 +927,10 @@ async function downloadStoryPost(sourceUrl, metadata, tempDir, options = {}) {
   const videoPath = path.join(tempDir, `${slugify(videoId, 'story')}.${extension}`);
   const infoJson = `${videoId}.info.json`;
   const descriptionFile = `${videoId}.description`;
-  await writeFile(videoPath, Buffer.from(await response.arrayBuffer()));
+  await writeResponseToFile(response, videoPath, {
+    maxBytes: positiveOrDefault(options.maxMediaDownloadBytes, 2 * 1024 * 1024 * 1024),
+    timeoutMs: fetchTimeoutMs(options),
+  });
   await writeFile(path.join(tempDir, infoJson), JSON.stringify(metadata, null, 2));
   if (normalized.description) {
     await writeFile(path.join(tempDir, descriptionFile), String(normalized.description));
@@ -1105,22 +1152,159 @@ function findProfileUser(value) {
   return null;
 }
 
-async function fetchImage(url, fetchImpl) {
-  const response = await fetchImpl(String(url), {
-    redirect: 'follow',
-    headers: {
-      'user-agent': MOBILE_USER_AGENT,
-      accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-    },
-  });
-  if (!response?.ok) {
-    throw new Error(`TikTok image request failed with status ${response?.status ?? 'unknown'}.`);
+async function fetchWithLimits(url, fetchImpl, {
+  timeoutMs = 30_000,
+  maxBytes = 20 * 1024 * 1024,
+  headers = {},
+  label = 'TikTok media',
+} = {}) {
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  const timer = controller && timeoutMs > 0
+    ? setTimeout(() => controller.abort(), timeoutMs)
+    : null;
+  try {
+    const response = await fetchImpl(String(url), {
+      redirect: 'follow',
+      headers,
+      ...(controller ? { signal: controller.signal } : {}),
+    });
+    if (!response?.ok) {
+      throw new Error(`${label} request failed with status ${response?.status ?? 'unknown'}.`);
+    }
+    const contentLength = Number(response.headers?.get?.('content-length') ?? 0);
+    if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+      throw Object.assign(new Error(`${label} exceeds the configured size limit of ${formatByteLimit(maxBytes)}.`), {
+        kind: 'media_size_limit',
+      });
+    }
+    return response;
+  } catch (error) {
+    if (controller?.signal?.aborted) {
+      throw Object.assign(new Error(`${label} request timed out.`), { kind: 'fetch_timeout', cause: error });
+    }
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
-  const contentType = String(response.headers?.get?.('content-type') ?? '');
-  return {
-    data: Buffer.from(await response.arrayBuffer()),
-    extension: extensionFromContentType(contentType) || extensionFromUrl(response.url || url) || 'jpg',
-  };
+}
+
+async function writeResponseToFile(response, filePath, { maxBytes, timeoutMs = 30_000 }) {
+  const limit = positiveOrDefault(maxBytes, 20 * 1024 * 1024);
+  const body = response?.body;
+  if (!body) {
+    const data = Buffer.from(await response.arrayBuffer());
+    if (data.length > limit) {
+      throw Object.assign(new Error(`Downloaded media exceeds the configured size limit of ${formatByteLimit(limit)}.`), {
+        kind: 'media_size_limit',
+      });
+    }
+    await writeFile(filePath, data);
+    return data.length;
+  }
+
+  const input = typeof body.getReader === 'function' ? Readable.fromWeb(body) : body;
+  if (!input || typeof input[Symbol.asyncIterator] !== 'function') {
+    const data = Buffer.from(await response.arrayBuffer());
+    if (data.length > limit) throw Object.assign(new Error(`Downloaded media exceeds the configured size limit of ${formatByteLimit(limit)}.`), { kind: 'media_size_limit' });
+    await writeFile(filePath, data);
+    return data.length;
+  }
+
+  const output = createWriteStream(filePath, { flags: 'wx' });
+  let bytes = 0;
+  const timeoutError = Object.assign(new Error('TikTok media download timed out.'), { kind: 'fetch_timeout' });
+  const timer = timeoutMs > 0
+    ? setTimeout(() => {
+        output.destroy(timeoutError);
+        input.destroy?.(timeoutError);
+      }, timeoutMs)
+    : null;
+  try {
+    for await (const chunk of input) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      bytes += buffer.length;
+      if (bytes > limit) {
+        throw Object.assign(new Error(`Downloaded media exceeds the configured size limit of ${formatByteLimit(limit)}.`), {
+          kind: 'media_size_limit',
+        });
+      }
+      await writeStreamChunk(output, buffer);
+    }
+    output.end();
+    await once(output, 'finish');
+    return bytes;
+  } catch (error) {
+    output.destroy();
+    await rm(filePath, { force: true }).catch(() => {});
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function readResponseText(response, { maxBytes, timeoutMs = 30_000, label = 'TikTok response' } = {}) {
+  const limit = positiveOrDefault(maxBytes, 10 * 1024 * 1024);
+  const body = response?.body;
+  if (!body) {
+    const text = typeof response?.text === 'function'
+      ? await response.text()
+      : Buffer.from(await response.arrayBuffer()).toString('utf8');
+    if (Buffer.byteLength(text) > limit) {
+      throw Object.assign(new Error(`${label} exceeds the configured size limit of ${formatByteLimit(limit)}.`), {
+        kind: 'media_size_limit',
+      });
+    }
+    return text;
+  }
+
+  const input = typeof body.getReader === 'function' ? Readable.fromWeb(body) : body;
+  if (!input || typeof input[Symbol.asyncIterator] !== 'function') {
+    const text = await response.text();
+    if (Buffer.byteLength(text) > limit) {
+      throw Object.assign(new Error(`${label} exceeds the configured size limit of ${formatByteLimit(limit)}.`), {
+        kind: 'media_size_limit',
+      });
+    }
+    return text;
+  }
+
+  const chunks = [];
+  let bytes = 0;
+  const timeoutError = Object.assign(new Error(`${label} request timed out.`), { kind: 'fetch_timeout' });
+  const timer = timeoutMs > 0
+    ? setTimeout(() => input.destroy?.(timeoutError), timeoutMs)
+    : null;
+  try {
+    for await (const chunk of input) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      bytes += buffer.length;
+      if (bytes > limit) {
+        throw Object.assign(new Error(`${label} exceeds the configured size limit of ${formatByteLimit(limit)}.`), {
+          kind: 'media_size_limit',
+        });
+      }
+      chunks.push(buffer);
+    }
+    return Buffer.concat(chunks, bytes).toString('utf8');
+  } finally {
+    if (timer) clearTimeout(timer);
+    input.destroy?.();
+  }
+}
+
+function fetchTimeoutMs(options = {}) {
+  return positiveOrDefault(options.fetchTimeoutSeconds, 30) * 1000;
+}
+
+function positiveOrDefault(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? Math.floor(number) : fallback;
+}
+
+function formatByteLimit(bytes) {
+  if (bytes >= 1024 * 1024 * 1024) return `${Math.round(bytes / (1024 * 1024 * 1024))} GiB`;
+  if (bytes >= 1024 * 1024) return `${Math.round(bytes / (1024 * 1024))} MiB`;
+  return `${bytes} bytes`;
 }
 
 function extensionFromContentType(contentType) {
@@ -1141,10 +1325,14 @@ function extensionFromVideoContentType(contentType) {
 }
 
 function extensionFromUrl(url) {
-  const pathname = new URL(String(url)).pathname;
-  const extension = path.extname(pathname).replace(/^\./, '').toLowerCase();
-  if (['jpg', 'jpeg', 'png', 'webp', 'gif', 'heic'].includes(extension)) {
-    return extension === 'jpeg' ? 'jpg' : extension;
+  try {
+    const pathname = new URL(String(url)).pathname;
+    const extension = path.extname(pathname).replace(/^\./, '').toLowerCase();
+    if (['jpg', 'jpeg', 'png', 'webp', 'gif', 'heic'].includes(extension)) {
+      return extension === 'jpeg' ? 'jpg' : extension;
+    }
+  } catch {
+    return '';
   }
   return '';
 }
@@ -1167,26 +1355,71 @@ function makePhotoUrl(username, id) {
 async function createZipFile(zipPath, entries) {
   const now = new Date();
   const centralDirectory = [];
-  const chunks = [];
   let offset = 0;
+  const output = createWriteStream(zipPath, { flags: 'wx' });
+  try {
+    for (const entry of entries) {
+      const descriptor = await describeZipEntry(entry);
+      const name = Buffer.from(entry.name);
+      const localHeader = makeZipLocalHeader({ name, size: descriptor.size, crc: descriptor.crc, date: now });
+      await writeStreamChunk(output, localHeader);
+      if (descriptor.filePath) await copyFileToStream(descriptor.filePath, output);
+      else await writeStreamChunk(output, descriptor.data);
+      centralDirectory.push(makeZipCentralDirectoryHeader({
+        name,
+        size: descriptor.size,
+        crc: descriptor.crc,
+        date: now,
+        offset,
+      }));
+      offset += localHeader.length + descriptor.size;
+    }
 
-  for (const entry of entries) {
-    const data = Buffer.isBuffer(entry.data) ? entry.data : Buffer.from(entry.data);
-    const name = Buffer.from(entry.name);
-    const crc = crc32(data);
-    const localHeader = makeZipLocalHeader({ name, data, crc, date: now });
-    chunks.push(localHeader, data);
-    centralDirectory.push(makeZipCentralDirectoryHeader({ name, data, crc, date: now, offset }));
-    offset += localHeader.length + data.length;
+    const centralDirectoryOffset = offset;
+    let centralDirectorySize = 0;
+    for (const entry of centralDirectory) {
+      centralDirectorySize += entry.length;
+      await writeStreamChunk(output, entry);
+    }
+    await writeStreamChunk(output, makeZipEndRecord(entries.length, centralDirectorySize, centralDirectoryOffset));
+    output.end();
+    await once(output, 'finish');
+  } catch (error) {
+    output.destroy();
+    await rm(zipPath, { force: true }).catch(() => {});
+    throw error;
   }
-
-  const centralDirectoryOffset = offset;
-  const centralDirectoryBuffer = Buffer.concat(centralDirectory);
-  const endRecord = makeZipEndRecord(entries.length, centralDirectoryBuffer.length, centralDirectoryOffset);
-  await writeFile(zipPath, Buffer.concat([...chunks, centralDirectoryBuffer, endRecord]));
 }
 
-function makeZipLocalHeader({ name, data, crc, date }) {
+async function describeZipEntry(entry) {
+  if (entry.filePath) {
+    const info = await stat(entry.filePath);
+    return { filePath: entry.filePath, size: info.size, crc: await crc32File(entry.filePath) };
+  }
+  const data = Buffer.isBuffer(entry.data) ? entry.data : Buffer.from(entry.data ?? '');
+  return { data, size: data.length, crc: crc32(data) };
+}
+
+async function copyFileToStream(filePath, output) {
+  for await (const chunk of createReadStream(filePath)) {
+    await writeStreamChunk(output, chunk);
+  }
+}
+
+async function writeStreamChunk(stream, chunk) {
+  if (stream.write(chunk)) return;
+  await once(stream, 'drain');
+}
+
+async function crc32File(filePath) {
+  let crc = 0xffffffff;
+  for await (const chunk of createReadStream(filePath)) {
+    crc = updateCrc32(crc, chunk);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function makeZipLocalHeader({ name, size, crc, date }) {
   const buffer = Buffer.alloc(30 + name.length);
   buffer.writeUInt32LE(0x04034b50, 0);
   buffer.writeUInt16LE(20, 4);
@@ -1195,15 +1428,15 @@ function makeZipLocalHeader({ name, data, crc, date }) {
   buffer.writeUInt16LE(zipTime(date), 10);
   buffer.writeUInt16LE(zipDate(date), 12);
   buffer.writeUInt32LE(crc, 14);
-  buffer.writeUInt32LE(data.length, 18);
-  buffer.writeUInt32LE(data.length, 22);
+  buffer.writeUInt32LE(size, 18);
+  buffer.writeUInt32LE(size, 22);
   buffer.writeUInt16LE(name.length, 26);
   buffer.writeUInt16LE(0, 28);
   name.copy(buffer, 30);
   return buffer;
 }
 
-function makeZipCentralDirectoryHeader({ name, data, crc, date, offset }) {
+function makeZipCentralDirectoryHeader({ name, size, crc, date, offset }) {
   const buffer = Buffer.alloc(46 + name.length);
   buffer.writeUInt32LE(0x02014b50, 0);
   buffer.writeUInt16LE(20, 4);
@@ -1213,8 +1446,8 @@ function makeZipCentralDirectoryHeader({ name, data, crc, date, offset }) {
   buffer.writeUInt16LE(zipTime(date), 12);
   buffer.writeUInt16LE(zipDate(date), 14);
   buffer.writeUInt32LE(crc, 16);
-  buffer.writeUInt32LE(data.length, 20);
-  buffer.writeUInt32LE(data.length, 24);
+  buffer.writeUInt32LE(size, 20);
+  buffer.writeUInt32LE(size, 24);
   buffer.writeUInt16LE(name.length, 28);
   buffer.writeUInt16LE(0, 30);
   buffer.writeUInt16LE(0, 32);
@@ -1248,11 +1481,16 @@ function zipTime(date) {
 }
 
 function crc32(buffer) {
-  let crc = 0xffffffff;
-  for (const byte of buffer) {
-    crc = CRC32_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
-  }
+  const crc = updateCrc32(0xffffffff, buffer);
   return (crc ^ 0xffffffff) >>> 0;
+}
+
+function updateCrc32(crc, buffer) {
+  let next = crc;
+  for (const byte of buffer) {
+    next = CRC32_TABLE[(next ^ byte) & 0xff] ^ (next >>> 8);
+  }
+  return next;
 }
 
 const CRC32_TABLE = Array.from({ length: 256 }, (_, index) => {
