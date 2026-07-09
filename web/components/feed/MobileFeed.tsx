@@ -25,6 +25,8 @@ interface MobileFeedProps {
   videos: SavedVideo[];
 }
 
+const BOOKMARK_STORAGE_KEY = "rewind-bookmarks";
+
 export function MobileFeed({ creators, videos }: MobileFeedProps) {
   const archive = useArchiveData({
     fallbackCreators: creators,
@@ -39,21 +41,48 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
   const [paused, setPaused] = useState(false);
   const [controlsVisible, setControlsVisible] = useState(false);
   const [menuVideoId, setMenuVideoId] = useState("");
+  const [feedView, setFeedView] = useState<"all" | "bookmarks">("all");
   const [saved, setSaved] = useState<Set<string>>(() => new Set());
+  const [bookmarksReady, setBookmarksReady] = useState(false);
   const [progress, setProgress] = useState(0);
   const videoRefs = useRef(new Map<string, HTMLVideoElement>());
 
-  const filteredVideos = useMemo(
+  const creatorVideos = useMemo(
     () =>
       creatorId === "all"
         ? liveVideos
         : liveVideos.filter((video) => video.creatorId === creatorId),
     [creatorId, liveVideos],
   );
+  const filteredVideos = useMemo(
+    () => feedView === "bookmarks"
+      ? creatorVideos.filter((video) => saved.has(video.id))
+      : creatorVideos,
+    [creatorVideos, feedView, saved],
+  );
   const currentActiveId = filteredVideos.some((video) => video.id === activeId)
     ? activeId
     : filteredVideos[0]?.id ?? "";
   const activeIndex = filteredVideos.findIndex((video) => video.id === currentActiveId);
+
+  useEffect(() => {
+    try {
+      const stored = JSON.parse(window.localStorage.getItem(BOOKMARK_STORAGE_KEY) || "[]");
+      if (Array.isArray(stored)) {
+        // Bookmarks are a device-local archive preference until the backend exposes them.
+        // eslint-disable-next-line react-hooks/set-state-in-effect
+        setSaved(new Set(stored.filter((id): id is string => typeof id === "string")));
+      }
+    } catch {
+      window.localStorage.removeItem(BOOKMARK_STORAGE_KEY);
+    }
+    setBookmarksReady(true);
+  }, []);
+
+  useEffect(() => {
+    if (!bookmarksReady) return;
+    window.localStorage.setItem(BOOKMARK_STORAGE_KEY, JSON.stringify([...saved]));
+  }, [bookmarksReady, saved]);
 
   useEffect(() => {
     const nodes = Array.from(
@@ -119,32 +148,52 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
     <main className={styles.appShell}>
       <section className={styles.stage} aria-label="Saved video feed">
         <div className={`${styles.controlBar} ${controlsVisible ? styles.controlBarVisible : ""}`}>
-          <CreatorPicker
-            creators={liveCreators}
-            value={creatorId}
-            onChange={setCreatorId}
-            compact
-          />
-          <div className={styles.controlActions}>
-            <Link className={styles.iconButton} href="/dashboard/videos" aria-label="Open video library">
-              <Library size={19} />
-            </Link>
+          <div className={styles.feedTabs} aria-label="Feed view">
             <button
-              className={styles.iconButton}
-              onClick={() => setMuted((value) => !value)}
+              className={feedView === "all" ? styles.feedTabActive : styles.feedTab}
               type="button"
-              aria-label={muted ? "Turn sound on" : "Mute videos"}
+              aria-pressed={feedView === "all"}
+              onClick={() => setFeedView("all")}
             >
-              {muted ? <VolumeX size={19} /> : <Volume2 size={19} />}
+              All
             </button>
             <button
-              className={styles.iconButton}
-              onClick={() => setPaused((value) => !value)}
+              className={feedView === "bookmarks" ? styles.feedTabActive : styles.feedTab}
               type="button"
-              aria-label={paused ? "Play video" : "Pause video"}
+              aria-pressed={feedView === "bookmarks"}
+              onClick={() => setFeedView("bookmarks")}
             >
-              {paused ? <Play size={18} fill="currentColor" /> : <Pause size={18} fill="currentColor" />}
+              Bookmarks
             </button>
+          </div>
+          <div className={styles.controlRow}>
+            <CreatorPicker
+              creators={liveCreators}
+              value={creatorId}
+              onChange={setCreatorId}
+              compact
+            />
+            <div className={styles.controlActions}>
+              <Link className={styles.iconButton} href="/dashboard/videos" aria-label="Open video library">
+                <Library size={19} />
+              </Link>
+              <button
+                className={styles.iconButton}
+                onClick={() => setMuted((value) => !value)}
+                type="button"
+                aria-label={muted ? "Turn sound on" : "Mute videos"}
+              >
+                {muted ? <VolumeX size={19} /> : <Volume2 size={19} />}
+              </button>
+              <button
+                className={styles.iconButton}
+                onClick={() => setPaused((value) => !value)}
+                type="button"
+                aria-label={paused ? "Play video" : "Pause video"}
+              >
+                {paused ? <Play size={18} fill="currentColor" /> : <Pause size={18} fill="currentColor" />}
+              </button>
+            </div>
           </div>
         </div>
 
@@ -219,6 +268,15 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
                 </div>
 
                 <div className={`${styles.minimalActions} ${showControls ? styles.minimalActionsVisible : ""}`}>
+                  <button
+                    className={isSaved ? styles.bookmarkActive : undefined}
+                    type="button"
+                    onClick={() => toggleSaved(video.id)}
+                    aria-label={isSaved ? "Remove bookmark" : "Bookmark"}
+                    aria-pressed={isSaved}
+                  >
+                    <Bookmark size={21} fill={isSaved ? "currentColor" : "none"} />
+                  </button>
                   <button type="button" onClick={() => shareVideo(video)} aria-label="Share">
                     <Share2 size={21} />
                   </button>
@@ -232,10 +290,6 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
                   </button>
                   {menuVideoId === video.id ? (
                     <div className={styles.moreMenu}>
-                      <button type="button" onClick={() => toggleSaved(video.id)}>
-                        <Bookmark size={17} fill={isSaved ? "currentColor" : "none"} />
-                        {isSaved ? "Remove bookmark" : "Bookmark"}
-                      </button>
                       <a href={video.sourceUrl} target="_blank" rel="noreferrer">
                         <ExternalLink size={17} /> Original post
                       </a>
@@ -255,8 +309,12 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
 
           {filteredVideos.length === 0 ? (
             <div className={styles.emptyFeed}>
-              <h2>No saved videos</h2>
-              <p>There are no files for this creator.</p>
+              <h2>{feedView === "bookmarks" ? "No bookmarks" : "No saved videos"}</h2>
+              <p>
+                {feedView === "bookmarks"
+                  ? "Bookmark a video and it will appear here."
+                  : "There are no files for this creator."}
+              </p>
             </div>
           ) : null}
         </div>

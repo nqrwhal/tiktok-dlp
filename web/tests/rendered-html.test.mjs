@@ -39,6 +39,7 @@ for (const [pathname, expectedContent] of routes) {
     const html = await response.text();
     assert.match(html, /<title>[^<]*Rewind<\/title>/i);
     assert.match(html, expectedContent);
+    if (pathname === "/") assert.match(html, />Bookmarks<\/button>/i);
     assert.doesNotMatch(html, /codex-preview|Your site is taking shape/i);
   });
 }

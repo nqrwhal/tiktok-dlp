@@ -19,16 +19,55 @@
   top: 0;
   right: 0;
   left: 0;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
+  display: grid;
+  gap: 10px;
   padding: max(14px, env(safe-area-inset-top)) 14px 22px;
   background: linear-gradient(180deg, rgba(0, 0, 0, 0.62), transparent);
   opacity: 0;
   pointer-events: none;
   transform: translateY(-10px);
   transition: opacity 150ms ease, transform 150ms ease;
+}
+
+.feedTabs {
+  display: flex;
+  align-items: center;
+  justify-self: center;
+  gap: 18px;
+}
+
+.feedTab,
+.feedTabActive {
+  position: relative;
+  border: 0;
+  padding: 3px 0 7px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.58);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.feedTabActive {
+  color: white;
+}
+
+.feedTabActive::after {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 2px;
+  border-radius: 999px;
+  background: white;
+  content: "";
+}
+
+.controlRow {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
 }
 
 .controlBarVisible {
@@ -207,6 +246,10 @@
   opacity: 1;
   pointer-events: auto;
   transform: translateY(0);
+}
+
+.bookmarkActive {
+  color: var(--acid) !important;
 }
 
 .moreMenu {
