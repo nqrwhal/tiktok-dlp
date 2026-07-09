@@ -1,0 +1,101 @@
+.picker {
+  position: relative;
+  z-index: 50;
+  min-width: 176px;
+}
+
+.trigger {
+  display: flex;
+  width: 100%;
+  min-height: 42px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid rgba(244, 247, 239, 0.14);
+  border-radius: 9px;
+  padding: 0 12px;
+  background: #121512;
+  color: #f4f7ef;
+  font-size: 11px;
+  font-weight: 620;
+}
+
+.menu {
+  position: absolute;
+  top: calc(100% + 7px);
+  left: 0;
+  display: grid;
+  width: min(280px, calc(100vw - 32px));
+  max-height: min(430px, 64vh);
+  overflow-y: auto;
+  border: 1px solid rgba(244, 247, 239, 0.15);
+  border-radius: 10px;
+  padding: 6px;
+  background: #121512;
+  box-shadow: 0 22px 70px rgba(0, 0, 0, 0.55);
+  color-scheme: dark;
+}
+
+.option,
+.optionSelected {
+  display: flex;
+  width: 100%;
+  min-height: 38px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 0;
+  border-radius: 7px;
+  padding: 0 10px;
+  background: transparent;
+  color: #a4aba2;
+  font-size: 11px;
+  text-align: left;
+}
+
+.option:hover,
+.optionSelected {
+  background: #202420;
+  color: #f4f7ef;
+}
+
+.optionSelected {
+  color: #c9ff4a;
+}
+
+.optionIdentity {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 9px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.optionIdentity i {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+}
+
+.compact {
+  min-width: 0;
+}
+
+.compact .trigger {
+  min-height: 36px;
+  border-color: rgba(255, 255, 255, 0.2);
+  border-radius: 999px;
+  background: rgba(8, 10, 9, 0.58);
+  backdrop-filter: blur(14px);
+  font-size: 10px;
+}
+
+@media (max-width: 600px) {
+  .menu {
+    right: 0;
+    left: auto;
+  }
+}
