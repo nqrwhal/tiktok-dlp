@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef } from "react";
 
 const focusableSelector = [
   "a[href]",
@@ -15,6 +15,7 @@ export function useModalDialog(open: boolean, onClose: () => void) {
   const dialogRef = useRef<HTMLElement | null>(null);
   const returnFocusRef = useRef<HTMLElement | null>(null);
   const onCloseRef = useRef(onClose);
+  const restoreFocus = useCallback(() => returnFocusRef.current?.focus(), []);
 
   useEffect(() => {
     onCloseRef.current = onClose;
@@ -24,7 +25,6 @@ export function useModalDialog(open: boolean, onClose: () => void) {
     if (!open) return;
     const dialog = dialogRef.current;
     if (!dialog) return;
-    const returnFocus = returnFocusRef.current;
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
 
@@ -61,9 +61,9 @@ export function useModalDialog(open: boolean, onClose: () => void) {
     return () => {
       document.removeEventListener("keydown", handleKeyDown);
       document.body.style.overflow = previousOverflow;
-      window.requestAnimationFrame(() => returnFocus?.focus());
+      window.requestAnimationFrame(restoreFocus);
     };
-  }, [open]);
+  }, [open, restoreFocus]);
 
   return { dialogRef, returnFocusRef };
 }

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 async function render(pathname) {
@@ -44,7 +45,7 @@ for (const [pathname, expectedContent] of routes) {
     assert.match(html, expectedContent);
     if (pathname === "/") {
       assert.match(html, />Bookmarks<\/button>/i);
-      assert.equal(html.match(/preload="auto"/gi)?.length, 5);
+      assert.equal(html.match(/preload="auto"/gi)?.length, 1);
     }
     if (pathname.startsWith("/creator")) {
       assert.match(html, /href="\/\?creator=mina-makes(?:&amp;|&)video=v-1042"/i);
@@ -60,3 +61,10 @@ for (const [pathname, expectedContent] of routes) {
     assert.doesNotMatch(html, /codex-preview|Your site is taking shape/i);
   });
 }
+
+test("feed exposes confirmed server deletion", async () => {
+  const source = await readFile(new URL("../components/feed/MobileFeed.tsx", import.meta.url), "utf8");
+  assert.match(source, /Delete from server/i);
+  assert.match(source, /method:\s*"DELETE"/);
+  assert.match(source, /confirmFileId:\s*deleteVideo\.id/);
+});

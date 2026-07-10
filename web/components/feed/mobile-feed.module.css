@@ -324,6 +324,137 @@
   background: #202420;
 }
 
+.moreMenu .deleteMenuAction {
+  color: #ff9187;
+}
+
+.feedToast {
+  position: absolute;
+  z-index: 35;
+  right: 18px;
+  bottom: max(22px, calc(env(safe-area-inset-bottom) + 12px));
+  left: 18px;
+  width: max-content;
+  max-width: calc(100% - 36px);
+  margin: 0 auto;
+  border: 1px solid rgba(201, 255, 74, 0.24);
+  border-radius: 10px;
+  padding: 11px 14px;
+  background: rgba(17, 21, 18, 0.94);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.48);
+  color: #eef3ea;
+  font-size: 12px;
+  line-height: 1.4;
+  text-align: center;
+}
+
+.confirmScrim {
+  position: fixed;
+  z-index: 100;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: max(18px, env(safe-area-inset-top)) 18px max(18px, env(safe-area-inset-bottom));
+  background: rgba(3, 5, 4, 0.82);
+  backdrop-filter: blur(7px);
+}
+
+.confirmDialog {
+  display: grid;
+  width: min(100%, 420px);
+  max-height: 100%;
+  gap: 18px;
+  overflow-y: auto;
+  border: 1px solid rgba(244, 247, 239, 0.18);
+  border-radius: 15px;
+  padding: 22px;
+  background: #111512;
+  box-shadow: 0 28px 90px rgba(0, 0, 0, 0.64);
+}
+
+.confirmIcon {
+  display: grid;
+  width: 42px;
+  height: 42px;
+  place-items: center;
+  border-radius: 11px;
+  background: rgba(255, 112, 100, 0.12);
+  color: #ff9187;
+}
+
+.confirmDialog h2 {
+  margin: 0 0 8px;
+  font-size: 20px;
+  letter-spacing: -0.035em;
+}
+
+.confirmDialog p {
+  margin: 0;
+  color: #9ca49a;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.confirmDialog p strong,
+.confirmDialog p span {
+  display: block;
+}
+
+.confirmDialog p strong {
+  margin-bottom: 3px;
+  color: #edf1eb;
+}
+
+.confirmDialog p span {
+  margin-bottom: 13px;
+  color: #b2b9af;
+  font-size: 12px;
+}
+
+.confirmDialog .deleteError {
+  color: #ff9b92;
+}
+
+.confirmActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.confirmActions button {
+  display: inline-flex;
+  min-height: 44px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border: 1px solid rgba(244, 247, 239, 0.16);
+  border-radius: 9px;
+  padding: 0 14px;
+  background: #191d1a;
+  color: #e4e8e2;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.confirmActions .confirmDeleteButton {
+  border-color: #a8463e;
+  background: #b94c43;
+  color: white;
+}
+
+.confirmActions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
+.spinning {
+  animation: feedSpin 800ms linear infinite;
+}
+
+@keyframes feedSpin {
+  to { transform: rotate(360deg); }
+}
+
 .progressTrack {
   position: absolute;
   z-index: 12;

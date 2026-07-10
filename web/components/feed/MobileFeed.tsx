@@ -5,11 +5,13 @@ import {
   ExternalLink,
   LayoutDashboard,
   Library,
+  LoaderCircle,
   MoreHorizontal,
   Pause,
   Play,
   Share2,
   Shuffle,
+  Trash2,
   Volume2,
   VolumeX,
 } from "lucide-react";
@@ -27,6 +29,7 @@ import {
 } from "../../lib/playback-preferences";
 import type { Creator, SavedVideo } from "../../lib/types";
 import { useArchiveData } from "../../lib/useArchiveData";
+import { useModalDialog } from "../../lib/useModalDialog";
 import styles from "./mobile-feed.module.css";
 
 interface MobileFeedProps {
@@ -57,7 +60,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
     includeStats: false,
   });
   const liveCreators = archive.creators;
-  const liveVideos = archive.videos;
+  const archiveVideos = archive.videos;
   const [activeId, setActiveId] = useState(requestedVideoId);
   const [shuffleSeed, setShuffleSeed] = useState(0);
   const [shuffleReady, setShuffleReady] = useState(false);
@@ -68,18 +71,31 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
   const [buffering, setBuffering] = useState(true);
   const [playbackError, setPlaybackError] = useState("");
   const [presentedVideoId, setPresentedVideoId] = useState("");
+  const [preloadReadyVideoId, setPreloadReadyVideoId] = useState("");
   const [controlsVisible, setControlsVisible] = useState(false);
   const [menuVideoId, setMenuVideoId] = useState("");
   const [feedView, setFeedView] = useState<"all" | "bookmarks">("all");
   const [saved, setSaved] = useState<Set<string>>(() => new Set());
   const [bookmarksReady, setBookmarksReady] = useState(false);
   const [shareStatus, setShareStatus] = useState("");
+  const [deleteVideo, setDeleteVideo] = useState<SavedVideo | null>(null);
+  const [deleteError, setDeleteError] = useState("");
+  const [deleting, setDeleting] = useState(false);
+  const [feedStatus, setFeedStatus] = useState("");
+  const [removedVideoIds, setRemovedVideoIds] = useState<Set<string>>(() => new Set());
   const videoRefs = useRef(new Map<string, HTMLVideoElement>());
   const activeIdRef = useRef(activeId);
   const failedVideoIdsRef = useRef(new Set<string>());
   const skipMutedPreferenceWrite = useRef(false);
   const feedScrollerRef = useRef<HTMLDivElement>(null);
   const progressRef = useRef<HTMLSpanElement>(null);
+  const wasPausedBeforeDeleteRef = useRef(false);
+  const { dialogRef, returnFocusRef } = useModalDialog(Boolean(deleteVideo), closeDeleteVideo);
+
+  const liveVideos = useMemo(
+    () => archiveVideos.filter((video) => !removedVideoIds.has(video.id)),
+    [archiveVideos, removedVideoIds],
+  );
 
   const resolvedCreatorId = useMemo(
     () => resolveCreatorId(creatorId, liveCreators),
@@ -223,8 +239,12 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
         const id = visible?.target.getAttribute("data-video-id");
         if (id && requestedJumpHandled.current && id !== activeIdRef.current) {
           activeIdRef.current = id;
-          setActiveId(id);
+          const nextVideo = videoRefs.current.get(id);
           const failed = failedVideoIdsRef.current.has(id);
+          setActiveId(id);
+          setPreloadReadyVideoId(
+            !failed && nextVideo?.readyState >= PLAYABLE_READY_STATE ? id : "",
+          );
           setPaused(failed || !autoplayEnabled);
           setBuffering(!failed);
           setPlaybackError(failed ? "This archived file could not be played." : "");
@@ -243,7 +263,6 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
   useEffect(() => {
     if (!shuffleReady) return;
     for (const [id, video] of videoRefs.current) {
-      video.muted = muted;
       if (id === currentActiveId && !paused) {
         playIfReady(id, video);
       } else {
@@ -297,16 +316,98 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
     }
   }
 
+  function openDeleteVideo(video: SavedVideo) {
+    returnFocusRef.current = document.getElementById(`feed-more-${video.id}`);
+    wasPausedBeforeDeleteRef.current = paused;
+    setPaused(true);
+    setMenuVideoId("");
+    setDeleteVideo(video);
+    setDeleteError("");
+  }
+
+  function closeDeleteVideo() {
+    if (deleting) return;
+    setDeleteVideo(null);
+    setDeleteError("");
+    setPaused(wasPausedBeforeDeleteRef.current);
+  }
+
+  async function confirmDeleteVideo() {
+    if (!deleteVideo || deleting) return;
+    const apiBase = process.env.NEXT_PUBLIC_ARCHIVE_API_BASE?.replace(/\/+$/, "") || "";
+    if (!apiBase) {
+      setDeleteError("The live backend connection is required to delete videos.");
+      return;
+    }
+
+    setDeleting(true);
+    setDeleteError("");
+    try {
+      const response = await fetch(`${apiBase}/api/videos/${encodeURIComponent(deleteVideo.id)}`, {
+        method: "DELETE",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ confirmFileId: deleteVideo.id }),
+      });
+      const payload = await response.json().catch(() => ({})) as { error?: string };
+      if (!response.ok) {
+        throw new Error(payload.error || `Deletion failed (${response.status})`);
+      }
+
+      const deletedIndex = filteredVideos.findIndex((video) => video.id === deleteVideo.id);
+      const nextVideo = filteredVideos[deletedIndex + 1] || filteredVideos[deletedIndex - 1];
+      const nextId = nextVideo?.id || "";
+      const nextFailed = failedVideoIdsRef.current.has(nextId);
+      const nextElement = videoRefs.current.get(nextId);
+      activeIdRef.current = nextId;
+      setActiveId(nextId);
+      setPreloadReadyVideoId(
+        !nextFailed && nextElement?.readyState >= PLAYABLE_READY_STATE ? nextId : "",
+      );
+      setPaused(!autoplayEnabled || !nextId || nextFailed);
+      setBuffering(Boolean(nextId) && !nextFailed);
+      setPlaybackError(nextFailed ? "This archived file could not be played." : "");
+      setPresentedVideoId("");
+      setControlsVisible(false);
+      setSaved((current) => {
+        const next = new Set(current);
+        next.delete(deleteVideo.id);
+        return next;
+      });
+      setRemovedVideoIds((current) => new Set(current).add(deleteVideo.id));
+      returnFocusRef.current = document.getElementById("feed-stage");
+      setDeleteVideo(null);
+      setFeedStatus(`Deleted “${deleteVideo.title}” from the server.`);
+      window.setTimeout(() => setFeedStatus(""), 2600);
+      archive.refresh();
+
+      if (nextId) {
+        window.requestAnimationFrame(() => {
+          const target = Array.from(document.querySelectorAll<HTMLElement>("[data-video-id]"))
+            .find((node) => node.dataset.videoId === nextId);
+          target?.scrollIntoView({ block: "start" });
+        });
+      }
+    } catch (error) {
+      setDeleteError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setDeleting(false);
+    }
+  }
+
   function resetFeedPosition(nextActiveId: string) {
     feedScrollerRef.current?.scrollTo({ top: 0, behavior: "auto" });
     activeIdRef.current = nextActiveId;
     setActiveId(nextActiveId);
     if (nextActiveId !== currentActiveId) {
       const failed = failedVideoIdsRef.current.has(nextActiveId);
+      const nextElement = videoRefs.current.get(nextActiveId);
       setPaused(failed || !autoplayEnabled);
-      setBuffering(!failed);
+      setBuffering(Boolean(nextActiveId) && !failed);
       setPlaybackError(failed ? "This archived file could not be played." : "");
       setPresentedVideoId("");
+      setPreloadReadyVideoId(
+        !failed && nextElement?.readyState >= PLAYABLE_READY_STATE ? nextActiveId : "",
+      );
       if (progressRef.current) progressRef.current.style.width = "0%";
     }
     setControlsVisible(false);
@@ -363,7 +464,10 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
     setPlaybackError("");
     setBuffering(true);
     setPaused(false);
-    if (activeVideo && shouldReload) activeVideo.load();
+    if (activeVideo && shouldReload) {
+      setPreloadReadyVideoId("");
+      activeVideo.load();
+    }
   }
 
   const controlsAvailable = filteredVideos.length > 0;
@@ -372,7 +476,12 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
   return (
     <main className={styles.appShell}>
       <h1 className="sr-only">Saved video feed</h1>
-      <section className={styles.stage} aria-label="Saved video feed">
+      <section
+        className={styles.stage}
+        id="feed-stage"
+        tabIndex={-1}
+        aria-label="Saved video feed"
+      >
         <div
           className={`${styles.controlBar} ${showControlBar ? styles.controlBarVisible : ""}`}
           aria-hidden={!showControlBar}
@@ -447,9 +556,13 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
         <div className={styles.feedScroller} ref={feedScrollerRef}>
           {filteredVideos.map((video, index) => {
             const isActive = video.id === currentActiveId;
-            const shouldPreload = activeIndex >= 0
+            const isInPreloadWindow = activeIndex >= 0
               && index >= activeIndex - PRELOAD_BEHIND
               && index <= activeIndex + PRELOAD_AHEAD;
+            // Give the first visible video the connection to itself. Once it
+            // has a forward buffer, open the neighboring preload window.
+            const shouldPreload = isActive
+              || (preloadReadyVideoId === currentActiveId && isInPreloadWindow);
             const posterAnchor = Math.max(activeIndex, 0);
             const shouldPreloadPoster = index >= posterAnchor - POSTER_PRELOAD_BEHIND
               && index <= posterAnchor + POSTER_PRELOAD_AHEAD;
@@ -481,7 +594,10 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
                         progressRef.current.style.width = `${Math.max(0, Math.min(1, value)) * 100}%`;
                       }
                     }}
-                    onCanPlay={(event) => playIfReady(video.id, event.currentTarget)}
+                    onCanPlay={(event) => {
+                      if (activeIdRef.current === video.id) setPreloadReadyVideoId(video.id);
+                      playIfReady(video.id, event.currentTarget);
+                    }}
                     onPlaying={(event) => {
                       if (activeIdRef.current !== video.id) return;
                       const element = event.currentTarget;
@@ -503,6 +619,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
                     onError={() => {
                       failedVideoIdsRef.current.add(video.id);
                       if (activeIdRef.current !== video.id) return;
+                      setPreloadReadyVideoId("");
                       setPaused(true);
                       setBuffering(false);
                       setPlaybackError("This archived file could not be played.");
@@ -610,6 +727,13 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
                       <Link href="/dashboard">
                         <LayoutDashboard size={17} /> Dashboard
                       </Link>
+                      <button
+                        className={styles.deleteMenuAction}
+                        type="button"
+                        onClick={() => openDeleteVideo(video)}
+                      >
+                        <Trash2 size={17} /> Delete from server
+                      </button>
                     </div>
                   ) : null}
                 </div> : null}
@@ -649,7 +773,51 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
             </div>
           ) : null}
         </div>
+        {feedStatus ? <p className={styles.feedToast} role="status">{feedStatus}</p> : null}
       </section>
+
+      {deleteVideo ? (
+        <div
+          className={styles.confirmScrim}
+          onPointerDown={(event) => {
+            if (event.target === event.currentTarget && !deleting) closeDeleteVideo();
+          }}
+        >
+          <section
+            className={styles.confirmDialog}
+            ref={dialogRef}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="feed-delete-title"
+            aria-describedby="feed-delete-description"
+          >
+            <div className={styles.confirmIcon}><Trash2 size={20} /></div>
+            <div>
+              <h2 id="feed-delete-title">Delete from the server?</h2>
+              <p id="feed-delete-description">
+                <strong>{deleteVideo.title}</strong>
+                <span>@{deleteVideo.username} · saved {deleteVideo.savedAtLabel}</span>
+                This permanently removes the archived video and its saved metadata.
+              </p>
+            </div>
+            {deleteError ? <p className={styles.deleteError} role="alert">{deleteError}</p> : null}
+            <div className={styles.confirmActions}>
+              <button data-dialog-initial type="button" onClick={closeDeleteVideo} disabled={deleting}>
+                Cancel
+              </button>
+              <button
+                className={styles.confirmDeleteButton}
+                type="button"
+                disabled={deleting}
+                onClick={() => void confirmDeleteVideo()}
+              >
+                {deleting ? <LoaderCircle className={styles.spinning} size={16} /> : <Trash2 size={16} />}
+                {deleting ? "Deleting" : "Delete video"}
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
     </main>
   );
 }
