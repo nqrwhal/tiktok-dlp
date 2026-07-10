@@ -25,6 +25,8 @@ async function render(pathname) {
 const routes = [
   ["/", /Show video controls/i],
   ["/?video=v-1041", /Show video controls/i],
+  ["/?creator=mina-makes&video=v-1042", /Show video controls/i],
+  ["/creator?creator=mina-makes", /Open feed/i],
   ["/dashboard", /Open feed/i],
   ["/dashboard/videos", /Search title or creator/i],
   ["/dashboard/creators", /Import creator/i],
@@ -43,6 +45,10 @@ for (const [pathname, expectedContent] of routes) {
     if (pathname === "/") {
       assert.match(html, />Bookmarks<\/button>/i);
       assert.equal(html.match(/preload="auto"/gi)?.length, 5);
+      assert.match(html, /href="\/creator\?creator=mina-makes"/i);
+    }
+    if (pathname.startsWith("/creator")) {
+      assert.match(html, /href="\/\?creator=mina-makes(?:&amp;|&)video=v-1042"/i);
     }
     if (pathname === "/dashboard" || pathname === "/dashboard/videos") {
       assert.match(html, /href="\/\?video=v-/i);

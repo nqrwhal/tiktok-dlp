@@ -38,6 +38,7 @@ const PLAYABLE_READY_STATE = 3;
 export function MobileFeed({ creators, videos }: MobileFeedProps) {
   const searchParams = useSearchParams();
   const requestedVideoId = searchParams.get("video") || "";
+  const requestedCreatorId = searchParams.get("creator") || "all";
   const requestedJumpHandled = useRef(!requestedVideoId);
   const archive = useArchiveData({
     fallbackCreators: creators,
@@ -46,7 +47,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
   });
   const liveCreators = archive.creators;
   const liveVideos = archive.videos;
-  const [creatorId, setCreatorId] = useState("all");
+  const [creatorId, setCreatorId] = useState(requestedCreatorId);
   const [activeId, setActiveId] = useState(requestedVideoId || liveVideos[0]?.id || "");
   const [muted, setMuted] = useState(true);
   const [mutePreferenceReady, setMutePreferenceReady] = useState(false);
@@ -327,7 +328,13 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
                 ) : null}
 
                 <div className={`${styles.videoMeta} ${showControls ? styles.videoMetaVisible : ""}`}>
-                  <span className={styles.creatorName}>@{video.username}</span>
+                  <Link
+                    className={styles.creatorName}
+                    href={`/creator?creator=${encodeURIComponent(video.creatorId)}`}
+                    aria-label={`View videos by @${video.username}`}
+                  >
+                    @{video.username}
+                  </Link>
                   <h1>{video.title}</h1>
                   {video.description && video.description !== video.title ? (
                     <p>{video.description}</p>

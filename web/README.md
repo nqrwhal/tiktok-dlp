@@ -5,6 +5,7 @@ Mobile-first video browsing and archive management for `tiktok-dlp`.
 ## What is included
 
 - `/` — a full-height, scroll-snap video feed optimized for touch
+- `/creator?creator=` — a creator profile with a mobile thumbnail grid
 - `/dashboard` — archive health, storage, and recent downloads
 - `/dashboard/videos` — searchable video library with bulk-selection UI
 - `/dashboard/creators` — creator monitoring controls and full-profile imports

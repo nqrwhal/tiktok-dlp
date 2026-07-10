@@ -189,9 +189,21 @@
 
 .creatorName {
   display: block;
+  width: max-content;
   margin-bottom: 7px;
+  border-radius: 4px;
   font-size: 12px;
   font-weight: 700;
+  pointer-events: none;
+}
+
+.videoMetaVisible .creatorName {
+  pointer-events: auto;
+}
+
+.creatorName:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 
 .videoMeta h1 {

@@ -1,0 +1,218 @@
+.page {
+  min-height: 100dvh;
+  background: #080a09;
+  color: #f4f7ef;
+}
+
+.topBar {
+  position: sticky;
+  z-index: 20;
+  top: 0;
+  display: grid;
+  min-height: 56px;
+  grid-template-columns: 40px 1fr 40px;
+  align-items: center;
+  gap: 10px;
+  padding: max(8px, env(safe-area-inset-top)) 12px 8px;
+  border-bottom: 1px solid rgba(244, 247, 239, 0.1);
+  background: rgba(8, 10, 9, 0.94);
+  backdrop-filter: blur(16px);
+}
+
+.topBar strong {
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 680;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.iconButton {
+  display: grid;
+  width: 40px;
+  height: 40px;
+  place-items: center;
+  border-radius: 50%;
+  color: #eef2eb;
+}
+
+.iconButton:hover {
+  background: #171b17;
+}
+
+.profile {
+  display: grid;
+  max-width: 960px;
+  grid-template-columns: 72px 1fr;
+  align-items: center;
+  gap: 16px;
+  margin: 0 auto;
+  padding: 24px 16px 20px;
+}
+
+.avatar {
+  display: grid;
+  width: 72px;
+  height: 72px;
+  place-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 50%;
+  color: #080a09;
+  font-size: 19px;
+  font-weight: 780;
+  letter-spacing: -0.04em;
+}
+
+.profileIdentity {
+  min-width: 0;
+}
+
+.profileIdentity h1 {
+  margin: 0;
+  overflow: hidden;
+  font-size: 20px;
+  font-weight: 720;
+  letter-spacing: -0.035em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.profileIdentity p {
+  margin: 3px 0 8px;
+  overflow: hidden;
+  color: #c2c8c0;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.profileIdentity span {
+  color: #8f978d;
+  font-size: 11px;
+}
+
+.feedButton {
+  display: flex;
+  min-height: 40px;
+  grid-column: 1 / -1;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border-radius: 8px;
+  background: #c9ff4a;
+  color: #080a09;
+  font-size: 12px;
+  font-weight: 740;
+}
+
+.feedButton:hover {
+  background: #d6ff76;
+}
+
+.gridLabel {
+  display: flex;
+  max-width: 960px;
+  min-height: 42px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  margin: 0 auto;
+  border-top: 1px solid rgba(244, 247, 239, 0.1);
+  border-bottom: 1px solid rgba(244, 247, 239, 0.1);
+  color: #f4f7ef;
+  font-size: 11px;
+  font-weight: 680;
+}
+
+.videoGrid {
+  display: grid;
+  max-width: 960px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 2px;
+  margin: 0 auto;
+}
+
+.videoTile {
+  position: relative;
+  display: block;
+  overflow: hidden;
+  aspect-ratio: 9 / 16;
+  background: #111411;
+}
+
+.videoTile img,
+.videoPlaceholder {
+  width: 100%;
+  height: 100%;
+}
+
+.videoTile img {
+  display: block;
+  object-fit: cover;
+  transition: opacity 140ms ease, transform 180ms ease;
+}
+
+.videoTile:hover img {
+  opacity: 0.86;
+  transform: scale(1.015);
+}
+
+.videoPlaceholder {
+  display: grid;
+  place-items: center;
+  color: rgba(255, 255, 255, 0.84);
+}
+
+.duration {
+  position: absolute;
+  right: 5px;
+  bottom: 5px;
+  border-radius: 4px;
+  padding: 3px 5px;
+  background: rgba(0, 0, 0, 0.68);
+  color: white;
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 9px;
+  font-weight: 650;
+  line-height: 1;
+}
+
+.emptyState {
+  display: grid;
+  min-height: 260px;
+  place-items: center;
+  padding: 30px;
+  color: #8f978d;
+  font-size: 12px;
+  text-align: center;
+}
+
+@media (min-width: 720px) {
+  .profile {
+    grid-template-columns: 88px 1fr auto;
+    padding: 34px 24px 28px;
+  }
+
+  .avatar {
+    width: 88px;
+    height: 88px;
+    font-size: 23px;
+  }
+
+  .profileIdentity h1 {
+    font-size: 26px;
+  }
+
+  .feedButton {
+    min-width: 126px;
+    grid-column: auto;
+    padding: 0 18px;
+  }
+
+  .videoGrid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 6px;
+    padding: 6px;
+  }
+}
