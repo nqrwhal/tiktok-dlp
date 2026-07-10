@@ -1,20 +1,30 @@
-# Rewind frontend
+# Rewind web app
 
-Mobile-first video browsing and archive management for `tiktok-dlp`.
+Rewind is the private, mobile-first video browser and archive dashboard for the
+root `tiktok-dlp` service.
 
-## What is included
+It is a vinext/Next.js React app with a small archive bridge. The bridge reads
+SQLite and saved MP4 files, generates thumbnails with ffmpeg, serves byte-range
+video responses, and forwards imports and confirmed deletions to the backend.
 
-- `/` — a full-height, scroll-snap video feed optimized for touch
-- `/creator?creator=` — a creator profile with a mobile thumbnail grid
-- `/dashboard` — archive health, storage, and recent downloads
-- `/dashboard/videos` — searchable video library with bulk-selection UI
-- `/dashboard/creators` — creator monitoring controls and full-profile imports
-- `/dashboard/settings` — playback, download, and retention preferences
-- `lib/archive-api.ts` — the frontend data boundary for the backend API
+## Product surfaces
 
-The regular development build uses safe mock records and a public CC0 demo
-video. Creator imports use the live backend API; other dashboard mutations are
-still preview-only.
+| Route | Purpose |
+| --- | --- |
+| `/` | Shuffled full-height feed, bookmarks, creator filter, playback controls, sharing, and deletion |
+| `/creator?creator=<id>` | Creator identity and thumbnail video grid |
+| `/dashboard` | Archive totals, storage, recent files, and monitoring health |
+| `/dashboard/videos` | Search/filter library, feed links, downloads, source links, and deletion |
+| `/dashboard/creators` | Creator search, profile imports, status, links, and creator-wide deletion |
+| `/dashboard/settings` | Browser-local autoplay, sound memory, and default-feed preferences |
+
+The feed preserves original descriptions and hashtags, uses the post date when
+a video has no caption, and supports exact video links. Bookmarks and playback
+settings are local to the browser; archive media, imports, and deletions are
+server-backed.
+
+Rewind currently lists MP4 archive records only. Photo/slideshow ZIPs created by
+the Discord backend are not part of the web feed.
 
 ## Local development
 
@@ -23,54 +33,110 @@ Requires Node.js `>=22.13.0`.
 ```bash
 npm install
 npm run dev
+```
+
+The regular development command uses the small mock archive in `lib/mock-data.ts`.
+
+Validation:
+
+```bash
+npm run lint
 npm test
 ```
 
-## Live local preview
+`npm test` builds the production bundle and checks every rendered route plus
+critical feed controls.
 
-If the SSH alias `yufeihl` is available, start the frontend and its local
-read-only data bridge together:
+## Live preview over SSH
+
+Start the frontend and local bridge together:
 
 ```bash
 npm run dev:live
 ```
 
-The bridge reads creators and video records from the live SQLite database over
-SSH. It also reads the saved `*.info.json` sidecars so the frontend preserves
-the original captions, hashtags, duration, and post date. Captionless items use
-their post date instead of generated titles.
+Defaults:
 
-Thumbnails are extracted from the archived MP4s on the server and cached in the
-ignored `.live-cache/` directory. Requested MP4 files are copied on demand and
-served locally with HTTP byte-range support. Creator import requests are
-forwarded over SSH to the backend's loopback-only admin API; the bridge does not
-write the archive database itself or restart the backend server.
+```text
+LIVE_SSH_HOST=yufeihl
+LIVE_REMOTE_PROJECT=/home/yufei/tiktok-discord-downloader
+LIVE_BRIDGE_PORT=8787
+```
 
-## Backend integration contract
+Override them in the shell when needed:
 
-Replace `mockArchiveApi` with an implementation of `ArchiveApi` backed by:
+```bash
+LIVE_SSH_HOST=my-server \
+LIVE_REMOTE_PROJECT=/srv/tiktok-dlp \
+npm run dev:live
+```
 
-- `GET /api/creators`
-- `GET /api/videos?creatorId=&cursor=&limit=`
-- `POST /api/imports`
-- `GET /api/imports?limit=`
-- `GET /api/imports/:id`
-- `GET /thumbnail/:fileId.jpg`
-- `GET /media/:fileId` with HTTP range support
+The SSH bridge:
 
-The shared frontend types live in `lib/types.ts`.
+- queries the remote SQLite archive;
+- reads `*.info.json` metadata for original descriptions, tags, duration, and
+  post dates;
+- copies requested MP4s on demand and serves HTTP range requests;
+- extracts and caches JPEG thumbnails under ignored `.live-cache/`;
+- forwards creator imports and confirmed deletion requests to the backend.
 
-## Server deployment
+Those mutation controls affect the connected archive. Keep the preview private
+and use confirmation prompts deliberately.
 
-The root Compose stack includes a `rewind-web` service for the private hosted
-archive. It reads the mounted archive database and media directory directly,
-serves the production frontend, and proxies all browser-facing archive routes
-through one origin. The data mount is read-only; creator imports are sent to the
-backend over the private Docker network with `IMPORT_API_TOKEN`.
+## Production deployment
 
-Set `REWIND_PUBLIC_URL` if the archive is hosted somewhere other than
-`https://rewind.yufei.dev`, then start the normal Cloudflare profile:
+The root Compose stack builds `Dockerfile.web` and starts `npm run start:live`.
+That command runs:
+
+1. the archive bridge on port 8787;
+2. the vinext production server on port 3001;
+3. a same-origin gateway on port 3000 that routes `/api`, `/media`, and
+   `/thumbnail` to the bridge and everything else to the frontend.
+
+The service mounts `data` read-only. Imports and deletions go through the
+backend on the private Docker network using `IMPORT_API_TOKEN`.
+
+Set the public origin and start the Cloudflare profile from the repository root:
+
+```env
+REWIND_PUBLIC_URL=https://rewind.example.com
+IMPORT_API_TOKEN=use-a-long-random-secret
+```
 
 ```bash
 docker compose --profile cloudflare up --build -d
 ```
+
+> [!WARNING]
+> The Rewind bridge exposes live import and destructive deletion routes and has
+> no application-level login. Protect the complete hostname with Cloudflare
+> Access or an equivalent private authentication proxy.
+
+## Browser-facing bridge API
+
+- `GET /api/health`
+- `GET /api/creators`
+- `GET /api/videos?creatorId=&username=&fileId=&limit=`
+- `GET /api/stats`
+- `GET /api/imports?limit=`
+- `POST /api/imports`
+- `GET /api/imports/:id`
+- `DELETE /api/videos/:fileId`
+- `DELETE /api/creators/:username/videos`
+- `GET|HEAD /media/:fileId`
+- `GET|HEAD /media/:fileId?download=1`
+- `GET|HEAD /thumbnail/:fileId.jpg`
+
+Creator/video/stat reads come directly from the archive. Import and deletion
+routes are forwarded to the backend admin API.
+
+## Data flow
+
+`useArchiveData` is the live frontend data boundary. When
+`NEXT_PUBLIC_ARCHIVE_API_BASE` is configured, it loads real creators, videos,
+and stats independently, retains the last valid live data during refresh errors,
+and exposes explicit loading/error states. Without it, the development routes
+use mock records.
+
+Shared UI contracts live in `lib/types.ts`; browser-local playback preferences
+live in `lib/playback-preferences.ts`.
