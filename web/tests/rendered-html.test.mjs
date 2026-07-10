@@ -62,9 +62,56 @@ for (const [pathname, expectedContent] of routes) {
   });
 }
 
-test("feed exposes confirmed server deletion", async () => {
+test("feed exposes confirmed server trash and bounded delivery", async () => {
   const source = await readFile(new URL("../components/feed/MobileFeed.tsx", import.meta.url), "utf8");
-  assert.match(source, /Delete from server/i);
+  assert.match(source, /Move to trash/i);
   assert.match(source, /method:\s*"DELETE"/);
   assert.match(source, /confirmFileId:\s*deleteVideo\.id/);
+  assert.match(source, /const CARD_WINDOW_SIZE = 7/);
+  assert.match(source, /paginateVideos:\s*true/);
+  assert.match(source, /renderedVideos\.map/);
+  assert.match(source, /const PRELOAD_AHEAD = 1/);
+  assert.match(source, /Tap for controls · swipe to browse/);
+  assert.match(source, /type="range"/);
+  assert.match(source, /aria-keyshortcuts="Space ArrowUp ArrowDown ArrowLeft ArrowRight M B"/);
+  assert.match(source, /shouldIgnoreFeedShortcut/);
+});
+
+test("video dashboard exposes trash listing and confirmed restore", async () => {
+  const librarySource = await readFile(new URL("../components/dashboard/VideoLibrary.tsx", import.meta.url), "utf8");
+  const source = await readFile(new URL("../components/dashboard/TrashLibrary.tsx", import.meta.url), "utf8");
+  assert.match(librarySource, /id="video-library-trash-tab"/);
+  assert.match(librarySource, /<TrashLibrary apiBase=\{apiBase\} onRestored=\{handleRestoredVideo\}/);
+  assert.match(librarySource, /archive\.refresh\(\)/);
+  assert.match(source, /\/api\/trash\?limit=1000/);
+  assert.match(source, /\/api\/videos\/\$\{restoreVideo\.fileId\}\/restore/);
+  assert.match(source, /method:\s*"POST"/);
+  assert.match(source, /confirmFileId:\s*restoreVideo\.fileId/);
+  assert.match(source, /Restore this video\?/);
+});
+
+test("creator imports remain durable and actionable outside the open panel", async () => {
+  const source = await readFile(new URL("../components/dashboard/CreatorManager.tsx", import.meta.url), "utf8");
+  const types = await readFile(new URL("../lib/types.ts", import.meta.url), "utf8");
+  assert.match(source, /void loadImports\(\)\.catch/);
+  assert.match(source, /if \(!hasActiveImport\) return/);
+  assert.doesNotMatch(source, /if \(!importOpen \|\| !hasActiveImport\) return/);
+  assert.match(source, /\/api\/imports\/\$\{entry\.id\}\/\$\{action\}/);
+  assert.match(source, /runImportAction\(entry, "cancel"\)/);
+  assert.match(source, /runImportAction\(entry, "retry"\)/);
+  assert.match(source, /const IMPORT_FAILURE_DETAIL_LIMIT = 5/);
+  assert.match(source, /\.filter\(\(item\) => item\.status === "failed"\)/);
+  assert.match(source, /\.slice\(0, IMPORT_FAILURE_DETAIL_LIMIT\)/);
+  assert.match(source, /skippedUnknownDurationCount/);
+  assert.match(types, /"completed" \| "failed" \| "canceled"/);
+  assert.match(types, /cancelRequestedAt: number \| null/);
+  assert.match(types, /retryCount: number/);
+  assert.match(types, /resumeCount: number/);
+});
+
+test("failed feed pages use a retry backoff instead of an immediate render loop", async () => {
+  const source = await readFile(new URL("../lib/useArchiveData.ts", import.meta.url), "utf8");
+  assert.match(source, /const VIDEO_PAGE_RETRY_DELAY_MS = 10_000/);
+  assert.match(source, /Date\.now\(\) < loadMoreRetryAfterRef\.current/);
+  assert.match(source, /loadMoreRetryAfterRef\.current = Date\.now\(\) \+ VIDEO_PAGE_RETRY_DELAY_MS/);
 });

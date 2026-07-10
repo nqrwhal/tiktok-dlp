@@ -4,7 +4,7 @@ import { access, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { DatabaseSync } from 'node:sqlite';
 import os from 'node:os';
 import path from 'node:path';
-import { loadConfig, loadEnvFile, parsePositiveInt } from '../src/config.js';
+import { loadConfig, loadEnvFile, parseNonNegativeInt, parsePositiveInt } from '../src/config.js';
 import {
   extractVideoId,
   extractTikTokUrls,
@@ -52,6 +52,8 @@ test('loadConfig resolves paths and upload limits', () => {
   assert.equal(config.importMaxDurationSeconds, 120);
   assert.equal(config.importConcurrency, 1);
   assert.equal(config.importProfileTimeoutMs, 600_000);
+  assert.equal(config.cleanupOrphanGraceMinutes, 15);
+  assert.equal(config.archiveTrashRetentionDays, 30);
   assert.equal(config.deletionCheckConcurrency, 2);
   assert.equal(config.maxSlideshowImages, 35);
   assert.equal(config.ytdlpTimeoutMs, 60_000);
@@ -71,6 +73,13 @@ test('parsePositiveInt falls back for invalid input', () => {
   assert.equal(parsePositiveInt('15', 1), 15);
   assert.equal(parsePositiveInt('0', 1), 1);
   assert.equal(parsePositiveInt('nope', 7), 7);
+});
+
+test('archive trash retention accepts an explicit disabled value', () => {
+  assert.equal(parseNonNegativeInt('0', 30), 0);
+  assert.equal(parseNonNegativeInt('-1', 30), 30);
+  assert.equal(loadConfig({ ARCHIVE_TRASH_RETENTION_DAYS: '0' }).archiveTrashRetentionDays, 0);
+  assert.equal(loadConfig({ ARCHIVE_TRASH_RETENTION_DAYS: '45' }).archiveTrashRetentionDays, 45);
 });
 
 test('username and TikTok URL helpers normalize supported forms', () => {
@@ -236,6 +245,31 @@ test('cleanup never removes a shared path while another asset row has an active 
   }
 });
 
+test('cleanup gives newly materialized unlinked files time to receive a delivery token', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-orphan-grace-'));
+  const store = createStore(path.join(dir, 'state.db'));
+  try {
+    const filePath = path.join(dir, 'new.mp4');
+    await writeFile(filePath, 'new video');
+    const fileId = store.createFileRecord({
+      videoId: 'new', sourceUrl: 'https://example.test/new', filePath, filename: 'new.mp4', sizeBytes: 9,
+    }, 10_000);
+    const config = { downloadDir: dir, cleanupOrphanGraceMinutes: 15 };
+
+    const early = await cleanupExpiredDownloads({ config, store, now: 10_000 + 14 * 60_000, log: { warn() {} } });
+    assert.equal(early.files, 0);
+    await access(filePath);
+    assert.equal(store.getLatestFileByVideoId('new')?.id, fileId);
+
+    const late = await cleanupExpiredDownloads({ config, store, now: 10_000 + 16 * 60_000, log: { warn() {} } });
+    assert.equal(late.files, 1);
+    await assert.rejects(access(filePath), { code: 'ENOENT' });
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('cleanup records failed disk deletions as retryable trash state', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-trash-state-'));
   const store = createStore(path.join(dir, 'state.db'));
@@ -266,6 +300,173 @@ test('cleanup records failed disk deletions as retryable trash state', async () 
     state = store.db.prepare('SELECT delete_requested_at, delete_error FROM files WHERE id = ?').get(fileId);
     assert.equal(state.delete_requested_at, null);
     assert.equal(state.delete_error, null);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('trashed files disappear from active lookups and can be restored with their deliveries intact', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-trash-restore-'));
+  const store = createStore(path.join(dir, 'state.db'));
+  try {
+    const filePath = path.join(dir, 'restorable.mp4');
+    await writeFile(filePath, 'video');
+    const fileId = store.createFileRecord({
+      videoId: 'restorable',
+      requestedBy: 'user-1',
+      username: 'creator',
+      sourceUrl: 'https://www.tiktok.com/@creator/video/restorable',
+      filePath,
+      filename: 'restorable.mp4',
+      sizeBytes: 5,
+    }, 1000);
+    store.createLinkToken({ token: 'restorable-token', fileId, ownerId: 'user-1', expiresAt: 0 }, 1000);
+
+    assert.equal(store.trashFile(fileId, 2000)?.trashed_at, 2000);
+    assert.equal(store.getLatestFileByVideoId('restorable'), null);
+    assert.equal(store.getValidToken('restorable-token', 3000), null);
+    assert.equal(store.getToken('restorable-token'), null);
+    assert.equal(store.listDownloadLinksByRequester('user-1').length, 0);
+    assert.equal(store.listPermanentDownloadsByRequester('user-1').length, 0);
+    assert.equal(store.listPurgePlan().length, 0);
+    assert.equal(store.stats().fileCount, 0);
+    assert.equal(store.stats().trashCount, 1);
+    assert.equal(store.listTrashedFiles()[0].id, fileId);
+    assert.deepEqual(store.purgeDownloads(), { files: 0, links: 0, jobs: 0 });
+    assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM link_tokens WHERE token = ?').get('restorable-token').count, 1);
+    assert.throws(
+      () => store.createLinkToken({ token: 'new-token', fileId, expiresAt: 0 }, 3000),
+      /missing or trashed/i,
+    );
+
+    assert.equal(store.claimTrashedFilesForDeletion(2000, 2500, 1)[0].id, fileId);
+    assert.equal(store.restoreTrashedFile(fileId), null);
+    store.markFileDeletionFailed(fileId, new Error('temporary disk failure'), 2600);
+    assert.equal(store.restoreTrashedFile(fileId)?.id, fileId);
+    assert.equal(store.getValidToken('restorable-token', 3000)?.id, fileId);
+    assert.equal(store.listPermanentDownloadsByRequester('user-1').length, 1);
+    assert.equal(store.stats().fileCount, 1);
+    assert.equal(store.stats().trashCount, 0);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('trash cleanup is bounded, honors its grace period, and removes non-MP4 sidecars', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-trash-retention-'));
+  const store = createStore(path.join(dir, 'state.db'));
+  const day = 24 * 60 * 60 * 1000;
+  const now = 100 * day;
+  try {
+    const legacyPath = path.join(dir, 'legacy.jpg');
+    const legacySidecars = [
+      path.join(dir, 'legacy.m4a'),
+      path.join(dir, 'legacy.info.json'),
+      path.join(dir, 'legacy.description'),
+    ];
+    const nearCollision = path.join(dir, 'legacy-copy.info.json');
+    const untrackedPrimary = path.join(dir, 'legacy.mp4');
+    const zipPath = path.join(dir, 'archive.zip');
+    const zipSidecars = [
+      path.join(dir, 'slideshow-id.info.json'),
+      path.join(dir, 'archive__001.jpg'),
+    ];
+    const recentPath = path.join(dir, 'recent.mp4');
+    await Promise.all([
+      writeFile(legacyPath, 'thumbnail'),
+      ...legacySidecars.map((filePath) => writeFile(filePath, 'sidecar')),
+      writeFile(nearCollision, 'keep'),
+      writeFile(untrackedPrimary, 'keep primary'),
+      writeFile(zipPath, 'zip'),
+      ...zipSidecars.map((filePath) => writeFile(filePath, 'sidecar')),
+      writeFile(recentPath, 'recent'),
+    ]);
+
+    const legacyId = store.createFileRecord({
+      videoId: 'legacy', sourceUrl: 'https://example.test/legacy', filePath: legacyPath, filename: 'legacy.jpg', sizeBytes: 9,
+    }, now - 50 * day);
+    const zipId = store.createFileRecord({
+      videoId: 'slideshow-id', sourceUrl: 'https://example.test/slideshow', filePath: zipPath, filename: 'archive.zip', sizeBytes: 3,
+    }, now - 49 * day);
+    const recentId = store.createFileRecord({
+      videoId: 'recent', sourceUrl: 'https://example.test/recent', filePath: recentPath, filename: 'recent.mp4', sizeBytes: 6,
+    }, now - 40 * day);
+    store.createLinkToken({ token: 'legacy', fileId: legacyId, expiresAt: 0 }, now - 50 * day);
+    store.createLinkToken({ token: 'zip', fileId: zipId, expiresAt: 0 }, now - 49 * day);
+    store.createLinkToken({ token: 'recent', fileId: recentId, expiresAt: 0 }, now - 40 * day);
+    store.trashFile(legacyId, now - 40 * day);
+    store.trashFile(zipId, now - 35 * day);
+    store.trashFile(recentId, now - 10 * day);
+
+    const config = {
+      downloadDir: dir,
+      archiveTrashRetentionDays: 30,
+      cleanupBatchSize: 1,
+    };
+    const first = await cleanupExpiredDownloads({ config, store, now, log: { warn() {} } });
+    assert.equal(first.trashFiles, 1);
+    assert.equal(first.trashDeleted, 4);
+    await assert.rejects(access(legacyPath), { code: 'ENOENT' });
+    for (const sidecar of legacySidecars) await assert.rejects(access(sidecar), { code: 'ENOENT' });
+    await access(nearCollision);
+    await access(untrackedPrimary);
+    await access(zipPath);
+
+    const second = await cleanupExpiredDownloads({ config, store, now, log: { warn() {} } });
+    assert.equal(second.trashFiles, 1);
+    assert.equal(second.trashDeleted, 3);
+    await assert.rejects(access(zipPath), { code: 'ENOENT' });
+    for (const sidecar of zipSidecars) await assert.rejects(access(sidecar), { code: 'ENOENT' });
+    await access(recentPath);
+    assert.equal(store.getTrashedFile(recentId)?.id, recentId);
+
+    const disabled = await cleanupExpiredDownloads({
+      config: { ...config, archiveTrashRetentionDays: 0 },
+      store,
+      now: now + 100 * day,
+      log: { warn() {} },
+    });
+    assert.equal(disabled.trashFiles, 0);
+    await access(recentPath);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('trash cleanup preserves shared bytes and sidecars referenced by an active record', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-trash-shared-'));
+  const store = createStore(path.join(dir, 'state.db'));
+  const day = 24 * 60 * 60 * 1000;
+  const now = 100 * day;
+  try {
+    const filePath = path.join(dir, 'shared.mov');
+    const sidecarPath = path.join(dir, 'shared.info.json');
+    await writeFile(filePath, 'shared');
+    await writeFile(sidecarPath, 'metadata');
+    const trashedId = store.createFileRecord({
+      videoId: 'trashed', sourceUrl: 'https://example.test/trashed', filePath, filename: 'shared.mov', sizeBytes: 6,
+    }, now - 50 * day);
+    const activeId = store.createFileRecord({
+      videoId: 'active', sourceUrl: 'https://example.test/active', filePath, filename: 'shared.mov', sizeBytes: 6,
+    }, now - 10 * day);
+    store.createLinkToken({ token: 'trashed', fileId: trashedId, expiresAt: 0 }, now - 50 * day);
+    store.createLinkToken({ token: 'active', fileId: activeId, expiresAt: 0 }, now - 10 * day);
+    store.trashFile(trashedId, now - 40 * day);
+
+    const result = await cleanupExpiredDownloads({
+      config: { downloadDir: dir, archiveTrashRetentionDays: 30 },
+      store,
+      now,
+      log: { warn() {} },
+    });
+    assert.equal(result.trashFiles, 1);
+    assert.equal(result.trashDeleted, 0);
+    await access(filePath);
+    await access(sidecarPath);
+    assert.equal(store.getLatestFileByVideoId('active')?.id, activeId);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -319,6 +520,23 @@ test('store migrates older databases before creating indexes for new columns', a
         size_bytes INTEGER NOT NULL,
         created_at INTEGER NOT NULL
       );
+      CREATE TABLE creator_imports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL,
+        status TEXT NOT NULL,
+        max_duration_seconds INTEGER NOT NULL,
+        discovered_count INTEGER NOT NULL DEFAULT 0,
+        processed_count INTEGER NOT NULL DEFAULT 0,
+        downloaded_count INTEGER NOT NULL DEFAULT 0,
+        skipped_existing_count INTEGER NOT NULL DEFAULT 0,
+        skipped_duration_count INTEGER NOT NULL DEFAULT 0,
+        failed_count INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        created_at INTEGER NOT NULL,
+        started_at INTEGER,
+        completed_at INTEGER,
+        updated_at INTEGER NOT NULL
+      );
     `);
   } finally {
     db.close();
@@ -331,6 +549,8 @@ test('store migrates older databases before creating indexes for new columns', a
     const jobColumns = store.db.prepare('PRAGMA table_info(jobs)').all().map((column) => column.name);
     const fileColumns = store.db.prepare('PRAGMA table_info(files)').all().map((column) => column.name);
     const linkColumns = store.db.prepare('PRAGMA table_info(link_tokens)').all().map((column) => column.name);
+    const importColumns = store.db.prepare('PRAGMA table_info(creator_imports)').all().map((column) => column.name);
+    const importItemColumns = store.db.prepare('PRAGMA table_info(creator_import_items)').all().map((column) => column.name);
     const indexes = store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all().map((index) => index.name);
     assert.ok(watchColumns.includes('creator_id'));
     assert.ok(watchColumns.includes('has_story'));
@@ -339,11 +559,20 @@ test('store migrates older databases before creating indexes for new columns', a
     assert.ok(indexes.includes('idx_seen_videos_next_deletion_check_at'));
     assert.ok(jobColumns.includes('requested_by'));
     assert.ok(fileColumns.includes('requested_by'));
+    assert.ok(fileColumns.includes('trashed_at'));
     assert.ok(fileColumns.includes('delete_attempts'));
     assert.ok(linkColumns.includes('owner_id'));
     assert.ok(linkColumns.includes('job_id'));
     assert.ok(indexes.includes('idx_link_tokens_file_id_expires_at'));
     assert.ok(indexes.includes('idx_jobs_file_id'));
+    assert.ok(indexes.includes('idx_files_trashed_at'));
+    assert.ok(importColumns.includes('skipped_unknown_duration_count'));
+    assert.ok(importColumns.includes('cancel_requested_at'));
+    assert.ok(importColumns.includes('retry_count'));
+    assert.ok(importColumns.includes('resume_count'));
+    assert.ok(importItemColumns.includes('metadata_json'));
+    assert.ok(importItemColumns.includes('attempt_count'));
+    assert.ok(indexes.includes('idx_creator_import_items_import_status_position'));
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });

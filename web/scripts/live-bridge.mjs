@@ -1,14 +1,24 @@
 import { createReadStream, createWriteStream } from "node:fs";
-import { mkdir, readdir, rename, rm, stat } from "node:fs/promises";
+import { copyFile, mkdir, open, realpath, rename, rm, stat } from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { pipeline } from "node:stream/promises";
+import {
+  MAX_PAGINATED_VIDEO_LIMIT,
+  buildVideoSql,
+  decodeVideoCursor,
+  encodeVideoCursor,
+  isTrashSchemaMigrationError,
+  matchImportProxyRoute,
+  resolveArchivePath as resolveSafeArchivePath,
+  thumbnailSidecarCandidates,
+} from "./live-bridge-core.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const projectDir = path.resolve(here, "..");
-const cacheDir = path.join(projectDir, ".live-cache");
+const cacheDir = process.env.LIVE_CACHE_PATH || path.join(projectDir, ".live-cache");
 const host = process.env.LIVE_SSH_HOST || "yufeihl";
 const port = positiveInteger(process.env.LIVE_BRIDGE_PORT, 8787);
 const localMode = /^(1|true|yes)$/i.test(process.env.LIVE_LOCAL_MODE || "");
@@ -41,6 +51,7 @@ const CREATOR_SQL = `
     WHERE username IS NOT NULL
       AND username <> ''
       AND lower(filename) LIKE '%.mp4'
+      AND trashed_at IS NULL
     GROUP BY lower(username)
   )
   SELECT
@@ -76,21 +87,31 @@ const STATS_SQL = `
         UNION
         SELECT lower(username) AS username_key
         FROM files
-        WHERE username <> '' AND lower(filename) LIKE '%.mp4'
+        WHERE username <> ''
+          AND lower(filename) LIKE '%.mp4'
+          AND trashed_at IS NULL
       )
     ) AS creator_count,
-    (SELECT COUNT(*) FROM files WHERE lower(filename) LIKE '%.mp4') AS video_count,
-    (SELECT COALESCE(SUM(size_bytes), 0) FROM files WHERE lower(filename) LIKE '%.mp4') AS size_bytes,
+    (
+      SELECT COUNT(*) FROM files
+      WHERE lower(filename) LIKE '%.mp4' AND trashed_at IS NULL
+    ) AS video_count,
+    (
+      SELECT COALESCE(SUM(size_bytes), 0) FROM files
+      WHERE lower(filename) LIKE '%.mp4' AND trashed_at IS NULL
+    ) AS size_bytes,
     (
       SELECT COUNT(*)
       FROM files
       WHERE lower(filename) LIKE '%.mp4'
+        AND trashed_at IS NULL
         AND created_at >= (unixepoch('now', '-7 days') * 1000)
     ) AS new_this_week,
     (
       SELECT COUNT(*)
       FROM files
       WHERE lower(filename) LIKE '%.mp4'
+        AND trashed_at IS NULL
         AND created_at >= (unixepoch('now', 'start of day') * 1000)
     ) AS added_today;
 `;
@@ -125,25 +146,48 @@ const server = http.createServer(async (request, response) => {
       const creatorId = String(url.searchParams.get("creatorId") || "").toLowerCase();
       const username = String(url.searchParams.get("username") || "").trim();
       const fileId = positiveInteger(url.searchParams.get("fileId"), 0);
-      const limit = Math.min(5_000, positiveInteger(url.searchParams.get("limit"), 100));
+      const paginated = url.searchParams.get("page") === "1" || url.searchParams.has("cursor");
+      const limit = Math.min(
+        paginated ? MAX_PAGINATED_VIDEO_LIMIT : 5_000,
+        positiveInteger(url.searchParams.get("limit"), paginated ? 36 : 100),
+      );
+      let cursor = null;
+      if (paginated && url.searchParams.has("cursor")) {
+        try {
+          cursor = decodeVideoCursor(url.searchParams.get("cursor"));
+        } catch {
+          sendJson(response, 400, { error: "Invalid video cursor" });
+          return;
+        }
+      }
       let resolvedUsername = username || creatorId;
       let baseRows = resolvedUsername
-        ? await remoteSql(buildVideoSql({ username: resolvedUsername, limit }))
+        ? await remoteSql(buildVideoSql({
+          username: resolvedUsername,
+          limit: paginated ? limit + 1 : limit,
+          cursor,
+        }))
+        : paginated
+          ? await remoteSql(buildVideoSql({ limit: limit + 1, cursor }))
         : limit <= 500
           ? await loadVideoRows()
           : await remoteSql(buildVideoSql({ limit }));
-      if (!resolvedUsername && limit > 500) {
+      if (!paginated && !resolvedUsername && limit > 500) {
         videoCache = { loadedAt: Date.now(), rows: baseRows };
       }
       if (creatorId && !username && baseRows.length === 0) {
         const legacyUsername = await resolveCreatorUsername(creatorId);
         if (legacyUsername && legacyUsername.toLowerCase() !== resolvedUsername.toLowerCase()) {
           resolvedUsername = legacyUsername;
-          baseRows = await remoteSql(buildVideoSql({ username: resolvedUsername, limit }));
+          baseRows = await remoteSql(buildVideoSql({
+            username: resolvedUsername,
+            limit: paginated ? limit + 1 : limit,
+            cursor,
+          }));
         }
       }
       const rows = [...baseRows];
-      if (fileId) {
+      if (fileId && !cursor) {
         const exactIndex = rows.findIndex((row) => Number(row.id) === fileId);
         if (exactIndex < 0) {
           const exactRows = await remoteSql(buildVideoSql({ fileId, limit: 1 }));
@@ -156,9 +200,21 @@ const server = http.createServer(async (request, response) => {
       const filtered = creatorId
         ? rows.filter((row) => creatorMatches(row.username, creatorId))
         : rows;
-      sendJson(response, 200, filtered.slice(0, limit).map((row) => (
+      const uniqueRows = [...new Map(filtered.map((row) => [String(row.id), row])).values()];
+      const pageRows = uniqueRows.slice(0, limit);
+      const items = pageRows.map((row) => (
         toVideo(row, request, metadataById[String(row.video_id || "")] || {})
-      )));
+      ));
+      if (paginated) {
+        sendJson(response, 200, {
+          items,
+          nextCursor: uniqueRows.length > limit && pageRows.length
+            ? encodeVideoCursor(pageRows.at(-1))
+            : null,
+        });
+      } else {
+        sendJson(response, 200, items);
+      }
       return;
     }
 
@@ -176,9 +232,13 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    const importApiRoute = url.pathname === "/api/imports" || /^\/api\/imports\/\d+$/.test(url.pathname);
-    if (importApiRoute && (request.method === "GET" || request.method === "POST")) {
-      const body = request.method === "POST" ? await readBodyText(request) : "";
+    const importApiRoute = matchImportProxyRoute(url.pathname, request.method);
+    if (importApiRoute) {
+      if (!importApiRoute.allowed) {
+        sendJson(response, 405, { error: "Method not allowed" });
+        return;
+      }
+      const body = importApiRoute.readsBody ? await readBodyText(request) : "";
       const upstream = await remoteAdminRequest(request.method, `${url.pathname}${url.search}`, body);
       response.writeHead(upstream.status, {
         "Cache-Control": "no-store",
@@ -186,6 +246,24 @@ const server = http.createServer(async (request, response) => {
         "Content-Type": upstream.contentType || "application/json; charset=utf-8",
       });
       response.end(upstream.body);
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/trash") {
+      const upstream = await remoteAdminRequest("GET", `${url.pathname}${url.search}`);
+      sendUpstream(response, upstream);
+      return;
+    }
+
+    const restoreVideoRoute = /^\/api\/videos\/\d+\/restore$/.test(url.pathname);
+    if (restoreVideoRoute && request.method === "POST") {
+      const body = await readBodyText(request);
+      const upstream = await remoteAdminRequest("POST", `${url.pathname}${url.search}`, body);
+      if (upstream.status >= 200 && upstream.status < 300) {
+        videoCache = { loadedAt: 0, rows: [] };
+        metadataCache = { loadedAt: 0, byId: {} };
+      }
+      sendUpstream(response, upstream);
       return;
     }
 
@@ -211,10 +289,8 @@ const server = http.createServer(async (request, response) => {
       const body = await readBodyText(request);
       const upstream = await remoteAdminRequest(request.method, `${url.pathname}${url.search}`, body);
       if (upstream.status >= 200 && upstream.status < 300) {
-        const fileId = Number(url.pathname.split("/").at(-1));
         videoCache = { loadedAt: 0, rows: [] };
         metadataCache = { loadedAt: 0, byId: {} };
-        await clearCachedFile(fileId);
       }
       response.writeHead(upstream.status, {
         "Cache-Control": "no-store",
@@ -242,7 +318,13 @@ const server = http.createServer(async (request, response) => {
     if (isClientDisconnect(error, request, response)) return;
     console.error("[live-bridge]", error);
     if (!response.headersSent) {
-      sendJson(response, 500, { error: error instanceof Error ? error.message : String(error) });
+      if (isTrashSchemaMigrationError(error)) {
+        sendJson(response, 503, {
+          error: "The archive database is being upgraded. Retry in a moment.",
+        });
+      } else {
+        sendJson(response, 500, { error: error instanceof Error ? error.message : String(error) });
+      }
     } else {
       response.destroy(error instanceof Error ? error : undefined);
     }
@@ -271,54 +353,6 @@ async function loadVideoRows({ force = false } = {}) {
       videoCacheLoadPromise = null;
     });
   return videoCacheLoadPromise;
-}
-
-async function clearCachedFile(fileId) {
-  try {
-    const entries = await readdir(cacheDir);
-    await Promise.all(entries
-      .filter((entry) => entry === `thumb-${fileId}.jpg` || entry.startsWith(`${fileId}-`))
-      .map((entry) => rm(path.join(cacheDir, entry), { force: true })));
-  } catch {
-    // Cache cleanup is best effort; the archive record is already gone.
-  }
-}
-
-function buildVideoSql({ username = "", fileId = 0, limit = 500 } = {}) {
-  const boundedLimit = Math.min(5_000, positiveInteger(limit, 500));
-  const creatorClause = username
-    ? `AND lower(files.username) = lower(${sqliteString(username)})`
-    : "";
-  const fileClause = fileId ? `AND files.id = ${positiveInteger(fileId, 0)}` : "";
-  return `
-    SELECT
-      files.id,
-      files.video_id,
-      files.username,
-      files.source_url,
-      files.path,
-      files.filename,
-      files.size_bytes,
-      files.created_at,
-      COALESCE(
-        (
-          SELECT jobs.title
-          FROM jobs
-          WHERE jobs.file_id = files.id
-            AND jobs.title IS NOT NULL
-            AND jobs.title <> ''
-          ORDER BY jobs.created_at DESC, jobs.id DESC
-          LIMIT 1
-        ),
-        files.filename
-      ) AS title
-    FROM files
-    WHERE lower(files.filename) LIKE '%.mp4'
-      ${creatorClause}
-      ${fileClause}
-    ORDER BY files.created_at DESC, files.id DESC
-    LIMIT ${boundedLimit};
-  `;
 }
 
 async function resolveCreatorUsername(creatorId) {
@@ -527,14 +561,105 @@ async function ensureThumbnail(record) {
   }
 
   if (inflightThumbnails.has(record.id)) return inflightThumbnails.get(record.id);
-  const thumbnailPromise = limitThumbnailGeneration(() => copyThumbnailFromRemote(record, localPath))
+  const thumbnailPromise = limitThumbnailGeneration(() => prepareThumbnail(record, localPath))
     .finally(() => inflightThumbnails.delete(record.id));
   inflightThumbnails.set(record.id, thumbnailPromise);
   return thumbnailPromise;
 }
 
-async function copyThumbnailFromRemote(record, localPath) {
-  if (localMode) return generateLocalThumbnail(record, localPath);
+async function prepareThumbnail(record, localPath) {
+  const copiedSidecar = localMode
+    ? await copyLocalThumbnailSidecar(record, localPath)
+    : await copyRemoteThumbnailSidecar(record, localPath);
+  if (copiedSidecar) return localPath;
+  return localMode
+    ? generateLocalThumbnail(record, localPath)
+    : generateRemoteThumbnail(record, localPath);
+}
+
+async function copyLocalThumbnailSidecar(record, localPath) {
+  const candidates = thumbnailSidecarCandidates(record.path, { archiveDownloads, remoteDownloads });
+  const tempPath = `${localPath}.part-${process.pid}`;
+  const resolvedArchiveRoot = await realpath(archiveDownloads);
+  for (const candidate of candidates) {
+    try {
+      const resolvedCandidate = await realpath(candidate);
+      const relativeCandidate = path.relative(resolvedArchiveRoot, resolvedCandidate);
+      if (
+        !relativeCandidate
+        || relativeCandidate.startsWith(`..${path.sep}`)
+        || relativeCandidate === ".."
+        || path.isAbsolute(relativeCandidate)
+      ) {
+        throw new Error("Refusing to read a thumbnail outside the download archive");
+      }
+      if (!await isJpegFile(resolvedCandidate)) continue;
+      await rm(tempPath, { force: true });
+      await copyFile(resolvedCandidate, tempPath);
+      const copied = await stat(tempPath);
+      if (!copied.size) continue;
+      await rename(tempPath, localPath);
+      return true;
+    } catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") continue;
+      await rm(tempPath, { force: true });
+      throw error;
+    }
+  }
+  await rm(tempPath, { force: true });
+  return false;
+}
+
+async function copyRemoteThumbnailSidecar(record, localPath) {
+  const candidates = thumbnailSidecarCandidates(record.path, { archiveDownloads, remoteDownloads });
+  const tempPath = `${localPath}.part-${process.pid}`;
+  const encodedRoot = Buffer.from(archiveDownloads, "utf8").toString("base64");
+  const encodedCandidates = Buffer.from(JSON.stringify(candidates), "utf8").toString("base64");
+  const script = [
+    "import base64, json, os, shutil, sys",
+    `archive_root = os.path.realpath(base64.b64decode(${JSON.stringify(encodedRoot)}).decode('utf-8'))`,
+    `candidates = json.loads(base64.b64decode(${JSON.stringify(encodedCandidates)}).decode('utf-8'))`,
+    "for candidate in candidates:",
+    "    resolved = os.path.realpath(candidate)",
+    "    try:",
+    "        if os.path.commonpath([archive_root, resolved]) != archive_root:",
+    "            continue",
+    "        with open(resolved, 'rb') as source:",
+    "            signature = source.read(3)",
+    "            if len(signature) != 3 or signature[0:2] != b'\\xff\\xd8' or signature[2] != 0xff:",
+    "                continue",
+    "            sys.stdout.buffer.write(signature)",
+    "            shutil.copyfileobj(source, sys.stdout.buffer, 1024 * 1024)",
+    "            break",
+    "    except (FileNotFoundError, IsADirectoryError, PermissionError):",
+    "        continue",
+  ].join("\n");
+
+  await rm(tempPath, { force: true });
+  const child = spawn("ssh", sshArgs("python3 -"), { stdio: ["pipe", "pipe", "pipe"] });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  child.stdin.end(script);
+  try {
+    await Promise.all([
+      pipeline(child.stdout, createWriteStream(tempPath)),
+      waitForChild(child),
+    ]);
+    const copied = await stat(tempPath);
+    if (!copied.size) {
+      await rm(tempPath, { force: true });
+      return false;
+    }
+    await rename(tempPath, localPath);
+    return true;
+  } catch (error) {
+    await rm(tempPath, { force: true });
+    throw new Error(stderr.trim() || (error instanceof Error ? error.message : String(error)));
+  }
+}
+
+async function generateRemoteThumbnail(record, localPath) {
 
   const sourcePath = resolveArchivePath(record.path);
   const relativePath = path.posix.relative(archiveDownloads, sourcePath);
@@ -572,6 +697,20 @@ async function copyThumbnailFromRemote(record, localPath) {
   }
 }
 
+async function isJpegFile(filePath) {
+  const handle = await open(filePath, "r");
+  try {
+    const signature = Buffer.alloc(3);
+    const { bytesRead } = await handle.read(signature, 0, signature.length, 0);
+    return bytesRead === signature.length
+      && signature[0] === 0xff
+      && signature[1] === 0xd8
+      && signature[2] === 0xff;
+  } finally {
+    await handle.close();
+  }
+}
+
 async function generateLocalThumbnail(record, localPath) {
   const sourcePath = resolveArchivePath(record.path);
   const tempPath = `${localPath}.part-${process.pid}`;
@@ -600,21 +739,7 @@ async function generateLocalThumbnail(record, localPath) {
 }
 
 function resolveArchivePath(storedPath) {
-  const normalized = path.posix.normalize(String(storedPath || ""));
-  let relative;
-  if (normalized.startsWith("/app/data/downloads/")) {
-    relative = normalized.slice("/app/data/downloads/".length);
-  } else if (normalized.startsWith(`${archiveDownloads}/`)) {
-    relative = normalized.slice(archiveDownloads.length + 1);
-  } else if (normalized.startsWith(`${remoteDownloads}/`)) {
-    relative = normalized.slice(remoteDownloads.length + 1);
-  } else {
-    throw new Error("Refusing to read a media path outside the download archive");
-  }
-  if (!relative || relative.startsWith("../") || relative.includes("/../")) {
-    throw new Error("Invalid media path");
-  }
-  return path.posix.join(archiveDownloads, relative);
+  return resolveSafeArchivePath(storedPath, { archiveDownloads, remoteDownloads });
 }
 
 function isClientDisconnect(error, request, response) {
@@ -638,7 +763,11 @@ async function remoteSql(sql) {
   child.stdout.on("data", (chunk) => { stdout += chunk; });
   child.stderr.on("data", (chunk) => { stderr += chunk; });
   child.stdin.end(sql);
-  await waitForChild(child);
+  try {
+    await waitForChild(child);
+  } catch (error) {
+    throw new Error(stderr.trim() || (error instanceof Error ? error.message : String(error)));
+  }
   if (stderr.trim()) throw new Error(stderr.trim());
   return stdout.trim() ? JSON.parse(stdout) : [];
 }
@@ -656,7 +785,11 @@ async function archivePythonJson(script) {
   child.stdout.on("data", (chunk) => { stdout += chunk; });
   child.stderr.on("data", (chunk) => { stderr += chunk; });
   child.stdin.end(script);
-  await waitForChild(child);
+  try {
+    await waitForChild(child);
+  } catch (error) {
+    throw new Error(stderr.trim() || (error instanceof Error ? error.message : String(error)));
+  }
   if (stderr.trim()) throw new Error(stderr.trim());
   return stdout.trim() ? JSON.parse(stdout) : {};
 }
@@ -728,8 +861,13 @@ function shellQuote(value) {
   return `'${String(value).replaceAll("'", `'"'"'`)}'`;
 }
 
-function sqliteString(value) {
-  return `'${String(value).replaceAll("'", "''")}'`;
+function sendUpstream(response, upstream) {
+  response.writeHead(upstream.status, {
+    "Cache-Control": "no-store",
+    "Content-Length": Buffer.byteLength(upstream.body),
+    "Content-Type": upstream.contentType || "application/json; charset=utf-8",
+  });
+  response.end(upstream.body);
 }
 
 function waitForChild(child) {

@@ -138,8 +138,10 @@ async function shutdown(signal) {
   console.log(`[shutdown] Received ${signal}`);
   monitor.stop();
   clearInterval(cleanupTimer);
+  const importDrain = creatorImportService.stop?.({ drain: true });
   await discordClient?.destroy?.();
   await new Promise((resolve) => httpService.server.close(resolve));
+  await importDrain;
   store.close();
   process.exit(0);
 }

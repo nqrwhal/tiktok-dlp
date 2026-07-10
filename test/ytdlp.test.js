@@ -208,6 +208,58 @@ test('photo post fallback parses and packages slideshow images', async () => {
   );
 });
 
+test('downloadVideo rejects successful yt-dlp runs that only leave non-video artifacts', async () => {
+  const fake = await createArtifactOnlyYtDlp();
+  const root = await mkdtemp(path.join(os.tmpdir(), 'tiktok-incomplete-download-'));
+  const sourceUrl = 'https://www.tiktok.com/@creator/video/9876543210';
+
+  await assert.rejects(
+    downloadVideo(sourceUrl, {
+      ytdlpPath: fake,
+      downloadDir: root,
+      disablePhotoFallback: true,
+      metadata: {
+        id: '9876543210',
+        uploader: 'creator',
+        webpage_url: sourceUrl,
+      },
+    }),
+    (error) => {
+      assert.equal(error.kind, 'no_video_file');
+      assert.deepEqual(error.files.sort(), [
+        '9876543210.description',
+        '9876543210.info.json',
+        '9876543210.jpg',
+        '9876543210.m4a',
+      ]);
+      return true;
+    },
+  );
+
+  assert.deepEqual(await readdir(path.join(root, '.tmp')), []);
+});
+
+test('downloadVideo converts artifact-only photo posts through the slideshow fallback', async () => {
+  const fake = await createArtifactOnlyYtDlp();
+  const root = await mkdtemp(path.join(os.tmpdir(), 'tiktok-artifact-photo-fallback-'));
+  const sourceUrl = 'https://www.tiktok.com/t/ZP8GUpGWj/';
+
+  const result = await downloadVideo(sourceUrl, {
+    ytdlpPath: fake,
+    fetchImpl: createPhotoFetch(),
+    downloadDir: root,
+    metadata: {
+      id: '7640994586499878174',
+      uploader: 'user400567892112',
+      webpage_url: sourceUrl,
+    },
+  });
+
+  assert.equal(result.mediaType, 'slideshow');
+  assert.equal(path.extname(result.primaryFile), '.zip');
+  assert.ok((await readFile(result.primaryFile)).includes(Buffer.from('manifest.json')));
+});
+
 test('slideshow fallback streams image bodies and rejects configured size/count limits', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'tiktok-photo-limits-'));
   const metadata = {
@@ -374,6 +426,30 @@ async function createUnsupportedYtDlp() {
   const script = `#!/usr/bin/env node
 process.stderr.write('ERROR: Unsupported URL: https://www.tiktok.com/@user400567892112/photo/7640994586499878174\\n');
 process.exit(1);
+`;
+
+  await writeFile(scriptPath, script, { mode: 0o755 });
+  await chmod(scriptPath, 0o755);
+  return scriptPath;
+}
+
+async function createArtifactOnlyYtDlp() {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'fake-ytdlp-artifacts-'));
+  const scriptPath = path.join(dir, 'yt-dlp');
+  const script = `#!/usr/bin/env node
+const fs = require('node:fs');
+const path = require('node:path');
+
+const args = process.argv.slice(2);
+const paths = args.flatMap((arg, index) => arg === '--paths' ? [args[index + 1]] : []);
+const home = paths.find((entry) => entry.startsWith('home:')) || paths.find((entry) => entry.startsWith('temp:')) || '';
+const outputDir = home.slice(home.indexOf(':') + 1);
+fs.mkdirSync(outputDir, { recursive: true });
+fs.writeFileSync(path.join(outputDir, '9876543210.jpg'), 'thumbnail');
+fs.writeFileSync(path.join(outputDir, '9876543210.m4a'), 'audio');
+fs.writeFileSync(path.join(outputDir, '9876543210.info.json'), '{}');
+fs.writeFileSync(path.join(outputDir, '9876543210.description'), 'description');
+process.exit(0);
 `;
 
   await writeFile(scriptPath, script, { mode: 0o755 });

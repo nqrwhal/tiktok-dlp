@@ -6,7 +6,8 @@ and managing saved videos.
 
 The backend uses `yt-dlp`, ffmpeg, Node.js, SQLite, and filesystem storage. The
 Rewind web app adds a touch-first video feed, creator galleries, archive search,
-imports, downloads, and confirmed deletion controls. Docker Compose runs both
+imports, downloads, trash/restore controls, and an installable mobile shell.
+Docker Compose runs both
 surfaces, while Cloudflare Tunnel can expose tokenized downloads and a
 Cloudflare Access-protected archive.
 
@@ -34,10 +35,13 @@ Cloudflare Access-protected archive.
 
 - Imports an entire public creator profile through the dashboard or admin API.
 - Skips already saved posts and videos above an adjustable duration limit.
-- Tracks queued, running, completed, and failed import work.
+- Persists per-video import checkpoints, resumes interrupted jobs after restart,
+  and supports cooperative cancellation and retry.
+- Strictly skips videos above the selected duration and items whose duration
+  remains unknown after metadata lookup.
 - Stores archive state in SQLite and media under `data/downloads`.
-- Deletes individual saved videos or every saved video for one creator, with
-  explicit confirmation.
+- Moves individual videos or a creator's saved videos to restorable trash with
+  explicit confirmation and configurable delayed purging.
 
 ### Rewind web app
 
@@ -46,13 +50,16 @@ Cloudflare Access-protected archive.
 - All and browser-local Bookmarks feeds with creator filtering.
 - Original captions and hashtags, a post-date fallback for captionless videos,
   creator links, and source links.
-- Adjacent media and thumbnail preloading, buffering/error feedback, remembered
-  sound, autoplay control, and exact-video deep links.
+- Bounded cursor pages, seven-card rendering, at most one adjacent video
+  preload, saved thumbnail reuse, and exact-video deep links.
+- Seekable progress, remembered sound, autoplay control, guarded desktop
+  shortcuts, and a one-time touch-control hint.
 - Creator profile pages with thumbnail grids that jump directly into the feed.
 - Searchable video library with thumbnails, creator filters, downloads, source
-  links, and confirmed deletion.
-- Creator dashboard with import progress, monitoring status, profile/library
-  shortcuts, and typed-confirmation bulk deletion.
+  links, trash inspection, and restore.
+- Creator dashboard with persistent import progress, monitoring status,
+  profile/library shortcuts, and typed-confirmation bulk trash.
+- Installable standalone metadata and mobile icons without caching private media.
 - Responsive, keyboard-aware navigation, menus, dialogs, and recovery states.
 
 Rewind currently indexes archived MP4 records. Photo/slideshow ZIPs delivered by
@@ -67,15 +74,15 @@ flowchart LR
     Media --> Backend
     Backend <--> State[(SQLite + data/downloads)]
     Rewind[Rewind web + archive bridge] --> State
-    Rewind -->|imports and deletions| Backend
+    Rewind -->|imports, trash, and restore| Backend
     Tunnel[Cloudflare Tunnel] --> Backend
     Access[Cloudflare Access] --> Rewind
 ```
 
-The backend owns Discord, monitoring, imports, retention, and destructive
+The backend owns Discord, monitoring, imports, retention, and durable
 archive mutations. Rewind mounts the archive data read-only, derives creators,
-videos, thumbnails, and statistics, and forwards authorized import/delete
-requests to the backend over the private Docker network.
+videos, thumbnails, and statistics, and forwards authorized archive mutations
+to the backend over the private Docker network.
 
 ## Requirements
 
@@ -210,12 +217,12 @@ destinations can follow one creator without duplicating the underlying scan.
 | `/` | Shuffled mobile video feed and bookmarks |
 | `/creator?creator=<id>` | Creator profile and saved-video grid |
 | `/dashboard` | Archive totals, storage, recent files, and monitor health |
-| `/dashboard/videos` | Search, filter, play, download, and delete videos |
-| `/dashboard/creators` | Search creators, import profiles, and delete creator archives |
+| `/dashboard/videos` | Search, filter, play, download, trash, and restore videos |
+| `/dashboard/creators` | Search creators, import profiles, and move creator archives to trash |
 | `/dashboard/settings` | Browser-local playback and default-feed preferences |
 
 Bookmarks and playback preferences are stored in the current browser. Archive
-files, imports, and deletions are server-backed.
+files, imports, trash, and restore operations are server-backed.
 
 ## Creator imports
 
@@ -236,9 +243,14 @@ Content-Type: application/json
 
 The backend enumerates the complete public profile, skips existing files, skips
 videos above the selected limit, and downloads the remaining posts as permanent
-archive files. The supported per-import duration range is 1–3600 seconds.
+archive files. It checkpoints every item in SQLite, resumes interrupted imports,
+and avoids downloading an item whose duration remains unknown. The supported
+per-import duration range is 1–3600 seconds.
 
 Read progress with `GET /api/imports?limit=20` or `GET /api/imports/:id`.
+Cancel or retry eligible jobs with `POST /api/imports/:id/cancel` and
+`POST /api/imports/:id/retry`. Cancellation is cooperative: an in-flight TikTok
+request finishes before the job stops.
 
 ## HTTP surfaces
 
@@ -249,7 +261,11 @@ Backend:
 - `GET /api/imports?limit=`
 - `POST /api/imports`
 - `GET /api/imports/:id`
+- `POST /api/imports/:id/cancel`
+- `POST /api/imports/:id/retry`
+- `GET /api/trash?limit=`
 - `DELETE /api/videos/:fileId`
+- `POST /api/videos/:fileId/restore`
 - `DELETE /api/creators/:username/videos`
 
 Admin routes require a loopback caller or
@@ -259,9 +275,10 @@ Rewind bridge:
 
 - `GET /api/health`
 - `GET /api/creators`
-- `GET /api/videos?creatorId=&username=&fileId=&limit=`
+- `GET /api/videos?creatorId=&username=&fileId=&limit=` (legacy array response)
+- `GET /api/videos?page=1&cursor=&creatorId=&username=&fileId=&limit=`
 - `GET /api/stats`
-- Import and delete routes proxied to the backend
+- Import, trash, and restore routes proxied to the backend
 - `GET|HEAD /media/:fileId`
 - `GET|HEAD /media/:fileId?download=1`
 - `GET|HEAD /thumbnail/:fileId.jpg`
@@ -277,7 +294,7 @@ Rewind bridge:
 | Monitoring | `POLL_INTERVAL_SECONDS`, `PROFILE_SCAN_LIMIT`, `PROFILE_BURST_SCAN_LIMIT`, `MONITOR_CONCURRENCY` |
 | Queue limits | `MAX_CONCURRENT_DOWNLOADS`, `MAX_DOWNLOAD_QUEUE_SIZE`, `MAX_QUEUED_DOWNLOADS_PER_USER`, `MAX_QUEUED_DOWNLOADS_PER_GUILD` |
 | Imports | `IMPORT_API_TOKEN`, `IMPORT_MAX_DURATION_SECONDS`, `IMPORT_CONCURRENCY`, `IMPORT_PROFILE_TIMEOUT_SECONDS` |
-| Retention | `DOWNLOAD_LINK_TTL_MINUTES`, `RETENTION_DAYS`, `CLEANUP_BATCH_SIZE` |
+| Retention | `DOWNLOAD_LINK_TTL_MINUTES`, `RETENTION_DAYS`, `ARCHIVE_TRASH_RETENTION_DAYS`, `CLEANUP_BATCH_SIZE`, `CLEANUP_ORPHAN_GRACE_MINUTES` |
 | Media bounds | `DISCORD_UPLOAD_LIMIT_MB`, `MAX_MEDIA_DOWNLOAD_MB`, `MAX_SLIDESHOW_IMAGES`, `MAX_SLIDESHOW_ITEM_MB`, `MAX_SLIDESHOW_TOTAL_MB` |
 | Paths/tools | `DATA_DIR`, `STATE_DB`, `DOWNLOAD_DIR`, `YTDLP_PATH`, `YTDLP_COOKIES_FILE`, `YTDLP_RETRIES`, `YTDLP_TIMEOUT_SECONDS` |
 
@@ -294,6 +311,11 @@ YTDLP_COOKIES_FILE=/app/cookies/tiktok.txt
 - Buttons can create, extend, or permanently retain requester-owned links.
 - Watched deliveries and creator imports are retained permanently by default.
 - Shared assets remain until no active delivery references them.
+- Dashboard deletion moves archive records to trash immediately. Trashed files
+  stop appearing in Rewind and their download links stop working, but their
+  bytes and delivery records remain restorable during the grace period.
+- `ARCHIVE_TRASH_RETENTION_DAYS` controls permanent trash purging and defaults
+  to 30 days. Set it to `0` to disable automatic purging.
 - Cleanup deletes disk bytes before database records and preserves retry state
   when filesystem deletion fails.
 - Inactive job/history metadata follows `RETENTION_DAYS`; file retention follows
@@ -334,8 +356,9 @@ npm run dev:live
 The live bridge defaults to the SSH host `yufeihl` and remote project
 `/home/yufei/tiktok-discord-downloader`. Export `LIVE_SSH_HOST`,
 `LIVE_REMOTE_PROJECT`, or `LIVE_BRIDGE_PORT` before the command to override
-them. It copies requested media on demand, generates and caches thumbnails, and
-supports imports and confirmed deletions by forwarding them to the backend.
+them. It copies requested media on demand, prefers saved JPEG thumbnail sidecars
+before its ffmpeg fallback, and supports imports, trash, and restore operations
+by forwarding them to the backend.
 
 ## Operational notes
 

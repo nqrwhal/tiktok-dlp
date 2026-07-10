@@ -26,6 +26,11 @@ export function parsePositiveInt(value, fallback) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+export function parseNonNegativeInt(value, fallback) {
+  const parsed = Number.parseInt(String(value ?? ''), 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
 export function parseBoolean(value, fallback = false) {
   if (value == null || value === '') return fallback;
   return ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());
@@ -72,6 +77,8 @@ export function loadConfig(env = process.env, cwd = process.cwd()) {
     importConcurrency: parsePositiveInt(env.IMPORT_CONCURRENCY, 1),
     importProfileTimeoutMs: parsePositiveInt(env.IMPORT_PROFILE_TIMEOUT_SECONDS, 600) * 1000,
     cleanupBatchSize: parsePositiveInt(env.CLEANUP_BATCH_SIZE, 100),
+    cleanupOrphanGraceMinutes: parsePositiveInt(env.CLEANUP_ORPHAN_GRACE_MINUTES, 15),
+    archiveTrashRetentionDays: parseNonNegativeInt(env.ARCHIVE_TRASH_RETENTION_DAYS, 30),
     deletionCheckConcurrency: parsePositiveInt(env.DELETION_CHECK_CONCURRENCY, 2),
     deletionCheckBatchSize: parsePositiveInt(env.DELETION_CHECK_BATCH_SIZE, 25),
     fetchTimeoutSeconds: parsePositiveInt(env.FETCH_TIMEOUT_SECONDS, 30),

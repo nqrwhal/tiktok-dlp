@@ -38,11 +38,13 @@ interface MobileFeedProps {
 }
 
 const BOOKMARK_STORAGE_KEY = "rewind-bookmarks";
-const PRELOAD_BEHIND = 1;
-const PRELOAD_AHEAD = 4;
-const POSTER_PRELOAD_BEHIND = 2;
-const POSTER_PRELOAD_AHEAD = 10;
+const FEED_HINT_STORAGE_KEY = "rewind-feed-hint-seen";
+const VIDEO_PAGE_SIZE = 36;
+const CARD_WINDOW_SIZE = 7;
+const CARD_WINDOW_BEHIND = 3;
+const PRELOAD_AHEAD = 1;
 const PLAYABLE_READY_STATE = 3;
+const KEYBOARD_SEEK_SECONDS = 5;
 
 export function MobileFeed({ creators, videos }: MobileFeedProps) {
   const searchParams = useSearchParams();
@@ -56,11 +58,18 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
     fallbackStats: mockStats,
     videoCreatorId: creatorId === "all" ? "" : creatorId,
     videoFileId: requestedVideoId,
-    videoLimit: 5_000,
+    videoLimit: VIDEO_PAGE_SIZE,
+    paginateVideos: true,
     includeStats: false,
   });
   const liveCreators = archive.creators;
   const archiveVideos = archive.videos;
+  const {
+    hasMoreVideos,
+    loadingMoreVideos,
+    loadAllVideos,
+    loadMoreVideos,
+  } = archive;
   const [activeId, setActiveId] = useState(requestedVideoId);
   const [shuffleSeed, setShuffleSeed] = useState(0);
   const [shuffleReady, setShuffleReady] = useState(false);
@@ -82,6 +91,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
   const [deleteError, setDeleteError] = useState("");
   const [deleting, setDeleting] = useState(false);
   const [feedStatus, setFeedStatus] = useState("");
+  const [hintVisible, setHintVisible] = useState(false);
   const [removedVideoIds, setRemovedVideoIds] = useState<Set<string>>(() => new Set());
   const videoRefs = useRef(new Map<string, HTMLVideoElement>());
   const activeIdRef = useRef(activeId);
@@ -89,6 +99,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
   const skipMutedPreferenceWrite = useRef(false);
   const feedScrollerRef = useRef<HTMLDivElement>(null);
   const progressRef = useRef<HTMLSpanElement>(null);
+  const seekRef = useRef<HTMLInputElement>(null);
   const wasPausedBeforeDeleteRef = useRef(false);
   const { dialogRef, returnFocusRef } = useModalDialog(Boolean(deleteVideo), closeDeleteVideo);
 
@@ -102,7 +113,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
     [creatorId, liveCreators],
   );
   const orderedVideos = useMemo(
-    () => shuffleVideos(liveVideos, shuffleSeed),
+    () => shuffleVideoPages(liveVideos, shuffleSeed, VIDEO_PAGE_SIZE),
     [liveVideos, shuffleSeed],
   );
   const creatorVideos = useMemo(
@@ -118,6 +129,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
       : creatorVideos,
     [creatorVideos, feedView, saved],
   );
+  const controlsAvailable = filteredVideos.length > 0;
   const hasActiveVideo = filteredVideos.some((video) => video.id === activeId);
   const requestedVideoPending = Boolean(requestedVideoId)
     && (archive.source === "loading" || archive.source === "refreshing")
@@ -128,6 +140,17 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
       ? ""
       : filteredVideos[0]?.id ?? "";
   const activeIndex = filteredVideos.findIndex((video) => video.id === currentActiveId);
+  const windowAnchor = Math.max(activeIndex, 0);
+  const unclampedWindowStart = Math.max(0, windowAnchor - CARD_WINDOW_BEHIND);
+  const windowStart = Math.max(
+    0,
+    Math.min(unclampedWindowStart, filteredVideos.length - CARD_WINDOW_SIZE),
+  );
+  const windowEnd = Math.min(filteredVideos.length, windowStart + CARD_WINDOW_SIZE);
+  const renderedVideos = useMemo(
+    () => filteredVideos.slice(windowStart, windowEnd),
+    [filteredVideos, windowEnd, windowStart],
+  );
 
   const playIfReady = useCallback((id: string, video: HTMLVideoElement) => {
     if (!mutePreferenceReady || id !== currentActiveId || id !== activeIdRef.current || paused) return;
@@ -168,6 +191,20 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
     setShuffleSeed(randomFeedSeed());
     setShuffleReady(true);
   }, []);
+
+  useEffect(() => {
+    if (!controlsAvailable) return;
+    try {
+      if (window.localStorage.getItem(FEED_HINT_STORAGE_KEY) === "1") return;
+      window.localStorage.setItem(FEED_HINT_STORAGE_KEY, "1");
+    } catch {
+      // The hint can still appear when storage is unavailable.
+    }
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setHintVisible(true);
+    const timer = window.setTimeout(() => setHintVisible(false), 4_500);
+    return () => window.clearTimeout(timer);
+  }, [controlsAvailable]);
 
   useEffect(() => {
     // Start muted for autoplay, then restore this device's last explicit choice.
@@ -216,20 +253,21 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
 
   useEffect(() => {
     if (!shuffleReady || requestedJumpHandled.current) return;
-    const target = Array.from(document.querySelectorAll<HTMLElement>("[data-video-id]"))
+    const target = Array.from(feedScrollerRef.current?.querySelectorAll<HTMLElement>("[data-video-id]") || [])
       .find((node) => node.dataset.videoId === requestedVideoId);
     if (target) {
       requestedJumpHandled.current = true;
       target.scrollIntoView({ block: "start" });
       return;
     }
+    if (archiveVideos.some((video) => video.id === requestedVideoId)) return;
     if (archive.source !== "loading" && archive.source !== "refreshing") requestedJumpHandled.current = true;
-  }, [archive.source, filteredVideos, requestedVideoId, shuffleReady]);
+  }, [archive.source, archiveVideos, filteredVideos, requestedVideoId, shuffleReady]);
 
   useEffect(() => {
     if (!shuffleReady) return;
     const nodes = Array.from(
-      document.querySelectorAll<HTMLElement>("[data-feed-card]"),
+      feedScrollerRef.current?.querySelectorAll<HTMLElement>("[data-feed-card]") || [],
     );
     const observer = new IntersectionObserver(
       (entries) => {
@@ -252,13 +290,14 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
           setControlsVisible(false);
           setMenuVideoId("");
           if (progressRef.current) progressRef.current.style.width = "0%";
+          if (seekRef.current) seekRef.current.value = "0";
         }
       },
       { threshold: [0.65, 0.82] },
     );
     nodes.forEach((node) => observer.observe(node));
     return () => observer.disconnect();
-  }, [autoplayEnabled, filteredVideos, shuffleReady]);
+  }, [autoplayEnabled, renderedVideos, shuffleReady]);
 
   useEffect(() => {
     if (!shuffleReady) return;
@@ -281,6 +320,16 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
     }
   }, [activeIndex, filteredVideos]);
 
+  useEffect(() => {
+    if (
+      feedView !== "all"
+      || !hasMoreVideos
+      || loadingMoreVideos
+      || activeIndex < filteredVideos.length - 8
+    ) return;
+    void loadMoreVideos();
+  }, [activeIndex, feedView, filteredVideos.length, hasMoreVideos, loadingMoreVideos, loadMoreVideos]);
+
   const setVideoRef = useCallback(
     (id: string, node: HTMLVideoElement | null) => {
       if (node) videoRefs.current.set(id, node);
@@ -289,7 +338,28 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
     [],
   );
 
-  function toggleSaved(id: string) {
+  const resetFeedPosition = useCallback((nextActiveId: string) => {
+    feedScrollerRef.current?.scrollTo({ top: 0, behavior: "auto" });
+    activeIdRef.current = nextActiveId;
+    setActiveId(nextActiveId);
+    if (nextActiveId !== currentActiveId) {
+      const failed = failedVideoIdsRef.current.has(nextActiveId);
+      const nextElement = videoRefs.current.get(nextActiveId);
+      setPaused(failed || !autoplayEnabled);
+      setBuffering(Boolean(nextActiveId) && !failed);
+      setPlaybackError(failed ? "This archived file could not be played." : "");
+      setPresentedVideoId("");
+      setPreloadReadyVideoId(
+        !failed && nextElement?.readyState >= PLAYABLE_READY_STATE ? nextActiveId : "",
+      );
+      if (progressRef.current) progressRef.current.style.width = "0%";
+      if (seekRef.current) seekRef.current.value = "0";
+    }
+    setControlsVisible(false);
+    setMenuVideoId("");
+  }, [autoplayEnabled, currentActiveId]);
+
+  const toggleSaved = useCallback((id: string) => {
     if (feedView === "bookmarks" && saved.has(id)) {
       const nextVideos = creatorVideos.filter((video) => video.id !== id && saved.has(video.id));
       resetFeedPosition(nextVideos[0]?.id || "");
@@ -300,7 +370,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
       else next.add(id);
       return next;
     });
-  }
+  }, [creatorVideos, feedView, resetFeedPosition, saved]);
 
   async function shareVideo(video: SavedVideo) {
     if (navigator.share) {
@@ -336,7 +406,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
     if (!deleteVideo || deleting) return;
     const apiBase = process.env.NEXT_PUBLIC_ARCHIVE_API_BASE?.replace(/\/+$/, "") || "";
     if (!apiBase) {
-      setDeleteError("The live backend connection is required to delete videos.");
+      setDeleteError("The live backend connection is required to move videos to trash.");
       return;
     }
 
@@ -350,7 +420,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
       });
       const payload = await response.json().catch(() => ({})) as { error?: string };
       if (!response.ok) {
-        throw new Error(payload.error || `Deletion failed (${response.status})`);
+        throw new Error(payload.error || `Move to trash failed (${response.status})`);
       }
 
       const deletedIndex = filteredVideos.findIndex((video) => video.id === deleteVideo.id);
@@ -376,7 +446,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
       setRemovedVideoIds((current) => new Set(current).add(deleteVideo.id));
       returnFocusRef.current = document.getElementById("feed-stage");
       setDeleteVideo(null);
-      setFeedStatus(`Deleted “${deleteVideo.title}” from the server.`);
+      setFeedStatus(`Moved “${deleteVideo.title}” to trash.`);
       window.setTimeout(() => setFeedStatus(""), 2600);
       archive.refresh();
 
@@ -394,26 +464,6 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
     }
   }
 
-  function resetFeedPosition(nextActiveId: string) {
-    feedScrollerRef.current?.scrollTo({ top: 0, behavior: "auto" });
-    activeIdRef.current = nextActiveId;
-    setActiveId(nextActiveId);
-    if (nextActiveId !== currentActiveId) {
-      const failed = failedVideoIdsRef.current.has(nextActiveId);
-      const nextElement = videoRefs.current.get(nextActiveId);
-      setPaused(failed || !autoplayEnabled);
-      setBuffering(Boolean(nextActiveId) && !failed);
-      setPlaybackError(failed ? "This archived file could not be played." : "");
-      setPresentedVideoId("");
-      setPreloadReadyVideoId(
-        !failed && nextElement?.readyState >= PLAYABLE_READY_STATE ? nextActiveId : "",
-      );
-      if (progressRef.current) progressRef.current.style.width = "0%";
-    }
-    setControlsVisible(false);
-    setMenuVideoId("");
-  }
-
   function selectCreator(id: string) {
     if (id === resolvedCreatorId) return;
     const nextCreatorVideos = id === "all"
@@ -428,6 +478,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
 
   function selectFeedView(view: "all" | "bookmarks") {
     if (view === feedView) return;
+    if (view === "bookmarks" && hasMoreVideos) void loadAllVideos();
     const nextVideos = view === "bookmarks"
       ? creatorVideos.filter((video) => saved.has(video.id))
       : creatorVideos;
@@ -448,14 +499,14 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
     resetFeedPosition(nextVideos[0]?.id || "");
   }
 
-  function toggleMute() {
+  const toggleMute = useCallback(() => {
     const nextMuted = !muted;
     const activeVideo = videoRefs.current.get(currentActiveId);
     if (activeVideo) activeVideo.muted = nextMuted;
     setMuted(nextMuted);
-  }
+  }, [currentActiveId, muted]);
 
-  function retryPlayback() {
+  const retryPlayback = useCallback(() => {
     const activeVideo = videoRefs.current.get(currentActiveId);
     const shouldReload = Boolean(
       playbackError || activeVideo?.error || failedVideoIdsRef.current.has(currentActiveId),
@@ -468,9 +519,78 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
       setPreloadReadyVideoId("");
       activeVideo.load();
     }
-  }
+  }, [currentActiveId, playbackError]);
 
-  const controlsAvailable = filteredVideos.length > 0;
+  useEffect(() => {
+    function handleFeedShortcut(event: KeyboardEvent) {
+      if (
+        event.defaultPrevented
+        || event.metaKey
+        || event.ctrlKey
+        || event.altKey
+        || event.shiftKey
+        || deleteVideo
+        || shouldIgnoreFeedShortcut(event.target)
+      ) return;
+
+      const key = event.key.toLowerCase();
+      if (event.repeat && (key === " " || key === "m" || key === "b")) return;
+      if ([" ", "arrowup", "arrowdown", "arrowleft", "arrowright", "m", "b"].includes(key)) {
+        setHintVisible(false);
+      }
+
+      if (key === " ") {
+        if (!currentActiveId) return;
+        event.preventDefault();
+        if (paused) retryPlayback();
+        else setPaused(true);
+        return;
+      }
+
+      if (key === "arrowup" || key === "arrowdown") {
+        const offset = key === "arrowup" ? -1 : 1;
+        const nextVideo = filteredVideos[activeIndex + offset];
+        event.preventDefault();
+        if (!nextVideo) {
+          if (key === "arrowdown" && hasMoreVideos) void loadMoreVideos();
+          return;
+        }
+        const target = Array.from(feedScrollerRef.current?.querySelectorAll<HTMLElement>("[data-video-id]") || [])
+          .find((node) => node.dataset.videoId === nextVideo.id);
+        target?.scrollIntoView({ block: "start", behavior: "smooth" });
+        return;
+      }
+
+      if (key === "arrowleft" || key === "arrowright") {
+        const video = videoRefs.current.get(currentActiveId);
+        if (!video || !Number.isFinite(video.duration) || video.duration <= 0) return;
+        event.preventDefault();
+        const delta = key === "arrowleft" ? -KEYBOARD_SEEK_SECONDS : KEYBOARD_SEEK_SECONDS;
+        video.currentTime = Math.max(0, Math.min(video.duration, video.currentTime + delta));
+        const percentage = video.currentTime / video.duration * 100;
+        if (progressRef.current) progressRef.current.style.width = `${percentage}%`;
+        if (seekRef.current) seekRef.current.value = String(percentage);
+        return;
+      }
+
+      if (key === "m") {
+        if (!currentActiveId) return;
+        event.preventDefault();
+        toggleMute();
+        return;
+      }
+
+      if (key === "b") {
+        if (!currentActiveId) return;
+        event.preventDefault();
+        toggleSaved(currentActiveId);
+      }
+    }
+
+    document.addEventListener("keydown", handleFeedShortcut);
+    return () => document.removeEventListener("keydown", handleFeedShortcut);
+  }, [activeIndex, currentActiveId, deleteVideo, filteredVideos, hasMoreVideos, loadMoreVideos, paused, retryPlayback, toggleMute, toggleSaved]);
+
   const showControlBar = controlsVisible || !controlsAvailable;
 
   return (
@@ -481,6 +601,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
         id="feed-stage"
         tabIndex={-1}
         aria-label="Saved video feed"
+        aria-keyshortcuts="Space ArrowUp ArrowDown ArrowLeft ArrowRight M B"
       >
         <div
           className={`${styles.controlBar} ${showControlBar ? styles.controlBarVisible : ""}`}
@@ -553,19 +674,26 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
           ) : null}
         </div>
 
+        {hintVisible && controlsAvailable ? (
+          <p className={styles.feedHint} role="status">Tap for controls · swipe to browse</p>
+        ) : null}
+
         <div className={styles.feedScroller} ref={feedScrollerRef}>
-          {filteredVideos.map((video, index) => {
+          {windowStart > 0 ? (
+            <div
+              className={styles.feedSpacer}
+              style={{ height: `${windowStart * 100}%` }}
+              aria-hidden="true"
+            />
+          ) : null}
+          {renderedVideos.map((video, windowIndex) => {
+            const index = windowStart + windowIndex;
             const isActive = video.id === currentActiveId;
-            const isInPreloadWindow = activeIndex >= 0
-              && index >= activeIndex - PRELOAD_BEHIND
-              && index <= activeIndex + PRELOAD_AHEAD;
             // Give the first visible video the connection to itself. Once it
-            // has a forward buffer, open the neighboring preload window.
+            // has a forward buffer, preload only the next card. Keeping older
+            // and farther cards poster-only prevents competing media streams.
             const shouldPreload = isActive
-              || (preloadReadyVideoId === currentActiveId && isInPreloadWindow);
-            const posterAnchor = Math.max(activeIndex, 0);
-            const shouldPreloadPoster = index >= posterAnchor - POSTER_PRELOAD_BEHIND
-              && index <= posterAnchor + POSTER_PRELOAD_AHEAD;
+              || (preloadReadyVideoId === currentActiveId && index === activeIndex + PRELOAD_AHEAD);
             const isSaved = saved.has(video.id);
             const showControls = isActive && controlsVisible;
             return (
@@ -593,6 +721,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
                       if (progressRef.current) {
                         progressRef.current.style.width = `${Math.max(0, Math.min(1, value)) * 100}%`;
                       }
+                      if (seekRef.current) seekRef.current.value = String(value * 100);
                     }}
                     onCanPlay={(event) => {
                       if (activeIdRef.current === video.id) setPreloadReadyVideoId(video.id);
@@ -633,7 +762,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
                     className={`${styles.videoPoster} ${presentedVideoId === video.id ? styles.videoPosterHidden : ""}`}
                     src={video.thumbnailUrl}
                     alt=""
-                    loading={shouldPreloadPoster ? "eager" : "lazy"}
+                    loading={isActive || index === activeIndex + 1 ? "eager" : "lazy"}
                     fetchPriority={isActive ? "high" : "low"}
                     decoding="async"
                   />
@@ -644,6 +773,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
                   type="button"
                   onClick={() => {
                     if (!isActive) return;
+                    setHintVisible(false);
                     setControlsVisible((value) => !value);
                     setMenuVideoId("");
                   }}
@@ -732,18 +862,43 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
                         type="button"
                         onClick={() => openDeleteVideo(video)}
                       >
-                        <Trash2 size={17} /> Delete from server
+                        <Trash2 size={17} /> Move to trash
                       </button>
                     </div>
                   ) : null}
                 </div> : null}
 
-                <div className={styles.progressTrack} aria-hidden="true">
+                <div className={styles.progressTrack}>
                   <span ref={isActive ? progressRef : undefined} />
+                  <input
+                    ref={isActive ? seekRef : undefined}
+                    type="range"
+                    min="0"
+                    max="100"
+                    step="0.1"
+                    defaultValue="0"
+                    disabled={!isActive}
+                    tabIndex={isActive ? 0 : -1}
+                    aria-label={`Seek ${video.title}`}
+                    onInput={(event) => {
+                      const element = videoRefs.current.get(video.id);
+                      const percentage = Number(event.currentTarget.value);
+                      if (!element || !Number.isFinite(element.duration) || element.duration <= 0) return;
+                      element.currentTime = element.duration * percentage / 100;
+                      if (progressRef.current) progressRef.current.style.width = `${percentage}%`;
+                    }}
+                  />
                 </div>
               </article>
             );
           })}
+          {windowEnd < filteredVideos.length ? (
+            <div
+              className={styles.feedSpacer}
+              style={{ height: `${(filteredVideos.length - windowEnd) * 100}%` }}
+              aria-hidden="true"
+            />
+          ) : null}
 
           {filteredVideos.length === 0 ? (
             <div className={styles.emptyFeed}>
@@ -773,6 +928,9 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
             </div>
           ) : null}
         </div>
+        {loadingMoreVideos ? (
+          <p className="sr-only" role="status">Loading more videos…</p>
+        ) : null}
         {feedStatus ? <p className={styles.feedToast} role="status">{feedStatus}</p> : null}
       </section>
 
@@ -793,11 +951,11 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
           >
             <div className={styles.confirmIcon}><Trash2 size={20} /></div>
             <div>
-              <h2 id="feed-delete-title">Delete from the server?</h2>
+              <h2 id="feed-delete-title">Move this video to trash?</h2>
               <p id="feed-delete-description">
                 <strong>{deleteVideo.title}</strong>
                 <span>@{deleteVideo.username} · saved {deleteVideo.savedAtLabel}</span>
-                This permanently removes the archived video and its saved metadata.
+                It will leave the active archive now and be permanently deleted after the configured retention period.
               </p>
             </div>
             {deleteError ? <p className={styles.deleteError} role="alert">{deleteError}</p> : null}
@@ -812,7 +970,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
                 onClick={() => void confirmDeleteVideo()}
               >
                 {deleting ? <LoaderCircle className={styles.spinning} size={16} /> : <Trash2 size={16} />}
-                {deleting ? "Deleting" : "Delete video"}
+                {deleting ? "Moving" : "Move to trash"}
               </button>
             </div>
           </section>
@@ -839,6 +997,14 @@ function shuffleVideos(videos: SavedVideo[], seed: number): SavedVideo[] {
   });
 }
 
+function shuffleVideoPages(videos: SavedVideo[], seed: number, pageSize: number): SavedVideo[] {
+  const shuffled: SavedVideo[] = [];
+  for (let start = 0; start < videos.length; start += pageSize) {
+    shuffled.push(...shuffleVideos(videos.slice(start, start + pageSize), seed ^ start));
+  }
+  return shuffled;
+}
+
 function feedRank(id: string, seed: number): number {
   let hash = (2166136261 ^ seed) >>> 0;
   for (const character of id) {
@@ -854,4 +1020,12 @@ function isAbortError(error: unknown): boolean {
 
 function isAutoplayPolicyError(error: unknown): boolean {
   return typeof error === "object" && error !== null && "name" in error && error.name === "NotAllowedError";
+}
+
+function shouldIgnoreFeedShortcut(target: EventTarget | null): boolean {
+  if (document.querySelector('[role="dialog"][aria-modal="true"]')) return true;
+  if (!(target instanceof Element)) return false;
+  return Boolean(target.closest(
+    'input, textarea, select, button, a[href], [role="textbox"], [contenteditable]:not([contenteditable="false"]), [role="dialog"]',
+  ));
 }

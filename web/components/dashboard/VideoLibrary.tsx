@@ -18,6 +18,7 @@ import { mockStats } from "../../lib/mock-data";
 import type { Creator, SavedVideo } from "../../lib/types";
 import { useArchiveData } from "../../lib/useArchiveData";
 import { useModalDialog } from "../../lib/useModalDialog";
+import { TrashLibrary } from "./TrashLibrary";
 import styles from "./dashboard.module.css";
 
 export function VideoLibrary({
@@ -28,6 +29,7 @@ export function VideoLibrary({
   videos: SavedVideo[];
 }) {
   const searchParams = useSearchParams();
+  const apiBase = process.env.NEXT_PUBLIC_ARCHIVE_API_BASE?.replace(/\/+$/, "") || "";
   const requestedCreatorId = searchParams.get("creator") || "all";
   const requestedUsername = searchParams.get("username") || "";
   const [creatorFilter, setCreatorFilter] = useState({
@@ -49,6 +51,7 @@ export function VideoLibrary({
     [creatorFilter.id, liveCreators],
   );
   const [query, setQuery] = useState("");
+  const [libraryView, setLibraryView] = useState<"active" | "trash">("active");
   const [actionVideoId, setActionVideoId] = useState("");
   const [deleteVideo, setDeleteVideo] = useState<SavedVideo | null>(null);
   const [deleteError, setDeleteError] = useState("");
@@ -120,9 +123,8 @@ export function VideoLibrary({
 
   async function confirmDeleteVideo() {
     if (!deleteVideo || deleting) return;
-    const apiBase = process.env.NEXT_PUBLIC_ARCHIVE_API_BASE?.replace(/\/+$/, "") || "";
     if (!apiBase) {
-      setDeleteError("The live backend connection is required to delete videos.");
+      setDeleteError("The live backend connection is required to move videos to trash.");
       return;
     }
 
@@ -136,11 +138,11 @@ export function VideoLibrary({
       });
       const payload = await response.json() as { error?: string };
       if (!response.ok) {
-        throw new Error(payload.error || `Deletion failed (${response.status})`);
+        throw new Error(payload.error || `Move to trash failed (${response.status})`);
       }
 
       setRemovedVideoIds((current) => new Set(current).add(deleteVideo.id));
-      setActionMessage(`Deleted “${deleteVideo.title}” from @${deleteVideo.username}.`);
+      setActionMessage(`Moved “${deleteVideo.title}” by @${deleteVideo.username} to trash.`);
       const deletedIndex = filtered.findIndex((video) => video.id === deleteVideo.id);
       const nextVideo = filtered[deletedIndex + 1] || filtered[deletedIndex - 1];
       returnFocusRef.current = nextVideo
@@ -155,6 +157,26 @@ export function VideoLibrary({
     }
   }
 
+  function handleRestoredVideo(video: { fileId: number; filename: string; username: string }) {
+    setRemovedVideoIds((current) => {
+      const next = new Set(current);
+      next.delete(String(video.fileId));
+      return next;
+    });
+    setActionMessage(`Restored “${video.filename}” by @${video.username}.`);
+    archive.refresh();
+  }
+
+  function handleLibraryTabKeyDown(event: React.KeyboardEvent<HTMLButtonElement>) {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const nextView = event.key === "ArrowLeft" || event.key === "Home" ? "active" : "trash";
+    setLibraryView(nextView);
+    window.requestAnimationFrame(() => {
+      document.getElementById(`video-library-${nextView}-tab`)?.focus();
+    });
+  }
+
   return (
     <>
       <div className={styles.pageHeader}>
@@ -166,7 +188,36 @@ export function VideoLibrary({
         </Link>
       </div>
 
-      <div className={styles.filterBar}>
+      <div className={styles.libraryTabs} role="tablist" aria-label="Video library view">
+        <button
+          className={libraryView === "active" ? styles.libraryTabActive : styles.libraryTab}
+          id="video-library-active-tab"
+          type="button"
+          role="tab"
+          aria-selected={libraryView === "active"}
+          aria-controls="video-library-active-panel"
+          tabIndex={libraryView === "active" ? 0 : -1}
+          onClick={() => setLibraryView("active")}
+          onKeyDown={handleLibraryTabKeyDown}
+        >
+          Active
+        </button>
+        <button
+          className={libraryView === "trash" ? styles.libraryTabActive : styles.libraryTab}
+          id="video-library-trash-tab"
+          type="button"
+          role="tab"
+          aria-selected={libraryView === "trash"}
+          aria-controls="video-library-trash-panel"
+          tabIndex={libraryView === "trash" ? 0 : -1}
+          onClick={() => setLibraryView("trash")}
+          onKeyDown={handleLibraryTabKeyDown}
+        >
+          Trash
+        </button>
+      </div>
+
+      {libraryView === "active" ? <div className={styles.filterBar}>
         <label className={styles.searchField}>
           <Search size={17} />
           <span className="sr-only">Search videos</span>
@@ -178,17 +229,22 @@ export function VideoLibrary({
         </label>
         <CreatorPicker creators={liveCreators} value={resolvedCreatorFilter} onChange={selectCreator} />
         <span className={styles.resultCount}>{filtered.length} results</span>
-      </div>
+      </div> : null}
 
       {actionMessage ? <p className={styles.actionMessage} role="status">{actionMessage}</p> : null}
-      {archive.error ? (
+      {libraryView === "active" && archive.error ? (
         <div className={styles.errorNotice} role="alert">
           <span>{archive.error}</span>
           <button type="button" onClick={archive.refresh}>Retry</button>
         </div>
       ) : null}
 
-      <section className={styles.libraryCard}>
+      {libraryView === "active" ? <section
+        className={styles.libraryCard}
+        id="video-library-active-panel"
+        role="tabpanel"
+        aria-labelledby="video-library-active-tab"
+      >
         <div className={styles.tableHeader}>
           <span>Video</span>
           <span>Creator</span>
@@ -250,7 +306,7 @@ export function VideoLibrary({
                     </a>
                     <button type="button" onClick={() => openDeleteVideo(video)}>
                       <Trash2 size={15} />
-                      Delete video
+                      Move to trash
                     </button>
                   </div>
                 ) : null}
@@ -271,7 +327,9 @@ export function VideoLibrary({
             </span>
           </div>
         ) : null}
-      </section>
+      </section> : (
+        <TrashLibrary apiBase={apiBase} onRestored={handleRestoredVideo} />
+      )}
 
       {deleteVideo ? (
         <div
@@ -289,11 +347,11 @@ export function VideoLibrary({
           >
             <div className={styles.confirmIcon}><Trash2 size={19} /></div>
             <div>
-              <h2 id="delete-video-title">Delete this video?</h2>
+              <h2 id="delete-video-title">Move this video to trash?</h2>
               <p>
                 <strong className={styles.confirmVideoTitle}>{deleteVideo.title}</strong>
                 <span className={styles.confirmVideoMeta}>@{deleteVideo.username} · saved {deleteVideo.savedAtLabel}</span>
-                This permanently removes the archived video and its saved metadata.
+                It leaves the active archive now and can be restored from this page until its scheduled purge.
               </p>
             </div>
             {deleteError ? <p className={styles.importError} role="alert">{deleteError}</p> : null}
@@ -306,7 +364,7 @@ export function VideoLibrary({
                 onClick={() => void confirmDeleteVideo()}
               >
                 {deleting ? <LoaderCircle className={styles.spinning} size={15} /> : <Trash2 size={15} />}
-                {deleting ? "Deleting" : "Delete video"}
+                {deleting ? "Moving" : "Move to trash"}
               </button>
             </div>
           </section>

@@ -4,7 +4,6 @@ import { stat } from 'node:fs/promises';
 import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { createReadStream } from 'node:fs';
-import { removeStoredFiles } from '../cleanup/downloads.js';
 import { normalizeUsername } from '../util/files.js';
 
 export function createHttpHandler({ config, store, creatorImportService = null }) {
@@ -18,11 +17,24 @@ export function createHttpHandler({ config, store, creatorImportService = null }
         return sendJson(res, 200, buildHealthPayload(config, store), { head: req.method === 'HEAD' });
       }
 
-      if (url.pathname === '/api/imports' || /^\/api\/imports\/\d+$/.test(url.pathname)) {
+      if (url.pathname === '/api/imports' || /^\/api\/imports\/\d+(?:\/(?:cancel|retry))?$/.test(url.pathname)) {
         return handleCreatorImportRequest(req, res, {
           config,
           creatorImportService,
           url,
+        });
+      }
+
+      if (url.pathname === '/api/trash') {
+        return handleTrashRequest(req, res, { config, store, url });
+      }
+
+      const restoreVideoMatch = url.pathname.match(/^\/api\/videos\/(\d+)\/restore$/);
+      if (restoreVideoMatch) {
+        return handleVideoRestoreRequest(req, res, {
+          config,
+          store,
+          fileId: Number(restoreVideoMatch[1]),
         });
       }
 
@@ -79,21 +91,18 @@ export async function handleVideoRequest(req, res, { config, store, fileId }) {
     const file = store.getVideoFilePurgePlan(fileId);
     if (!file) return sendJson(res, 404, { error: 'Video not found' });
 
-    const removal = Number(file.has_other_path_ref)
-      ? { deleted: 0, failed: [] }
-      : await removeStoredFiles([file], config);
-    if (removal.failed.length) {
-      store.markFileDeletionFailed?.(file.id, removal.failed[0].error);
-      return sendJson(res, 500, { error: 'The archived video could not be removed' });
-    }
-    const deletedVideo = store.deleteFileRecords([file.id]) === 1;
+    const trashed = store.trashFile?.(file.id);
+    if (!trashed) return sendJson(res, 404, { error: 'Video not found' });
 
     return sendJson(res, 200, {
       fileId: Number(file.id),
       videoId: String(file.video_id ?? ''),
       username: String(file.username ?? ''),
-      deletedVideo,
-      deletedStoredFiles: removal.deleted,
+      deletedVideo: true,
+      deletedStoredFiles: 0,
+      trashedVideo: true,
+      trashedAt: Number(trashed.trashed_at),
+      purgeAt: trashPurgeAt(trashed.trashed_at, config),
     });
   } catch (error) {
     const statusCode = Number(error?.statusCode) || 400;
@@ -125,25 +134,74 @@ export async function handleCreatorVideosRequest(req, res, { config, store, user
       });
     }
 
-    const files = store.listCreatorVideoPurgePlan(normalizedUsername);
-    const removal = await removeStoredFiles(
-      files.filter((file) => !Number(file.has_external_path_ref)),
-      config,
-    );
-    for (const failure of removal.failed) {
-      store.markFileDeletionFailed?.(failure.file.id, failure.error);
-    }
-    const failedIds = new Set(removal.failed.map((failure) => Number(failure.file.id)));
-    const removableIds = files
-      .filter((file) => !failedIds.has(Number(file.id)))
-      .map((file) => Number(file.id));
-    const deletedVideos = store.deleteFileRecords(removableIds);
+    const trashedIds = store.trashCreatorVideoFiles?.(normalizedUsername) ?? [];
 
     return sendJson(res, 200, {
       username: normalizedUsername,
-      deletedVideos,
-      deletedStoredFiles: removal.deleted,
-      failedVideos: removal.failed.length,
+      deletedVideos: trashedIds.length,
+      deletedStoredFiles: 0,
+      trashedVideos: trashedIds.length,
+      failedVideos: 0,
+    });
+  } catch (error) {
+    const statusCode = Number(error?.statusCode) || 400;
+    return sendJson(res, statusCode, {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+export async function handleTrashRequest(req, res, { config, store, url }) {
+  if (!isImportAuthorized(req, config)) {
+    return sendJson(res, 401, { error: 'Unauthorized' });
+  }
+  if (req.method !== 'GET') {
+    return sendJson(res, 405, { error: 'Method not allowed' });
+  }
+
+  const limit = Math.max(1, Math.min(1_000, Number(url.searchParams.get('limit')) || 100));
+  const videos = (store.listTrashedFiles?.(limit) ?? []).map((file) => serializeTrashedFile(file, config));
+  return sendJson(res, 200, {
+    videos,
+    retentionDays: Math.max(0, Number(config.archiveTrashRetentionDays) || 0),
+  });
+}
+
+export async function handleVideoRestoreRequest(req, res, { config, store, fileId }) {
+  if (!isImportAuthorized(req, config)) {
+    return sendJson(res, 401, { error: 'Unauthorized' });
+  }
+  if (req.method !== 'POST') {
+    return sendJson(res, 405, { error: 'Method not allowed' });
+  }
+
+  try {
+    const body = await readJsonBody(req);
+    if (Number(body.confirmFileId) !== Number(fileId)) {
+      return sendJson(res, 400, { error: 'Confirm the video before restoring it' });
+    }
+    const trashed = store.getTrashedFile?.(fileId);
+    if (!trashed) return sendJson(res, 404, { error: 'Trashed video not found' });
+    if (trashed.delete_requested_at != null && trashed.delete_error == null) {
+      return sendJson(res, 409, { error: 'The archived video is currently being purged' });
+    }
+
+    const filePath = resolveDownloadPath(config.downloadDir, trashed.path);
+    if (!filePath) {
+      return sendJson(res, 409, { error: 'The archived video is no longer available on disk' });
+    }
+    const fileStats = await stat(filePath).catch(() => null);
+    if (!fileStats?.isFile()) {
+      return sendJson(res, 409, { error: 'The archived video is no longer available on disk' });
+    }
+
+    const restored = store.restoreTrashedFile?.(fileId);
+    if (!restored) return sendJson(res, 404, { error: 'Trashed video not found' });
+    return sendJson(res, 200, {
+      fileId: Number(restored.id),
+      videoId: String(restored.video_id ?? ''),
+      username: String(restored.username ?? ''),
+      restoredVideo: true,
     });
   } catch (error) {
     const statusCode = Number(error?.statusCode) || 400;
@@ -208,6 +266,38 @@ export async function handleCreatorImportRequest(req, res, { config, creatorImpo
       const record = creatorImportService.get(Number(match[1]));
       if (!record) return sendJson(res, 404, { error: 'Import not found' });
       return sendJson(res, 200, { import: serializeCreatorImport(record) });
+    }
+
+    const cancelMatch = url.pathname.match(/^\/api\/imports\/(\d+)\/cancel$/);
+    if (req.method === 'POST' && cancelMatch) {
+      const result = creatorImportService.cancel?.(Number(cancelMatch[1]));
+      if (!result || result.reason === 'not_found') return sendJson(res, 404, { error: 'Import not found' });
+      if (!result.accepted) {
+        return sendJson(res, 409, {
+          error: `Import cannot be canceled from status ${result.import?.status ?? 'unknown'}`,
+          import: serializeCreatorImport(result.import),
+        });
+      }
+      return sendJson(res, result.import?.status === 'canceled' ? 200 : 202, {
+        import: serializeCreatorImport(result.import),
+        cancellationRequested: true,
+      });
+    }
+
+    const retryMatch = url.pathname.match(/^\/api\/imports\/(\d+)\/retry$/);
+    if (req.method === 'POST' && retryMatch) {
+      const result = creatorImportService.retry?.(Number(retryMatch[1]));
+      if (!result || result.reason === 'not_found') return sendJson(res, 404, { error: 'Import not found' });
+      if (!result.accepted) {
+        return sendJson(res, 409, {
+          error: `Import cannot be retried from status ${result.import?.status ?? 'unknown'}`,
+          import: serializeCreatorImport(result.import),
+        });
+      }
+      return sendJson(res, 202, {
+        import: serializeCreatorImport(result.import),
+        retried: true,
+      });
     }
 
     return sendJson(res, 405, { error: 'Method not allowed' });
@@ -332,13 +422,58 @@ export function serializeCreatorImport(record) {
     downloadedCount: Number(record.downloaded_count ?? 0),
     skippedExistingCount: Number(record.skipped_existing_count ?? 0),
     skippedDurationCount: Number(record.skipped_duration_count ?? 0),
+    skippedUnknownDurationCount: Number(record.skipped_unknown_duration_count ?? 0),
     failedCount: Number(record.failed_count ?? 0),
     lastError: record.last_error == null ? null : String(record.last_error),
     createdAt: Number(record.created_at ?? 0),
     startedAt: record.started_at == null ? null : Number(record.started_at),
     completedAt: record.completed_at == null ? null : Number(record.completed_at),
+    discoveryCompletedAt: record.discovery_completed_at == null ? null : Number(record.discovery_completed_at),
+    cancelRequestedAt: record.cancel_requested_at == null ? null : Number(record.cancel_requested_at),
+    canceledAt: record.canceled_at == null ? null : Number(record.canceled_at),
+    retryCount: Number(record.retry_count ?? 0),
+    resumeCount: Number(record.resume_count ?? 0),
+    lastResumedAt: record.last_resumed_at == null ? null : Number(record.last_resumed_at),
+    updatedAt: Number(record.updated_at ?? 0),
+    ...(Array.isArray(record.items) ? { items: record.items.map(serializeCreatorImportItem) } : {}),
+  };
+}
+
+export function serializeCreatorImportItem(record) {
+  return {
+    id: Number(record.id),
+    position: Number(record.position ?? 0),
+    videoId: String(record.video_id ?? ''),
+    sourceUrl: String(record.source_url ?? ''),
+    title: String(record.title ?? ''),
+    status: String(record.status ?? ''),
+    durationSeconds: record.duration_seconds == null ? null : Number(record.duration_seconds),
+    fileId: record.file_id == null ? null : Number(record.file_id),
+    error: record.error == null ? null : String(record.error),
+    attemptCount: Number(record.attempt_count ?? 0),
+    completedAt: record.completed_at == null ? null : Number(record.completed_at),
     updatedAt: Number(record.updated_at ?? 0),
   };
+}
+
+export function serializeTrashedFile(record, config = {}) {
+  return {
+    fileId: Number(record.id),
+    videoId: String(record.video_id ?? ''),
+    username: String(record.username ?? ''),
+    sourceUrl: String(record.source_url ?? ''),
+    filename: String(record.filename ?? ''),
+    sizeBytes: Number(record.size_bytes ?? 0),
+    createdAt: Number(record.created_at ?? 0),
+    trashedAt: Number(record.trashed_at ?? 0),
+    purgeAt: trashPurgeAt(record.trashed_at, config),
+  };
+}
+
+function trashPurgeAt(trashedAt, config = {}) {
+  const retentionDays = Number(config.archiveTrashRetentionDays);
+  if (!Number.isFinite(retentionDays) || retentionDays <= 0) return null;
+  return Number(trashedAt) + retentionDays * 24 * 60 * 60 * 1000;
 }
 
 export function parseRangeHeader(header, size) {

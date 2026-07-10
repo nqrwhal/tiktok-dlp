@@ -242,13 +242,40 @@ export async function downloadVideo(sourceUrl, options = {}) {
     }
 
     const normalized = normalizeMetadata(metadata, sourceUrl);
+    if (!pickPrimaryVideo(files)) {
+      const noVideoError = Object.assign(new Error('yt-dlp completed without producing a playable video file.'), {
+        kind: 'no_video_file',
+        sourceUrl: String(sourceUrl),
+        downloadDir: tempDir,
+        files: files.map((file) => path.basename(file)),
+        stdout,
+        stderr,
+      });
+
+      if (!options.disablePhotoFallback && isTikTokUrl(sourceUrl)) {
+        let photoMetadata = null;
+        try {
+          photoMetadata = await fetchPhotoPostMetadata(sourceUrl, options);
+        } catch (error) {
+          noVideoError.cause = error;
+        }
+        if (photoMetadata) {
+          await rm(tempDir, { recursive: true, force: true });
+          await ensureTempDir(tempDir);
+          return downloadPhotoPost(sourceUrl, photoMetadata, tempDir, options);
+        }
+      }
+
+      throw noVideoError;
+    }
+
     if (options.downloadDir) {
       const layout = makeDownloadLayout({ downloadDir: options.downloadDir }, normalized);
       downloadDir = layout.dir;
       files = await moveDirectoryContents(tempDir, downloadDir);
     }
 
-    const primaryFile = pickPrimaryVideo(files) || pickPrimaryFile(files);
+    const primaryFile = pickPrimaryVideo(files);
     const sizeBytes = primaryFile ? await fileSize(primaryFile) : 0;
 
     return {
@@ -944,7 +971,14 @@ async function downloadStoryPost(sourceUrl, metadata, tempDir, options = {}) {
     files = await moveDirectoryContents(tempDir, downloadDir);
   }
 
-  const primaryFile = pickPrimaryVideo(files) || pickPrimaryFile(files);
+  const primaryFile = pickPrimaryVideo(files);
+  if (!primaryFile) {
+    throw Object.assign(new Error('TikTok story download did not produce a playable video file.'), {
+      kind: 'no_video_file',
+      sourceUrl: String(sourceUrl),
+      downloadDir,
+    });
+  }
   const sizeBytes = primaryFile ? await fileSize(primaryFile) : 0;
   return {
     sourceUrl: String(sourceUrl),

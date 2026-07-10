@@ -89,6 +89,16 @@ test('serves files only for valid tokens with private health, HEAD, and Range su
         max_duration_seconds: input.maxDurationSeconds,
         created_at: Date.now(),
         updated_at: Date.now(),
+        items: [{
+          id: 1,
+          position: 1,
+          video_id: 'video-1',
+          source_url: 'https://www.tiktok.com/@creator/video/video-1',
+          title: 'Checkpointed item',
+          status: 'queued',
+          attempt_count: 0,
+          updated_at: Date.now(),
+        }],
       };
       imports.unshift(record);
       return { import: record, reused: false };
@@ -96,6 +106,33 @@ test('serves files only for valid tokens with private health, HEAD, and Range su
     list: () => imports,
     get: (id) => imports.find((entry) => entry.id === id) ?? null,
     status: () => ({ active: 0, queued: imports.length, concurrency: 1 }),
+    cancel(id) {
+      const record = imports.find((entry) => entry.id === id);
+      if (!record) return { accepted: false, reason: 'not_found', import: null };
+      if (!['queued', 'running'].includes(record.status)) {
+        return { accepted: false, reason: 'not_active', import: record };
+      }
+      record.cancel_requested_at = Date.now();
+      if (record.status === 'queued') {
+        record.status = 'canceled';
+        record.canceled_at = Date.now();
+        record.completed_at = Date.now();
+      }
+      return { accepted: true, reason: null, import: record };
+    },
+    retry(id) {
+      const record = imports.find((entry) => entry.id === id);
+      if (!record) return { accepted: false, reason: 'not_found', import: null };
+      if (!['failed', 'canceled'].includes(record.status)) {
+        return { accepted: false, reason: 'not_retryable', import: record };
+      }
+      record.status = 'queued';
+      record.retry_count = Number(record.retry_count || 0) + 1;
+      record.cancel_requested_at = null;
+      record.canceled_at = null;
+      record.completed_at = null;
+      return { accepted: true, reason: null, import: record };
+    },
   };
   const { server, address } = await startHttpServer({
     config,
@@ -158,7 +195,32 @@ test('serves files only for valid tokens with private health, HEAD, and Range su
 
   const importDetailResponse = await fetch(`${baseUrl}/api/imports/1`);
   assert.equal(importDetailResponse.status, 200);
-  assert.equal((await importDetailResponse.json()).import.id, 1);
+  const importDetail = (await importDetailResponse.json()).import;
+  assert.equal(importDetail.id, 1);
+  assert.equal(importDetail.items[0].status, 'queued');
+
+  const cancelImportResponse = await fetch(`${baseUrl}/api/imports/1/cancel`, { method: 'POST' });
+  assert.equal(cancelImportResponse.status, 200);
+  const canceledImport = await cancelImportResponse.json();
+  assert.equal(canceledImport.cancellationRequested, true);
+  assert.equal(canceledImport.import.status, 'canceled');
+
+  const retryImportResponse = await fetch(`${baseUrl}/api/imports/1/retry`, { method: 'POST' });
+  assert.equal(retryImportResponse.status, 202);
+  const retriedImport = await retryImportResponse.json();
+  assert.equal(retriedImport.retried, true);
+  assert.equal(retriedImport.import.status, 'queued');
+  assert.equal(retriedImport.import.retryCount, 1);
+
+  const invalidRetryResponse = await fetch(`${baseUrl}/api/imports/1/retry`, { method: 'POST' });
+  assert.equal(invalidRetryResponse.status, 409);
+  imports[0].status = 'running';
+  imports[0].cancel_requested_at = null;
+  const runningCancelResponse = await fetch(`${baseUrl}/api/imports/1/cancel`, { method: 'POST' });
+  assert.equal(runningCancelResponse.status, 202);
+  assert.equal((await runningCancelResponse.json()).import.status, 'running');
+  const missingCancelResponse = await fetch(`${baseUrl}/api/imports/999/cancel`, { method: 'POST' });
+  assert.equal(missingCancelResponse.status, 404);
 
   const missingResponse = await fetch(`${baseUrl}/files/missing-token`);
   assert.equal(missingResponse.status, 404);
@@ -188,7 +250,7 @@ test('creator import API requires a bearer token outside loopback', () => {
   ), false);
 });
 
-test('creator video deletion requires typed confirmation and removes only that creator media', async (t) => {
+test('creator video deletion requires typed confirmation and trashes only that creator media', async (t) => {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-creator-delete-'));
   const downloadDir = path.join(rootDir, 'downloads');
   const dbPath = path.join(rootDir, 'state.db');
@@ -280,21 +342,21 @@ test('creator video deletion requires typed confirmation and removes only that c
   assert.deepEqual(await deleted.json(), {
     username: 'Creator',
     deletedVideos: 1,
-    deletedStoredFiles: 4,
+    deletedStoredFiles: 0,
+    trashedVideos: 1,
     failedVideos: 0,
   });
 
-  await assert.rejects(access(creatorVideoPath), { code: 'ENOENT' });
-  for (const sidecarPath of sidecarPaths) {
-    await assert.rejects(access(sidecarPath), { code: 'ENOENT' });
-  }
+  await access(creatorVideoPath);
+  for (const sidecarPath of sidecarPaths) await access(sidecarPath);
   await access(unrelatedPath);
-  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM files WHERE id = ?').get(creatorFileId).count, 0);
+  assert.equal(store.getTrashedFile(creatorFileId)?.id, creatorFileId);
   assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM files WHERE id = ?').get(unrelatedFileId).count, 1);
-  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM link_tokens WHERE token = ?').get('creator-token').count, 0);
+  assert.equal(store.getValidToken('creator-token'), null);
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM link_tokens WHERE token = ?').get('creator-token').count, 1);
 });
 
-test('individual video deletion confirms the file id and preserves sibling records and shared bytes', async (t) => {
+test('individual video deletion trashes, blocks delivery, and supports confirmed restore', async (t) => {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-video-delete-'));
   const downloadDir = path.join(rootDir, 'downloads');
   const dbPath = path.join(rootDir, 'state.db');
@@ -341,6 +403,7 @@ test('individual video deletion confirms the file id and preserves sibling recor
     filename: '201.mp4',
     sizeBytes: 15,
   });
+  store.createLinkToken({ token: 'deleted-token', fileId: deletedFileId, expiresAt: 0 });
 
   const { server, address } = await startHttpServer({
     config,
@@ -369,19 +432,50 @@ test('individual video deletion confirms the file id and preserves sibling recor
     body: JSON.stringify({ confirmFileId: deletedFileId }),
   });
   assert.equal(deleted.status, 200);
-  assert.deepEqual(await deleted.json(), {
+  const deletedBody = await deleted.json();
+  assert.equal(deletedBody.fileId, deletedFileId);
+  assert.equal(deletedBody.videoId, '200');
+  assert.equal(deletedBody.username, 'creator');
+  assert.equal(deletedBody.deletedVideo, true);
+  assert.equal(deletedBody.deletedStoredFiles, 0);
+  assert.equal(deletedBody.trashedVideo, true);
+  assert.ok(deletedBody.purgeAt > deletedBody.trashedAt);
+
+  await access(deletedPath);
+  await access(deletedSidecarPath);
+  await access(siblingPath);
+  assert.equal(store.getTrashedFile(deletedFileId)?.id, deletedFileId);
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM files WHERE id = ?').get(siblingFileId).count, 1);
+  assert.equal((await fetch(`${baseUrl}/files/deleted-token`)).status, 404);
+
+  const trash = await fetch(`${baseUrl}/api/trash?limit=1`);
+  assert.equal(trash.status, 200);
+  const trashBody = await trash.json();
+  assert.equal(trashBody.retentionDays, 30);
+  assert.equal(trashBody.videos[0].fileId, deletedFileId);
+  assert.equal('path' in trashBody.videos[0], false);
+
+  const unconfirmedRestore = await fetch(`${baseUrl}/api/videos/${deletedFileId}/restore`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ confirmFileId: siblingFileId }),
+  });
+  assert.equal(unconfirmedRestore.status, 400);
+
+  const restored = await fetch(`${baseUrl}/api/videos/${deletedFileId}/restore`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ confirmFileId: deletedFileId }),
+  });
+  assert.equal(restored.status, 200);
+  assert.deepEqual(await restored.json(), {
     fileId: deletedFileId,
     videoId: '200',
     username: 'creator',
-    deletedVideo: true,
-    deletedStoredFiles: 2,
+    restoredVideo: true,
   });
-
-  await assert.rejects(access(deletedPath), { code: 'ENOENT' });
-  await assert.rejects(access(deletedSidecarPath), { code: 'ENOENT' });
-  await access(siblingPath);
-  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM files WHERE id = ?').get(deletedFileId).count, 0);
-  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM files WHERE id = ?').get(siblingFileId).count, 1);
+  assert.equal(store.getTrashedFile(deletedFileId), null);
+  assert.equal((await fetch(`${baseUrl}/files/deleted-token`)).status, 200);
 
   const deletedSharedRecord = await fetch(`${baseUrl}/api/videos/${siblingFileId}`, {
     method: 'DELETE',
@@ -391,6 +485,6 @@ test('individual video deletion confirms the file id and preserves sibling recor
   assert.equal(deletedSharedRecord.status, 200);
   assert.equal((await deletedSharedRecord.json()).deletedStoredFiles, 0);
   await access(siblingPath);
-  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM files WHERE id = ?').get(siblingFileId).count, 0);
+  assert.equal(store.getTrashedFile(siblingFileId)?.id, siblingFileId);
   assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM files WHERE id = ?').get(sharedFileId).count, 1);
 });

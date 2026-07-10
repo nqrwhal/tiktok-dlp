@@ -84,6 +84,7 @@ export class Store {
         filename TEXT NOT NULL,
         size_bytes INTEGER NOT NULL,
         created_at INTEGER NOT NULL,
+        trashed_at INTEGER,
         delete_requested_at INTEGER,
         delete_attempts INTEGER NOT NULL DEFAULT 0,
         delete_error TEXT
@@ -120,12 +121,39 @@ export class Store {
         downloaded_count INTEGER NOT NULL DEFAULT 0,
         skipped_existing_count INTEGER NOT NULL DEFAULT 0,
         skipped_duration_count INTEGER NOT NULL DEFAULT 0,
+        skipped_unknown_duration_count INTEGER NOT NULL DEFAULT 0,
         failed_count INTEGER NOT NULL DEFAULT 0,
         last_error TEXT,
         created_at INTEGER NOT NULL,
         started_at INTEGER,
         completed_at INTEGER,
+        discovery_completed_at INTEGER,
+        cancel_requested_at INTEGER,
+        canceled_at INTEGER,
+        retry_count INTEGER NOT NULL DEFAULT 0,
+        resume_count INTEGER NOT NULL DEFAULT 0,
+        last_resumed_at INTEGER,
         updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS creator_import_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        import_id INTEGER NOT NULL REFERENCES creator_imports(id) ON DELETE CASCADE,
+        item_key TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        video_id TEXT,
+        source_url TEXT NOT NULL,
+        title TEXT,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        status TEXT NOT NULL DEFAULT 'queued',
+        duration_seconds REAL,
+        file_id INTEGER,
+        error TEXT,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        completed_at INTEGER,
+        UNIQUE(import_id, item_key)
       );
 
       CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at DESC);
@@ -149,6 +177,7 @@ export class Store {
     this.ensureColumn('jobs', 'guild_id', "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn('jobs', 'channel_id', "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn('files', 'requested_by', "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn('files', 'trashed_at', 'INTEGER');
     this.ensureColumn('files', 'delete_requested_at', 'INTEGER');
     this.ensureColumn('files', 'delete_attempts', 'INTEGER NOT NULL DEFAULT 0');
     this.ensureColumn('files', 'delete_error', 'TEXT');
@@ -157,10 +186,18 @@ export class Store {
     this.ensureColumn('link_tokens', 'scope_id', "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn('link_tokens', 'delivery_type', "TEXT NOT NULL DEFAULT 'manual'");
     this.ensureColumn('seen_videos', 'deletion_check_claimed_at', 'INTEGER');
+    this.ensureColumn('creator_imports', 'skipped_unknown_duration_count', 'INTEGER NOT NULL DEFAULT 0');
+    this.ensureColumn('creator_imports', 'discovery_completed_at', 'INTEGER');
+    this.ensureColumn('creator_imports', 'cancel_requested_at', 'INTEGER');
+    this.ensureColumn('creator_imports', 'canceled_at', 'INTEGER');
+    this.ensureColumn('creator_imports', 'retry_count', 'INTEGER NOT NULL DEFAULT 0');
+    this.ensureColumn('creator_imports', 'resume_count', 'INTEGER NOT NULL DEFAULT 0');
+    this.ensureColumn('creator_imports', 'last_resumed_at', 'INTEGER');
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_jobs_requested_by ON jobs(requested_by);
       CREATE INDEX IF NOT EXISTS idx_jobs_file_id ON jobs(file_id);
       CREATE INDEX IF NOT EXISTS idx_files_requested_by ON files(requested_by);
+      CREATE INDEX IF NOT EXISTS idx_files_trashed_at ON files(trashed_at);
       CREATE INDEX IF NOT EXISTS idx_files_delete_requested_at ON files(delete_requested_at);
       CREATE INDEX IF NOT EXISTS idx_files_username_created_at ON files(username COLLATE NOCASE, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_link_tokens_file_id_expires_at ON link_tokens(file_id, expires_at);
@@ -173,6 +210,8 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_watch_subscriptions_guild_id_username ON watch_subscriptions(guild_id, username);
       CREATE INDEX IF NOT EXISTS idx_creator_imports_created_at ON creator_imports(created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_creator_imports_username_status ON creator_imports(username, status);
+      CREATE INDEX IF NOT EXISTS idx_creator_import_items_import_status_position
+        ON creator_import_items(import_id, status, position, id);
     `);
     this.migrateLegacyDeliveryOwnership();
     this.migrateLegacyWatchSubscriptions();
@@ -517,6 +556,7 @@ export class Store {
           FROM files
           JOIN link_tokens ON link_tokens.file_id = files.id
           WHERE files.video_id = seen_videos.video_id
+            AND files.trashed_at IS NULL
             AND link_tokens.expires_at = 0
           ORDER BY link_tokens.created_at DESC
           LIMIT 1
@@ -525,6 +565,7 @@ export class Store {
           SELECT files.filename
           FROM files
           WHERE files.video_id = seen_videos.video_id
+            AND files.trashed_at IS NULL
           ORDER BY files.created_at DESC
           LIMIT 1
         ) AS filename
@@ -660,10 +701,17 @@ export class Store {
       'downloaded_count',
       'skipped_existing_count',
       'skipped_duration_count',
+      'skipped_unknown_duration_count',
       'failed_count',
       'last_error',
       'started_at',
       'completed_at',
+      'discovery_completed_at',
+      'cancel_requested_at',
+      'canceled_at',
+      'retry_count',
+      'resume_count',
+      'last_resumed_at',
     ];
     const entries = Object.entries(changes).filter(([key]) => allowed.includes(key));
     if (!entries.length) return;
@@ -698,15 +746,400 @@ export class Store {
     `).get(String(username)) ?? null;
   }
 
-  failIncompleteCreatorImports(now = Date.now()) {
-    return this.db.prepare(`
+  beginCreatorImport(id, now = Date.now()) {
+    const result = this.db.prepare(`
       UPDATE creator_imports
-      SET status = 'failed',
-          last_error = COALESCE(last_error, 'Import interrupted by a service restart.'),
+      SET
+        status = 'running',
+        started_at = COALESCE(started_at, ?),
+        completed_at = NULL,
+        canceled_at = NULL,
+        updated_at = ?
+      WHERE id = ?
+        AND status = 'queued'
+        AND cancel_requested_at IS NULL
+    `).run(now, now, Number(id));
+    return result.changes > 0 ? this.getCreatorImport(id) : null;
+  }
+
+  checkpointCreatorImportDiscovery(importId, items = [], now = Date.now()) {
+    const numericId = Number(importId);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const record = this.getCreatorImport(numericId);
+      if (!record || !['queued', 'running'].includes(record.status)) {
+        throw new Error('Creator import is not active.');
+      }
+      const insert = this.db.prepare(`
+        INSERT INTO creator_import_items (
+          import_id,
+          item_key,
+          position,
+          video_id,
+          source_url,
+          title,
+          metadata_json,
+          status,
+          created_at,
+          updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+        ON CONFLICT(import_id, item_key) DO UPDATE SET
+          position = excluded.position,
+          video_id = COALESCE(NULLIF(excluded.video_id, ''), creator_import_items.video_id),
+          source_url = excluded.source_url,
+          title = excluded.title,
+          metadata_json = excluded.metadata_json,
+          updated_at = excluded.updated_at
+      `);
+      for (const item of items) {
+        insert.run(
+          numericId,
+          String(item.itemKey),
+          Number(item.position),
+          String(item.videoId ?? ''),
+          String(item.sourceUrl ?? ''),
+          String(item.title ?? ''),
+          String(item.metadataJson ?? '{}'),
+          now,
+          now,
+        );
+      }
+      const discoveredCount = Number(this.db.prepare(`
+        SELECT COUNT(*) AS count
+        FROM creator_import_items
+        WHERE import_id = ?
+      `).get(numericId).count);
+      this.db.prepare(`
+        UPDATE creator_imports
+        SET
+          discovered_count = ?,
+          discovery_completed_at = COALESCE(discovery_completed_at, ?),
+          updated_at = ?
+        WHERE id = ?
+      `).run(discoveredCount, now, now, numericId);
+      this.db.exec('COMMIT');
+      return this.getCreatorImport(numericId);
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  listCreatorImportItems(importId, limit = 1_000) {
+    return this.db.prepare(`
+      SELECT *
+      FROM creator_import_items
+      WHERE import_id = ?
+      ORDER BY position ASC, id ASC
+      LIMIT ?
+    `).all(Number(importId), Math.max(1, Math.min(10_000, Number(limit) || 1_000)));
+  }
+
+  claimNextCreatorImportItem(importId, now = Date.now()) {
+    const numericId = Number(importId);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const active = this.db.prepare(`
+        SELECT id
+        FROM creator_imports
+        WHERE id = ?
+          AND status = 'running'
+          AND cancel_requested_at IS NULL
+      `).get(numericId);
+      if (!active) {
+        this.db.exec('COMMIT');
+        return null;
+      }
+      const item = this.db.prepare(`
+        SELECT *
+        FROM creator_import_items
+        WHERE import_id = ?
+          AND status = 'queued'
+        ORDER BY position ASC, id ASC
+        LIMIT 1
+      `).get(numericId) ?? null;
+      if (item) {
+        this.db.prepare(`
+          UPDATE creator_import_items
+          SET
+            status = 'running',
+            attempt_count = attempt_count + 1,
+            error = NULL,
+            completed_at = NULL,
+            updated_at = ?
+          WHERE id = ?
+            AND status = 'queued'
+        `).run(now, Number(item.id));
+      }
+      this.db.exec('COMMIT');
+      return item ? this.db.prepare('SELECT * FROM creator_import_items WHERE id = ?').get(Number(item.id)) : null;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  completeCreatorImportItem(itemId, {
+    status,
+    videoId = '',
+    durationSeconds = null,
+    fileId = null,
+    error = null,
+  } = {}, now = Date.now()) {
+    const terminalStatuses = new Set([
+      'downloaded',
+      'skipped_existing',
+      'skipped_duration',
+      'skipped_unknown_duration',
+      'failed',
+    ]);
+    if (!terminalStatuses.has(status)) throw new Error(`Invalid creator import item status: ${status}`);
+    const numericItemId = Number(itemId);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const item = this.db.prepare('SELECT import_id FROM creator_import_items WHERE id = ?').get(numericItemId);
+      if (!item) throw new Error('Creator import item was not found.');
+      this.db.prepare(`
+        UPDATE creator_import_items
+        SET
+          status = ?,
+          video_id = COALESCE(NULLIF(?, ''), video_id),
+          duration_seconds = ?,
+          file_id = ?,
+          error = ?,
           completed_at = ?,
           updated_at = ?
-      WHERE status IN ('queued', 'running')
-    `).run(now, now).changes;
+        WHERE id = ?
+      `).run(
+        status,
+        String(videoId ?? ''),
+        durationSeconds == null ? null : Number(durationSeconds),
+        fileId == null ? null : Number(fileId),
+        error == null ? null : String(error).slice(0, 1_000),
+        now,
+        now,
+        numericItemId,
+      );
+      this.#refreshCreatorImportCounts(Number(item.import_id), now);
+      this.db.exec('COMMIT');
+      return this.db.prepare('SELECT * FROM creator_import_items WHERE id = ?').get(numericItemId);
+    } catch (caught) {
+      this.db.exec('ROLLBACK');
+      throw caught;
+    }
+  }
+
+  requestCreatorImportCancel(id, now = Date.now()) {
+    const numericId = Number(id);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const record = this.getCreatorImport(numericId);
+      if (!record) {
+        this.db.exec('COMMIT');
+        return { accepted: false, reason: 'not_found', import: null };
+      }
+      if (!['queued', 'running'].includes(record.status)) {
+        this.db.exec('COMMIT');
+        return { accepted: false, reason: 'not_active', import: record };
+      }
+      if (record.status === 'queued') {
+        this.db.prepare(`
+          UPDATE creator_imports
+          SET
+            status = 'canceled',
+            cancel_requested_at = COALESCE(cancel_requested_at, ?),
+            canceled_at = ?,
+            completed_at = ?,
+            updated_at = ?
+          WHERE id = ?
+        `).run(now, now, now, now, numericId);
+      } else {
+        this.db.prepare(`
+          UPDATE creator_imports
+          SET cancel_requested_at = COALESCE(cancel_requested_at, ?), updated_at = ?
+          WHERE id = ?
+        `).run(now, now, numericId);
+      }
+      this.db.exec('COMMIT');
+      return { accepted: true, reason: null, import: this.getCreatorImport(numericId) };
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  finalizeCanceledCreatorImport(id, now = Date.now()) {
+    const numericId = Number(id);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.#refreshCreatorImportCounts(numericId, now);
+      this.db.prepare(`
+        UPDATE creator_imports
+        SET
+          status = 'canceled',
+          cancel_requested_at = COALESCE(cancel_requested_at, ?),
+          canceled_at = ?,
+          completed_at = ?,
+          updated_at = ?
+        WHERE id = ?
+          AND status IN ('queued', 'running')
+      `).run(now, now, now, now, numericId);
+      this.db.exec('COMMIT');
+      return this.getCreatorImport(numericId);
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  pauseCreatorImport(id, now = Date.now()) {
+    this.db.prepare(`
+      UPDATE creator_imports
+      SET status = 'queued', updated_at = ?
+      WHERE id = ?
+        AND status = 'running'
+        AND cancel_requested_at IS NULL
+    `).run(now, Number(id));
+    return this.getCreatorImport(id);
+  }
+
+  retryCreatorImport(id, now = Date.now()) {
+    const numericId = Number(id);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const record = this.getCreatorImport(numericId);
+      if (!record) {
+        this.db.exec('COMMIT');
+        return { accepted: false, reason: 'not_found', import: null };
+      }
+      if (!['failed', 'canceled'].includes(record.status)) {
+        this.db.exec('COMMIT');
+        return { accepted: false, reason: 'not_retryable', import: record };
+      }
+      this.db.prepare(`
+        UPDATE creator_import_items
+        SET status = 'queued', error = NULL, completed_at = NULL, updated_at = ?
+        WHERE import_id = ?
+          AND status = 'running'
+      `).run(now, numericId);
+      this.db.prepare(`
+        UPDATE creator_imports
+        SET
+          status = 'queued',
+          last_error = NULL,
+          started_at = NULL,
+          completed_at = NULL,
+          cancel_requested_at = NULL,
+          canceled_at = NULL,
+          retry_count = retry_count + 1,
+          updated_at = ?
+        WHERE id = ?
+      `).run(now, numericId);
+      this.#refreshCreatorImportCounts(numericId, now);
+      this.db.exec('COMMIT');
+      return { accepted: true, reason: null, import: this.getCreatorImport(numericId) };
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  resumeIncompleteCreatorImports(now = Date.now()) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare(`
+        UPDATE creator_imports
+        SET
+          status = 'canceled',
+          canceled_at = COALESCE(canceled_at, ?),
+          completed_at = COALESCE(completed_at, ?),
+          updated_at = ?
+        WHERE status IN ('queued', 'running')
+          AND cancel_requested_at IS NOT NULL
+      `).run(now, now, now);
+      this.db.prepare(`
+        UPDATE creator_import_items
+        SET status = 'queued', error = NULL, completed_at = NULL, updated_at = ?
+        WHERE status = 'running'
+          AND import_id IN (
+            SELECT id FROM creator_imports WHERE status IN ('queued', 'running')
+          )
+      `).run(now);
+      this.db.prepare(`
+        UPDATE creator_imports
+        SET
+          status = 'queued',
+          resume_count = resume_count + 1,
+          last_resumed_at = ?,
+          updated_at = ?
+        WHERE status IN ('queued', 'running')
+          AND cancel_requested_at IS NULL
+      `).run(now, now);
+      const imports = this.db.prepare(`
+        SELECT *
+        FROM creator_imports
+        WHERE status = 'queued'
+        ORDER BY created_at ASC, id ASC
+      `).all();
+      this.db.exec('COMMIT');
+      return imports;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  failIncompleteCreatorImports(now = Date.now()) {
+    return this.resumeIncompleteCreatorImports(now).length;
+  }
+
+  #refreshCreatorImportCounts(importId, now = Date.now()) {
+    const counts = this.db.prepare(`
+      SELECT
+        COUNT(*) AS discovered_count,
+        SUM(CASE WHEN status IN ('downloaded', 'skipped_existing', 'skipped_duration', 'skipped_unknown_duration', 'failed') THEN 1 ELSE 0 END) AS processed_count,
+        SUM(CASE WHEN status = 'downloaded' THEN 1 ELSE 0 END) AS downloaded_count,
+        SUM(CASE WHEN status = 'skipped_existing' THEN 1 ELSE 0 END) AS skipped_existing_count,
+        SUM(CASE WHEN status = 'skipped_duration' THEN 1 ELSE 0 END) AS skipped_duration_count,
+        SUM(CASE WHEN status = 'skipped_unknown_duration' THEN 1 ELSE 0 END) AS skipped_unknown_duration_count,
+        SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_count
+      FROM creator_import_items
+      WHERE import_id = ?
+    `).get(Number(importId));
+    const latestFailure = this.db.prepare(`
+      SELECT error
+      FROM creator_import_items
+      WHERE import_id = ?
+        AND status = 'failed'
+        AND error IS NOT NULL
+      ORDER BY completed_at DESC, id DESC
+      LIMIT 1
+    `).get(Number(importId));
+    this.db.prepare(`
+      UPDATE creator_imports
+      SET
+        discovered_count = ?,
+        processed_count = ?,
+        downloaded_count = ?,
+        skipped_existing_count = ?,
+        skipped_duration_count = ?,
+        skipped_unknown_duration_count = ?,
+        failed_count = ?,
+        last_error = COALESCE(?, last_error),
+        updated_at = ?
+      WHERE id = ?
+    `).run(
+      Number(counts?.discovered_count ?? 0),
+      Number(counts?.processed_count ?? 0),
+      Number(counts?.downloaded_count ?? 0),
+      Number(counts?.skipped_existing_count ?? 0),
+      Number(counts?.skipped_duration_count ?? 0),
+      Number(counts?.skipped_unknown_duration_count ?? 0),
+      Number(counts?.failed_count ?? 0),
+      latestFailure?.error ?? null,
+      now,
+      Number(importId),
+    );
   }
 
   createFileRecord({ videoId = '', username = '', requestedBy = '', sourceUrl, filePath, filename, sizeBytes }, now = Date.now()) {
@@ -717,13 +1150,13 @@ export class Store {
     return Number(result.lastInsertRowid);
   }
 
-  getLatestFileByVideoId(videoId) {
+  getLatestFileByVideoId(videoId, { includeTrashed = false } = {}) {
     if (!videoId) return null;
     return this.db.prepare(`
       SELECT *
       FROM files
       WHERE video_id = ?
-        AND delete_requested_at IS NULL
+        ${includeTrashed ? '' : 'AND trashed_at IS NULL AND delete_requested_at IS NULL'}
       ORDER BY created_at DESC
       LIMIT 1
     `).get(String(videoId)) ?? null;
@@ -738,6 +1171,10 @@ export class Store {
     deliveryType = 'manual',
     expiresAt,
   }, now = Date.now()) {
+    const fileRecord = this.db.prepare('SELECT requested_by, trashed_at FROM files WHERE id = ?').get(fileId);
+    if (!fileRecord || fileRecord.trashed_at != null) {
+      throw new Error('Cannot create a delivery for a missing or trashed archive file.');
+    }
     let resolvedJobId = jobId == null ? null : Number(jobId);
     let linkedJob = null;
     if (resolvedJobId == null) {
@@ -752,7 +1189,7 @@ export class Store {
     } else {
       linkedJob = this.db.prepare('SELECT id, type, requested_by FROM jobs WHERE id = ?').get(resolvedJobId) ?? null;
     }
-    const legacyOwner = this.db.prepare('SELECT requested_by FROM files WHERE id = ?').get(fileId)?.requested_by ?? '';
+    const legacyOwner = fileRecord.requested_by ?? '';
     const resolvedOwnerId = String(ownerId || linkedJob?.requested_by || legacyOwner || '');
     const resolvedDeliveryType = deliveryType === 'manual' && linkedJob?.type === 'monitor'
       ? 'monitor'
@@ -807,6 +1244,7 @@ export class Store {
       FROM link_tokens
       JOIN files ON files.id = link_tokens.file_id
       WHERE link_tokens.token = ?
+        AND files.trashed_at IS NULL
     `).get(token) ?? null;
   }
 
@@ -825,6 +1263,7 @@ export class Store {
       FROM link_tokens
       JOIN files ON files.id = link_tokens.file_id
       WHERE link_tokens.token = ?
+        AND files.trashed_at IS NULL
         AND link_tokens.delivery_type = 'monitor'
     `).get(String(token ?? '')) ?? null;
   }
@@ -836,6 +1275,7 @@ export class Store {
       FROM link_tokens
       JOIN files ON files.id = link_tokens.file_id
       WHERE files.video_id = ?
+        AND files.trashed_at IS NULL
         AND link_tokens.delivery_type = 'monitor'
         AND link_tokens.expires_at = 0
         AND link_tokens.scope_id = ?
@@ -858,7 +1298,9 @@ export class Store {
         files.*
       FROM link_tokens
       JOIN files ON files.id = link_tokens.file_id
-      WHERE link_tokens.token = ? AND (link_tokens.expires_at = 0 OR link_tokens.expires_at > ?)
+      WHERE link_tokens.token = ?
+        AND files.trashed_at IS NULL
+        AND (link_tokens.expires_at = 0 OR link_tokens.expires_at > ?)
     `).get(token, now) ?? null;
   }
 
@@ -872,12 +1314,18 @@ export class Store {
         ELSE ?
       END
       WHERE token = ?
+        AND file_id IN (SELECT id FROM files WHERE trashed_at IS NULL)
     `).run(now, additionalMs, newExpiry, token);
     return result.changes > 0 ? this.getToken(token) : null;
   }
 
   setLinkTokenPermanent(token) {
-    const result = this.db.prepare('UPDATE link_tokens SET expires_at = 0 WHERE token = ?').run(token);
+    const result = this.db.prepare(`
+      UPDATE link_tokens
+      SET expires_at = 0
+      WHERE token = ?
+        AND file_id IN (SELECT id FROM files WHERE trashed_at IS NULL)
+    `).run(token);
     return result.changes > 0 ? this.getToken(token) : null;
   }
 
@@ -885,11 +1333,13 @@ export class Store {
     return this.db.prepare('DELETE FROM link_tokens WHERE expires_at > 0 AND expires_at <= ?').run(now).changes;
   }
 
-  listFilesWithoutActiveLinks(now = Date.now(), limit = 100) {
+  listFilesWithoutActiveLinks(now = Date.now(), limit = 100, createdBefore = now) {
     return this.db.prepare(`
       SELECT files.id, files.path, files.filename, files.video_id
       FROM files
-      WHERE NOT EXISTS (
+      WHERE files.trashed_at IS NULL
+        AND (files.delete_requested_at IS NOT NULL OR files.created_at <= ?)
+        AND NOT EXISTS (
           SELECT 1
           FROM link_tokens
           WHERE link_tokens.file_id = files.id
@@ -905,17 +1355,19 @@ export class Store {
         )
       ORDER BY files.created_at ASC
       LIMIT ?
-    `).all(now, now, Math.max(1, Math.min(1_000, Number(limit) || 100)));
+    `).all(createdBefore, now, now, Math.max(1, Math.min(1_000, Number(limit) || 100)));
   }
 
-  claimFilesForDeletion(now = Date.now(), limit = 100) {
+  claimFilesForDeletion(now = Date.now(), limit = 100, createdBefore = now) {
     const boundedLimit = Math.max(1, Math.min(1_000, Number(limit) || 100));
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const files = this.db.prepare(`
         SELECT files.id, files.path, files.filename, files.video_id
         FROM files
-        WHERE NOT EXISTS (
+        WHERE files.trashed_at IS NULL
+          AND (files.delete_requested_at IS NOT NULL OR files.created_at <= ?)
+          AND NOT EXISTS (
             SELECT 1
             FROM link_tokens
             WHERE link_tokens.file_id = files.id
@@ -934,7 +1386,7 @@ export class Store {
           files.created_at ASC,
           files.id ASC
         LIMIT ?
-      `).all(now, now, boundedLimit);
+      `).all(createdBefore, now, now, boundedLimit);
       if (files.length) {
         const ids = files.map((file) => Number(file.id));
         const placeholders = ids.map(() => '?').join(', ');
@@ -966,6 +1418,131 @@ export class Store {
       WHERE id = ?
     `).run(now, message, Number(fileId));
     return result.changes > 0;
+  }
+
+  trashFile(fileId, now = Date.now()) {
+    const numericId = Number(fileId);
+    if (!Number.isInteger(numericId) || numericId <= 0) return null;
+    const result = this.db.prepare(`
+      UPDATE files
+      SET
+        trashed_at = ?,
+        delete_requested_at = NULL,
+        delete_error = NULL
+      WHERE id = ?
+        AND trashed_at IS NULL
+    `).run(now, numericId);
+    if (!result.changes) return null;
+    return this.getTrashedFile(numericId);
+  }
+
+  trashCreatorVideoFiles(username, now = Date.now()) {
+    const normalized = String(username ?? '').trim().replace(/^@/, '');
+    if (!normalized) return [];
+    const files = this.db.prepare(`
+      SELECT id
+      FROM files
+      WHERE lower(username) = lower(?)
+        AND lower(filename) LIKE '%.mp4'
+        AND trashed_at IS NULL
+      ORDER BY created_at ASC, id ASC
+    `).all(normalized);
+    if (!files.length) return [];
+    const ids = files.map((file) => Number(file.id));
+    const placeholders = ids.map(() => '?').join(', ');
+    this.db.prepare(`
+      UPDATE files
+      SET
+        trashed_at = ?,
+        delete_requested_at = NULL,
+        delete_error = NULL
+      WHERE id IN (${placeholders})
+    `).run(now, ...ids);
+    return ids;
+  }
+
+  getTrashedFile(fileId) {
+    const numericId = Number(fileId);
+    if (!Number.isInteger(numericId) || numericId <= 0) return null;
+    return this.db.prepare(`
+      SELECT *
+      FROM files
+      WHERE id = ?
+        AND trashed_at IS NOT NULL
+    `).get(numericId) ?? null;
+  }
+
+  listTrashedFiles(limit = 100) {
+    return this.db.prepare(`
+      SELECT id, video_id, username, source_url, path, filename, size_bytes, created_at, trashed_at
+      FROM files
+      WHERE trashed_at IS NOT NULL
+      ORDER BY trashed_at DESC, id DESC
+      LIMIT ?
+    `).all(Math.max(1, Math.min(1_000, Number(limit) || 100)));
+  }
+
+  restoreTrashedFile(fileId) {
+    const numericId = Number(fileId);
+    if (!Number.isInteger(numericId) || numericId <= 0) return null;
+    const result = this.db.prepare(`
+      UPDATE files
+      SET
+        trashed_at = NULL,
+        delete_requested_at = NULL,
+        delete_error = NULL
+      WHERE id = ?
+        AND trashed_at IS NOT NULL
+        AND (delete_requested_at IS NULL OR delete_error IS NOT NULL)
+    `).run(numericId);
+    return result.changes > 0 ? this.db.prepare('SELECT * FROM files WHERE id = ?').get(numericId) : null;
+  }
+
+  claimTrashedFilesForDeletion(trashedBefore, now = Date.now(), limit = 100) {
+    const boundedLimit = Math.max(1, Math.min(1_000, Number(limit) || 100));
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const files = this.db.prepare(`
+        SELECT id, path, filename, video_id, username, trashed_at
+        FROM files
+        WHERE trashed_at IS NOT NULL
+          AND trashed_at <= ?
+        ORDER BY
+          CASE WHEN delete_requested_at IS NULL THEN 0 ELSE 1 END,
+          trashed_at ASC,
+          id ASC
+        LIMIT ?
+      `).all(Number(trashedBefore), boundedLimit);
+      if (files.length) {
+        const ids = files.map((file) => Number(file.id));
+        const placeholders = ids.map(() => '?').join(', ');
+        this.db.prepare(`
+          UPDATE files
+          SET
+            delete_requested_at = ?,
+            delete_attempts = delete_attempts + 1,
+            delete_error = NULL
+          WHERE id IN (${placeholders})
+            AND trashed_at IS NOT NULL
+        `).run(now, ...ids);
+      }
+      this.db.exec('COMMIT');
+      return files;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  listFilePathsReferencedOutside(fileIds = []) {
+    const ids = normalizeIds(fileIds);
+    if (!ids.length) return this.db.prepare('SELECT DISTINCT path FROM files').all().map((row) => row.path);
+    const placeholders = ids.map(() => '?').join(', ');
+    return this.db.prepare(`
+      SELECT DISTINCT path
+      FROM files
+      WHERE id NOT IN (${placeholders})
+    `).all(...ids).map((row) => row.path);
   }
 
   deleteFileRecords(ids = []) {
@@ -1065,7 +1642,7 @@ export class Store {
     username = '',
     now = Date.now(),
   } = {}) {
-    const clauses = [this.buildRequesterClause(includeMonitored, scopeId)];
+    const clauses = [this.buildRequesterClause(includeMonitored, scopeId), 'files.trashed_at IS NULL'];
     const params = this.buildRequesterParams(requestedBy, includeMonitored, scopeId);
     if (activeOnly) {
       clauses.push('(link_tokens.expires_at = 0 OR link_tokens.expires_at > ?)');
@@ -1114,7 +1691,7 @@ export class Store {
     username = '',
     now = Date.now(),
   } = {}) {
-    const clauses = [this.buildRequesterClause(includeMonitored, scopeId)];
+    const clauses = [this.buildRequesterClause(includeMonitored, scopeId), 'files.trashed_at IS NULL'];
     const params = this.buildRequesterParams(requestedBy, includeMonitored, scopeId);
     if (activeOnly) {
       clauses.push('(link_tokens.expires_at = 0 OR link_tokens.expires_at > ?)');
@@ -1140,7 +1717,7 @@ export class Store {
     scopeId = '',
     username = '',
   } = {}) {
-    const clauses = [this.buildRequesterClause(includeMonitored, scopeId), 'link_tokens.expires_at = 0'];
+    const clauses = [this.buildRequesterClause(includeMonitored, scopeId), 'link_tokens.expires_at = 0', 'files.trashed_at IS NULL'];
     const params = this.buildRequesterParams(requestedBy, includeMonitored, scopeId);
     if (username) {
       clauses.push('lower(files.username) = lower(?)');
@@ -1202,7 +1779,7 @@ export class Store {
   }
 
   countPermanentDownloadsByRequester(requestedBy, { includeMonitored = false, scopeId = '', username = '' } = {}) {
-    const clauses = [this.buildRequesterClause(includeMonitored, scopeId), 'link_tokens.expires_at = 0'];
+    const clauses = [this.buildRequesterClause(includeMonitored, scopeId), 'link_tokens.expires_at = 0', 'files.trashed_at IS NULL'];
     const params = this.buildRequesterParams(requestedBy, includeMonitored, scopeId);
     if (username) {
       clauses.push('lower(files.username) = lower(?)');
@@ -1234,7 +1811,7 @@ export class Store {
     scopeId = '',
     username = '',
   } = {}) {
-    const clauses = [this.buildRequesterClause(includeMonitored, scopeId)];
+    const clauses = [this.buildRequesterClause(includeMonitored, scopeId), 'files.trashed_at IS NULL'];
     const params = this.buildRequesterParams(requestedBy, includeMonitored, scopeId);
     if (username) {
       clauses.push('lower(files.username) = lower(?)');
@@ -1274,12 +1851,18 @@ export class Store {
 
   listPurgePlan({ requestedBy = '', now = Date.now() } = {}) {
     if (!requestedBy) {
-      return this.db.prepare('SELECT id, path, filename, video_id FROM files ORDER BY created_at ASC').all();
+      return this.db.prepare(`
+        SELECT id, path, filename, video_id
+        FROM files
+        WHERE trashed_at IS NULL
+        ORDER BY created_at ASC
+      `).all();
     }
     return this.db.prepare(`
       SELECT files.id, files.path, files.filename, files.video_id
       FROM files
-      WHERE EXISTS (
+      WHERE files.trashed_at IS NULL
+        AND EXISTS (
         SELECT 1
         FROM link_tokens
         WHERE link_tokens.file_id = files.id
@@ -1332,6 +1915,7 @@ export class Store {
       FROM files
       WHERE lower(files.username) = lower(?)
         AND lower(files.filename) LIKE '%.mp4'
+        AND files.trashed_at IS NULL
       ORDER BY files.created_at ASC, files.id ASC
     `).all(normalized, normalized);
   }
@@ -1355,6 +1939,7 @@ export class Store {
       FROM files
       WHERE files.id = ?
         AND lower(files.filename) LIKE '%.mp4'
+        AND files.trashed_at IS NULL
     `).get(numericId) ?? null;
   }
 
@@ -1373,11 +1958,21 @@ export class Store {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       if (scoped) {
-        counts.links += this.db.prepare('DELETE FROM link_tokens WHERE owner_id = ?').run(String(requestedBy)).changes;
-        counts.jobs += this.db.prepare('DELETE FROM jobs WHERE requested_by = ?').run(String(requestedBy)).changes;
+        counts.links += this.db.prepare(`
+          DELETE FROM link_tokens
+          WHERE owner_id = ?
+            AND file_id IN (SELECT id FROM files WHERE trashed_at IS NULL)
+        `).run(String(requestedBy)).changes;
+        counts.jobs += this.db.prepare(`
+          DELETE FROM jobs
+          WHERE requested_by = ?
+            AND (
+              file_id IS NULL
+              OR file_id IN (SELECT id FROM files WHERE trashed_at IS NULL)
+            )
+        `).run(String(requestedBy)).changes;
       } else {
-        counts.links += this.db.prepare('DELETE FROM link_tokens').run().changes;
-        counts.jobs += this.db.prepare('DELETE FROM jobs').run().changes;
+        counts.jobs += this.db.prepare('DELETE FROM jobs WHERE file_id IS NULL').run().changes;
       }
 
       if (removableIds.length) {
@@ -1406,6 +2001,7 @@ export class Store {
       SELECT files.id
       FROM files
       WHERE files.id IN (${placeholders})
+        AND files.trashed_at IS NULL
         AND EXISTS (
           SELECT 1
           FROM link_tokens
@@ -1452,9 +2048,10 @@ export class Store {
   stats() {
     const watchCount = this.db.prepare('SELECT COUNT(*) AS count FROM watched_users').get().count;
     const videoCount = this.db.prepare('SELECT COUNT(*) AS count FROM seen_videos').get().count;
-    const fileCount = this.db.prepare('SELECT COUNT(*) AS count FROM files').get().count;
+    const fileCount = this.db.prepare('SELECT COUNT(*) AS count FROM files WHERE trashed_at IS NULL').get().count;
+    const trashCount = this.db.prepare('SELECT COUNT(*) AS count FROM files WHERE trashed_at IS NOT NULL').get().count;
     const latestJob = this.db.prepare('SELECT * FROM jobs ORDER BY created_at DESC LIMIT 1').get() ?? null;
-    return { watchCount, videoCount, fileCount, latestJob };
+    return { watchCount, videoCount, fileCount, trashCount, latestJob };
   }
 }
 

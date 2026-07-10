@@ -107,6 +107,7 @@
   scroll-snap-type: y mandatory;
   scrollbar-width: none;
   overscroll-behavior-y: contain;
+  overflow-anchor: none;
 }
 
 .feedScroller::-webkit-scrollbar {
@@ -116,13 +117,20 @@
 .feedCard {
   --wash: #161916;
   position: relative;
-  height: 100dvh;
-  min-height: 500px;
+  height: 100%;
+  min-height: 100%;
   overflow: hidden;
   scroll-snap-align: start;
   scroll-snap-stop: always;
   background: var(--wash);
   isolation: isolate;
+}
+
+.feedSpacer {
+  width: 1px;
+  min-height: 0;
+  pointer-events: none;
+  scroll-snap-align: none;
 }
 
 .video,
@@ -348,6 +356,25 @@
   text-align: center;
 }
 
+.feedHint {
+  position: absolute;
+  z-index: 18;
+  bottom: max(38px, calc(env(safe-area-inset-bottom) + 26px));
+  left: 50%;
+  margin: 0;
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  border-radius: 999px;
+  padding: 8px 12px;
+  background: rgba(8, 10, 9, 0.7);
+  color: rgba(255, 255, 255, 0.82);
+  font-size: 11px;
+  line-height: 1;
+  pointer-events: none;
+  white-space: nowrap;
+  backdrop-filter: blur(10px);
+  transform: translateX(-50%);
+}
+
 .confirmScrim {
   position: fixed;
   z-index: 100;
@@ -461,16 +488,34 @@
   right: 0;
   bottom: 0;
   left: 0;
-  height: 3px;
-  background: rgba(255, 255, 255, 0.18);
+  height: 22px;
+  background: linear-gradient(180deg, transparent 19px, rgba(255, 255, 255, 0.18) 19px);
 }
 
 .progressTrack span {
+  position: absolute;
+  bottom: 0;
+  left: 0;
   display: block;
   width: 0;
-  height: 100%;
+  height: 3px;
   background: rgba(255, 255, 255, 0.92);
   transition: width 100ms linear;
+}
+
+.progressTrack input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 22px;
+  margin: 0;
+  cursor: pointer;
+  opacity: 0;
+}
+
+.progressTrack:has(input:focus-visible) {
+  outline: 2px solid rgba(255, 255, 255, 0.9);
+  outline-offset: -4px;
 }
 
 .emptyFeed {

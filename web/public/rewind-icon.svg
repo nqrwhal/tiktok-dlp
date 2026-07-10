@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Rewind">
+  <rect width="512" height="512" rx="112" fill="#080a09"/>
+  <path d="M92 256 246 142v228L92 256Z" fill="#f5f7f2"/>
+  <path d="M224 256 378 142v228L224 256Z" fill="#b8ff55"/>
+  <rect x="382" y="142" width="38" height="228" rx="19" fill="#f5f7f2"/>
+</svg>

@@ -15,10 +15,12 @@ import {
 import Link from "next/link";
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { mockStats, mockVideos } from "../../lib/mock-data";
-import type { Creator, CreatorImport } from "../../lib/types";
+import type { Creator, CreatorImport, CreatorImportItem } from "../../lib/types";
 import { useArchiveData } from "../../lib/useArchiveData";
 import { useModalDialog } from "../../lib/useModalDialog";
 import styles from "./dashboard.module.css";
+
+const IMPORT_FAILURE_DETAIL_LIMIT = 5;
 
 export function CreatorManager({ creators }: { creators: Creator[] }) {
   const archive = useArchiveData({
@@ -35,6 +37,11 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
   const [maxMinutes, setMaxMinutes] = useState("2");
   const [imports, setImports] = useState<CreatorImport[]>([]);
   const [importError, setImportError] = useState("");
+  const [importLoadError, setImportLoadError] = useState("");
+  const [importActionErrors, setImportActionErrors] = useState<Record<number, string>>({});
+  const [importActions, setImportActions] = useState<Record<number, "cancel" | "retry" | "details">>({});
+  const [failureDetails, setFailureDetails] = useState<Record<number, CreatorImportItem[]>>({});
+  const [expandedFailures, setExpandedFailures] = useState<Set<number>>(() => new Set());
   const [submittingImport, setSubmittingImport] = useState(false);
   const [actionCreatorId, setActionCreatorId] = useState("");
   const [deleteCreator, setDeleteCreator] = useState<Creator | null>(null);
@@ -42,7 +49,7 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
   const [deleteError, setDeleteError] = useState("");
   const [deleting, setDeleting] = useState(false);
   const [actionMessage, setActionMessage] = useState("");
-  const terminalImports = useRef(new Set<number>());
+  const importStatuses = useRef(new Map<number, CreatorImport["status"]>());
   const liveCreators = archive.creators;
   const refreshArchive = archive.refresh;
   const { dialogRef, returnFocusRef } = useModalDialog(Boolean(deleteCreator), closeDeleteConfirmation);
@@ -53,27 +60,37 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
     const payload = await response.json() as { imports?: CreatorImport[]; error?: string };
     if (!response.ok) throw new Error(payload.error || `Import status failed (${response.status})`);
     const nextImports = payload.imports || [];
+    const completedTransition = nextImports.some((entry) => {
+      const previous = importStatuses.current.get(entry.id);
+      return previous != null && isActiveImportStatus(previous) && isTerminalImportStatus(entry.status);
+    });
+    for (const entry of nextImports) importStatuses.current.set(entry.id, entry.status);
     setImports(nextImports);
-    const newlyTerminal = nextImports.filter(
-      (entry) => (entry.status === "completed" || entry.status === "failed")
-        && !terminalImports.current.has(entry.id),
-    );
-    for (const entry of newlyTerminal) terminalImports.current.add(entry.id);
-    if (newlyTerminal.length) {
-      refreshArchive();
-    }
+    setImportLoadError("");
+    if (completedTransition) refreshArchive();
   }, [apiBase, refreshArchive]);
 
-  const hasActiveImport = imports.some((entry) => entry.status === "queued" || entry.status === "running");
+  const activeImports = imports.filter((entry) => isActiveImportStatus(entry.status));
+  const hasActiveImport = activeImports.length > 0;
+  const primaryActiveImport = activeImports.find((entry) => entry.status === "running") || activeImports[0];
+
   useEffect(() => {
-    if (!importOpen || !hasActiveImport) return;
+    if (!apiBase) return;
+    // Load durable job state independently of whether the details panel is open.
+    void loadImports().catch((error: unknown) => {
+      setImportLoadError(error instanceof Error ? error.message : String(error));
+    });
+  }, [apiBase, loadImports]);
+
+  useEffect(() => {
+    if (!hasActiveImport) return;
     const timer = window.setInterval(() => {
       void loadImports().catch((error: unknown) => {
-        setImportError(error instanceof Error ? error.message : String(error));
+        setImportLoadError(error instanceof Error ? error.message : String(error));
       });
     }, 4_000);
     return () => window.clearInterval(timer);
-  }, [hasActiveImport, importOpen, loadImports]);
+  }, [hasActiveImport, loadImports]);
 
   useEffect(() => {
     function handlePointerDown(event: PointerEvent) {
@@ -113,7 +130,7 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
     setImportOpen(nextOpen);
     if (nextOpen && apiBase) {
       void loadImports().catch((error: unknown) => {
-        setImportError(error instanceof Error ? error.message : String(error));
+        setImportLoadError(error instanceof Error ? error.message : String(error));
       });
     }
   }
@@ -145,6 +162,7 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
       if (!response.ok || !payload.import) {
         throw new Error(payload.error || `Import failed (${response.status})`);
       }
+      importStatuses.current.set(payload.import.id, payload.import.status);
       setImports((current) => [
         payload.import as CreatorImport,
         ...current.filter((entry) => entry.id !== payload.import?.id),
@@ -154,6 +172,96 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
       setImportError(error instanceof Error ? error.message : String(error));
     } finally {
       setSubmittingImport(false);
+    }
+  }
+
+  function updateImport(nextImport: CreatorImport) {
+    const previousStatus = importStatuses.current.get(nextImport.id);
+    importStatuses.current.set(nextImport.id, nextImport.status);
+    setImports((current) => [
+      nextImport,
+      ...current.filter((entry) => entry.id !== nextImport.id),
+    ].slice(0, 8));
+    if (previousStatus && isActiveImportStatus(previousStatus) && isTerminalImportStatus(nextImport.status)) {
+      refreshArchive();
+    }
+  }
+
+  async function runImportAction(entry: CreatorImport, action: "cancel" | "retry") {
+    if (!apiBase || importActions[entry.id]) return;
+    setImportActions((current) => ({ ...current, [entry.id]: action }));
+    setImportActionErrors((current) => ({ ...current, [entry.id]: "" }));
+    try {
+      const response = await fetch(`${apiBase}/api/imports/${entry.id}/${action}`, { method: "POST" });
+      const payload = await response.json().catch(() => ({})) as { import?: CreatorImport; error?: string };
+      if (!response.ok || !payload.import) {
+        throw new Error(payload.error || `${action === "cancel" ? "Cancel" : "Retry"} failed (${response.status})`);
+      }
+      if (action === "retry") {
+        setFailureDetails((current) => {
+          const next = { ...current };
+          delete next[entry.id];
+          return next;
+        });
+        setExpandedFailures((current) => {
+          const next = new Set(current);
+          next.delete(entry.id);
+          return next;
+        });
+      }
+      updateImport(payload.import);
+    } catch (error) {
+      setImportActionErrors((current) => ({
+        ...current,
+        [entry.id]: error instanceof Error ? error.message : String(error),
+      }));
+    } finally {
+      setImportActions((current) => {
+        const next = { ...current };
+        delete next[entry.id];
+        return next;
+      });
+    }
+  }
+
+  async function toggleFailureDetails(entry: CreatorImport) {
+    if (expandedFailures.has(entry.id)) {
+      setExpandedFailures((current) => {
+        const next = new Set(current);
+        next.delete(entry.id);
+        return next;
+      });
+      return;
+    }
+    if (Object.hasOwn(failureDetails, entry.id)) {
+      setExpandedFailures((current) => new Set(current).add(entry.id));
+      return;
+    }
+    if (!apiBase || importActions[entry.id]) return;
+    setImportActions((current) => ({ ...current, [entry.id]: "details" }));
+    setImportActionErrors((current) => ({ ...current, [entry.id]: "" }));
+    try {
+      const response = await fetch(`${apiBase}/api/imports/${entry.id}`, { cache: "no-store" });
+      const payload = await response.json().catch(() => ({})) as { import?: CreatorImport; error?: string };
+      if (!response.ok || !payload.import) {
+        throw new Error(payload.error || `Import details failed (${response.status})`);
+      }
+      const failures = (payload.import.items || [])
+        .filter((item) => item.status === "failed")
+        .slice(0, IMPORT_FAILURE_DETAIL_LIMIT);
+      setFailureDetails((current) => ({ ...current, [entry.id]: failures }));
+      setExpandedFailures((current) => new Set(current).add(entry.id));
+    } catch (error) {
+      setImportActionErrors((current) => ({
+        ...current,
+        [entry.id]: error instanceof Error ? error.message : String(error),
+      }));
+    } finally {
+      setImportActions((current) => {
+        const next = { ...current };
+        delete next[entry.id];
+        return next;
+      });
     }
   }
 
@@ -177,7 +285,7 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
     const expectedConfirmation = `@${deleteCreator.username}`.toLowerCase();
     if (deleteConfirmation.trim().toLowerCase() !== expectedConfirmation) return;
     if (!apiBase) {
-      setDeleteError("The live backend connection is required to delete videos.");
+      setDeleteError("The live backend connection is required to move videos to trash.");
       return;
     }
 
@@ -194,19 +302,20 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
       );
       const payload = await response.json() as {
         deletedVideos?: number;
+        trashedVideos?: number;
         failedVideos?: number;
         error?: string;
       };
       if (!response.ok) {
-        throw new Error(payload.error || `Deletion failed (${response.status})`);
+        throw new Error(payload.error || `Move to trash failed (${response.status})`);
       }
 
-      const deletedVideos = Number(payload.deletedVideos || 0);
+      const movedVideos = Number(payload.trashedVideos ?? payload.deletedVideos ?? 0);
       const failedVideos = Number(payload.failedVideos || 0);
       setActionMessage(
         failedVideos
-          ? `Deleted ${deletedVideos} videos for @${deleteCreator.username}; ${failedVideos} could not be removed.`
-          : `Deleted ${deletedVideos} videos for @${deleteCreator.username}.`,
+          ? `Moved ${movedVideos} videos for @${deleteCreator.username} to trash; ${failedVideos} could not be moved.`
+          : `Moved ${movedVideos} videos for @${deleteCreator.username} to trash.`,
       );
       returnFocusRef.current = document.getElementById("creator-import-button");
       closeDeleteConfirmation();
@@ -224,16 +333,41 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
         <div>
           <h1>Creators</h1>
         </div>
-        <button
-          className={styles.primaryButton}
-          id="creator-import-button"
-          type="button"
-          onClick={toggleImportPanel}
-          aria-expanded={importOpen}
-        >
-          {importOpen ? <X size={17} /> : <DownloadCloud size={17} />}
-          {importOpen ? "Close" : "Import creator"}
-        </button>
+        <div className={styles.pageHeaderActions} aria-live="polite">
+          {primaryActiveImport ? (
+            <button
+              className={styles.activeImportCompact}
+              type="button"
+              onClick={() => setImportOpen(true)}
+              aria-label={`View import progress for @${primaryActiveImport.username}`}
+            >
+              {primaryActiveImport.status === "running"
+                ? <LoaderCircle className={styles.spinning} size={15} />
+                : <DownloadCloud size={15} />}
+              <span>
+                <strong>@{primaryActiveImport.username}</strong>
+                <small>{formatCompactImportStatus(primaryActiveImport)}</small>
+              </span>
+              {importLoadError ? (
+                <CircleAlert className={styles.importCompactWarning} size={14} aria-label="Import status refresh failed" />
+              ) : activeImports.length > 1 ? <em>+{activeImports.length - 1}</em> : null}
+            </button>
+          ) : !importOpen && importLoadError ? (
+            <button className={styles.importStatusError} type="button" onClick={() => setImportOpen(true)}>
+              <CircleAlert size={14} /> Import status unavailable
+            </button>
+          ) : null}
+          <button
+            className={styles.primaryButton}
+            id="creator-import-button"
+            type="button"
+            onClick={toggleImportPanel}
+            aria-expanded={importOpen}
+          >
+            {importOpen ? <X size={17} /> : <DownloadCloud size={17} />}
+            {importOpen ? "Close" : "Import creator"}
+          </button>
+        </div>
       </div>
 
       {importOpen ? (
@@ -269,9 +403,10 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
             </button>
           </form>
           <p className={styles.importNote}>
-            Existing files and videos longer than the selected limit are skipped. The default is 2 minutes.
+            Existing files, videos longer than the selected limit, and videos without a known duration are skipped. The default is 2 minutes.
           </p>
           {importError ? <p className={styles.importError} role="alert">{importError}</p> : null}
+          {importLoadError ? <p className={styles.importError} role="alert">Could not refresh imports: {importLoadError}</p> : null}
           {imports.length ? (
             <div className={styles.importList} aria-live="polite">
               {imports.map((entry) => (
@@ -279,18 +414,62 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
                   <div>
                     <strong>@{entry.username}</strong>
                     <span>{formatImportStatus(entry)}</span>
+                    {formatImportHistory(entry) ? <small>{formatImportHistory(entry)}</small> : null}
                   </div>
                   <span className={styles.importStatus} data-status={entry.status}>
                     {entry.status === "running" ? <LoaderCircle className={styles.spinning} size={13} /> : null}
-                    {entry.status}
+                    {displayImportStatus(entry)}
                   </span>
                   <dl>
                     <div><dt>Saved</dt><dd>{entry.downloadedCount}</dd></div>
                     <div><dt>Existing</dt><dd>{entry.skippedExistingCount}</dd></div>
                     <div><dt>Too long</dt><dd>{entry.skippedDurationCount}</dd></div>
+                    <div><dt>No duration</dt><dd>{entry.skippedUnknownDurationCount || 0}</dd></div>
                     <div><dt>Failed</dt><dd>{entry.failedCount}</dd></div>
                   </dl>
-                  {entry.lastError && (entry.status === "failed" || entry.failedCount > 0) ? <p>{entry.lastError}</p> : null}
+                  <div className={styles.importRowActions}>
+                    {isActiveImportStatus(entry.status) ? (
+                      <button
+                        type="button"
+                        disabled={Boolean(importActions[entry.id]) || Boolean(entry.cancelRequestedAt)}
+                        onClick={() => void runImportAction(entry, "cancel")}
+                      >
+                        {importActions[entry.id] === "cancel" ? <LoaderCircle className={styles.spinning} size={13} /> : <X size={13} />}
+                        {entry.cancelRequestedAt ? "Canceling" : importActions[entry.id] === "cancel" ? "Canceling" : "Cancel"}
+                      </button>
+                    ) : null}
+                    {entry.status === "failed" || entry.status === "canceled" ? (
+                      <button
+                        type="button"
+                        disabled={Boolean(importActions[entry.id])}
+                        onClick={() => void runImportAction(entry, "retry")}
+                      >
+                        {importActions[entry.id] === "retry" ? <LoaderCircle className={styles.spinning} size={13} /> : <RefreshCw size={13} />}
+                        {importActions[entry.id] === "retry" ? "Retrying" : "Retry"}
+                      </button>
+                    ) : null}
+                    {entry.failedCount > 0 ? (
+                      <button
+                        type="button"
+                        aria-expanded={expandedFailures.has(entry.id)}
+                        disabled={Boolean(importActions[entry.id])}
+                        onClick={() => void toggleFailureDetails(entry)}
+                      >
+                        {importActions[entry.id] === "details" ? <LoaderCircle className={styles.spinning} size={13} /> : <CircleAlert size={13} />}
+                        {expandedFailures.has(entry.id) ? "Hide failures" : "Show failures"}
+                      </button>
+                    ) : null}
+                  </div>
+                  {importActionErrors[entry.id] ? (
+                    <p className={styles.importRowError} role="alert">{importActionErrors[entry.id]}</p>
+                  ) : null}
+                  {entry.lastError && isTerminalImportStatus(entry.status) ? <p>{entry.lastError}</p> : null}
+                  {expandedFailures.has(entry.id) ? (
+                    <ImportFailureDetails
+                      failures={failureDetails[entry.id] || []}
+                      total={entry.failedCount}
+                    />
+                  ) : null}
                 </article>
               ))}
             </div>
@@ -362,7 +541,7 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
                       onClick={() => openDeleteConfirmation(creator)}
                     >
                       <Trash2 size={15} />
-                      Delete all videos
+                      Move all to trash
                     </button>
                   </div>
                 ) : null}
@@ -421,10 +600,10 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
           >
             <div className={styles.confirmIcon}><Trash2 size={19} /></div>
             <div>
-              <h2 id="delete-creator-title">Delete all videos?</h2>
+              <h2 id="delete-creator-title">Move all videos to trash?</h2>
               <p>
-                This permanently removes {deleteCreator.videoCount} archived {deleteCreator.videoCount === 1 ? "video" : "videos"}
-                {" "}and saved metadata for @{deleteCreator.username}. {deleteCreator.enabled
+                This removes {deleteCreator.videoCount} archived {deleteCreator.videoCount === 1 ? "video" : "videos"}
+                {" "}for @{deleteCreator.username} from the active archive. They can be restored from Videos → Trash until their scheduled purge. {deleteCreator.enabled
                   ? "The creator stays in your monitoring list."
                   : "This saved-only creator will be removed from the creator list."}
               </p>
@@ -453,7 +632,7 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
                 onClick={() => void deleteCreatorVideos()}
               >
                 {deleting ? <LoaderCircle className={styles.spinning} size={15} /> : <Trash2 size={15} />}
-                {deleting ? "Deleting" : "Delete all videos"}
+                {deleting ? "Moving" : "Move all to trash"}
               </button>
             </div>
           </section>
@@ -464,6 +643,7 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
 }
 
 function formatImportStatus(entry: CreatorImport) {
+  if (entry.cancelRequestedAt && isActiveImportStatus(entry.status)) return "Cancellation requested";
   if (entry.status === "queued") return `Waiting · ${entry.maxDurationSeconds}s limit`;
   if (entry.status === "running") {
     return entry.discoveredCount
@@ -471,5 +651,53 @@ function formatImportStatus(entry: CreatorImport) {
       : "Scanning profile";
   }
   if (entry.status === "failed") return "Import stopped";
+  if (entry.status === "canceled") return `${entry.processedCount} processed before cancellation`;
   return `${entry.processedCount} processed`;
+}
+
+function formatCompactImportStatus(entry: CreatorImport) {
+  if (entry.cancelRequestedAt) return "Canceling";
+  if (entry.status === "queued") return "Queued";
+  if (!entry.discoveredCount) return "Scanning profile";
+  return `${entry.processedCount}/${entry.discoveredCount} processed`;
+}
+
+function formatImportHistory(entry: CreatorImport) {
+  const parts: string[] = [];
+  if (entry.retryCount > 0) parts.push(`${entry.retryCount} ${entry.retryCount === 1 ? "retry" : "retries"}`);
+  if (entry.resumeCount > 0) parts.push(`${entry.resumeCount} ${entry.resumeCount === 1 ? "resume" : "resumes"}`);
+  return parts.join(" · ");
+}
+
+function displayImportStatus(entry: CreatorImport) {
+  return entry.cancelRequestedAt && isActiveImportStatus(entry.status) ? "canceling" : entry.status;
+}
+
+function isActiveImportStatus(status: CreatorImport["status"]) {
+  return status === "queued" || status === "running";
+}
+
+function isTerminalImportStatus(status: CreatorImport["status"]) {
+  return status === "completed" || status === "failed" || status === "canceled";
+}
+
+function ImportFailureDetails({ failures, total }: { failures: CreatorImportItem[]; total: number }) {
+  return (
+    <div className={styles.importFailures} role="region" aria-label="Individual import failures">
+      {failures.length ? (
+        <ul>
+          {failures.map((failure) => (
+            <li key={failure.id}>
+              <strong>{failure.title || (failure.videoId ? `Video ${failure.videoId}` : `Post ${failure.position}`)}</strong>
+              <span>{failure.error || "This item could not be archived."}</span>
+              {failure.attemptCount > 1 ? <small>{failure.attemptCount} attempts</small> : null}
+            </li>
+          ))}
+        </ul>
+      ) : <p>No individual failure details are available.</p>}
+      {failures.length > 0 && total > IMPORT_FAILURE_DETAIL_LIMIT ? (
+        <small>Showing {Math.min(failures.length, IMPORT_FAILURE_DETAIL_LIMIT)} of {total} failures.</small>
+      ) : null}
+    </div>
+  );
 }
