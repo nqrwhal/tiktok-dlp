@@ -47,9 +47,11 @@ export function useArchiveData({
   const [revision, setRevision] = useState(0);
   const [nextVideoCursor, setNextVideoCursor] = useState<string | null>(null);
   const [loadingMoreVideos, setLoadingMoreVideos] = useState(false);
+  const [loadingBookmarkedVideos, setLoadingBookmarkedVideos] = useState(false);
   const hasLoadedLiveData = useRef(false);
   const nextVideoCursorRef = useRef<string | null>(null);
   const loadingMoreVideosRef = useRef(false);
+  const loadingBookmarkedVideosRef = useRef(false);
   const loadMoreRetryAfterRef = useRef(0);
   const videoRequestKeyRef = useRef("");
   const videoGenerationRef = useRef(0);
@@ -198,6 +200,26 @@ export function useArchiveData({
     }
   }, [configuredBase, fetchVideoPage, includeVideos, paginateVideos]);
 
+  const loadBookmarkedVideos = useCallback(async () => {
+    if (!configuredBase || !includeVideos || loadingBookmarkedVideosRef.current) return [] as SavedVideo[];
+    loadingBookmarkedVideosRef.current = true;
+    setLoadingBookmarkedVideos(true);
+    try {
+      const payload = await fetch(`${base}/api/videos?bookmarked=1&limit=5000`, {
+        cache: "no-store",
+      }).then(assertJsonResponse<SavedVideo[] | FeedPage>);
+      const page = normalizeVideoPage(payload);
+      setVideos((current) => mergeVideos(current, page.items));
+      return page.items;
+    } catch (nextError) {
+      setError(errorMessage("bookmarked videos", nextError));
+      return [] as SavedVideo[];
+    } finally {
+      loadingBookmarkedVideosRef.current = false;
+      setLoadingBookmarkedVideos(false);
+    }
+  }, [base, configuredBase, includeVideos]);
+
   return {
     creators,
     videos,
@@ -207,8 +229,10 @@ export function useArchiveData({
     refresh,
     hasMoreVideos: Boolean(nextVideoCursor),
     loadingMoreVideos,
+    loadingBookmarkedVideos,
     loadMoreVideos,
     loadAllVideos,
+    loadBookmarkedVideos,
   };
 }
 

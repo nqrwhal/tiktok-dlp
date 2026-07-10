@@ -146,6 +146,7 @@ const server = http.createServer(async (request, response) => {
       const creatorId = String(url.searchParams.get("creatorId") || "").toLowerCase();
       const username = String(url.searchParams.get("username") || "").trim();
       const fileId = positiveInteger(url.searchParams.get("fileId"), 0);
+      const bookmarkedOnly = url.searchParams.get("bookmarked") === "1";
       const paginated = url.searchParams.get("page") === "1" || url.searchParams.has("cursor");
       const limit = Math.min(
         paginated ? MAX_PAGINATED_VIDEO_LIMIT : 5_000,
@@ -166,13 +167,20 @@ const server = http.createServer(async (request, response) => {
           username: resolvedUsername,
           limit: paginated ? limit + 1 : limit,
           cursor,
+          bookmarkedOnly,
         }))
+        : bookmarkedOnly
+          ? await remoteSql(buildVideoSql({
+            limit: paginated ? limit + 1 : limit,
+            cursor,
+            bookmarkedOnly: true,
+          }))
         : paginated
           ? await remoteSql(buildVideoSql({ limit: limit + 1, cursor }))
         : limit <= 500
           ? await loadVideoRows()
           : await remoteSql(buildVideoSql({ limit }));
-      if (!paginated && !resolvedUsername && limit > 500) {
+      if (!paginated && !bookmarkedOnly && !resolvedUsername && limit > 500) {
         videoCache = { loadedAt: Date.now(), rows: baseRows };
       }
       if (creatorId && !username && baseRows.length === 0) {
@@ -183,6 +191,7 @@ const server = http.createServer(async (request, response) => {
             username: resolvedUsername,
             limit: paginated ? limit + 1 : limit,
             cursor,
+            bookmarkedOnly,
           }));
         }
       }
@@ -190,7 +199,7 @@ const server = http.createServer(async (request, response) => {
       if (fileId && !cursor) {
         const exactIndex = rows.findIndex((row) => Number(row.id) === fileId);
         if (exactIndex < 0) {
-          const exactRows = await remoteSql(buildVideoSql({ fileId, limit: 1 }));
+          const exactRows = await remoteSql(buildVideoSql({ fileId, limit: 1, bookmarkedOnly }));
           rows.unshift(...exactRows);
         } else if (exactIndex >= limit) {
           rows.unshift(...rows.splice(exactIndex, 1));
@@ -229,6 +238,22 @@ const server = http.createServer(async (request, response) => {
         newThisWeek: Number(row.new_this_week || 0),
         addedToday: Number(row.added_today || 0),
       });
+      return;
+    }
+
+    const bookmarksRoute = url.pathname === "/api/bookmarks";
+    const bookmarkRoute = /^\/api\/bookmarks\/\d+$/.test(url.pathname);
+    if (bookmarksRoute || bookmarkRoute) {
+      const allowed = bookmarksRoute
+        ? request.method === "GET" || request.method === "POST"
+        : request.method === "PUT" || request.method === "DELETE";
+      if (!allowed) {
+        sendJson(response, 405, { error: "Method not allowed" });
+        return;
+      }
+      const body = request.method === "POST" ? await readBodyText(request) : "";
+      const upstream = await remoteAdminRequest(request.method, `${url.pathname}${url.search}`, body);
+      sendUpstream(response, upstream);
       return;
     }
 
@@ -416,7 +441,7 @@ async function serveMedia(request, response, fileId) {
   const wantsDownload = requestUrl.searchParams.get("download") === "1";
   const headers = {
     "Accept-Ranges": "bytes",
-    "Cache-Control": "private, max-age=86400, immutable",
+    "Cache-Control": "private, max-age=604800, immutable, no-transform",
     "Content-Type": "video/mp4",
     ETag: `"${fileId}-${fileStats.size}-${Math.trunc(fileStats.mtimeMs)}"`,
     "Last-Modified": modifiedAt,
@@ -1063,7 +1088,7 @@ function positiveInteger(value, fallback) {
 function applyCors(response, origin) {
   const allowed = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin);
   response.setHeader("Access-Control-Allow-Origin", allowed ? origin : "http://localhost:3000");
-  response.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, HEAD, OPTIONS");
+  response.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, HEAD, OPTIONS");
   response.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, Range");
   response.setHeader("Vary", "Origin");
 }

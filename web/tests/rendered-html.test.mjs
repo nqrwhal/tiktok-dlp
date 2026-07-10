@@ -70,7 +70,11 @@ test("feed exposes confirmed server trash and bounded delivery", async () => {
   assert.match(source, /const CARD_WINDOW_SIZE = 7/);
   assert.match(source, /paginateVideos:\s*true/);
   assert.match(source, /renderedVideos\.map/);
-  assert.match(source, /const PRELOAD_AHEAD = 1/);
+  assert.match(source, /const PRELOAD_AHEAD = 2/);
+  assert.match(source, /const PLAYABLE_READY_STATE = 2/);
+  assert.match(source, /onLoadedData=/);
+  assert.match(source, /\/api\/bookmarks/);
+  assert.match(source, /BOOKMARK_MIGRATION_STORAGE_KEY/);
   assert.match(source, /Tap for controls · swipe to browse/);
   assert.match(source, /type="range"/);
   assert.match(source, /aria-keyshortcuts="Space ArrowUp ArrowDown ArrowLeft ArrowRight M B"/);

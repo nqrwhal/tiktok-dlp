@@ -418,6 +418,26 @@ test('individual video deletion trashes, blocks delivery, and supports confirmed
   });
   const baseUrl = `http://127.0.0.1:${address.port}`;
 
+  const emptyBookmarks = await fetch(`${baseUrl}/api/bookmarks`);
+  assert.equal(emptyBookmarks.status, 200);
+  assert.deepEqual(await emptyBookmarks.json(), { fileIds: [] });
+
+  const bookmarked = await fetch(`${baseUrl}/api/bookmarks/${deletedFileId}`, { method: 'PUT' });
+  assert.equal(bookmarked.status, 200);
+  assert.deepEqual(await bookmarked.json(), { fileId: deletedFileId, bookmarked: true });
+
+  const migratedBookmarks = await fetch(`${baseUrl}/api/bookmarks`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ fileIds: [siblingFileId, 999999] }),
+  });
+  assert.equal(migratedBookmarks.status, 200);
+  assert.deepEqual(await migratedBookmarks.json(), { fileIds: [siblingFileId, deletedFileId] });
+
+  const unbookmarked = await fetch(`${baseUrl}/api/bookmarks/${siblingFileId}`, { method: 'DELETE' });
+  assert.equal(unbookmarked.status, 200);
+  assert.deepEqual(await unbookmarked.json(), { fileId: siblingFileId, bookmarked: false });
+
   const unconfirmed = await fetch(`${baseUrl}/api/videos/${deletedFileId}`, {
     method: 'DELETE',
     headers: { 'content-type': 'application/json' },
@@ -445,6 +465,7 @@ test('individual video deletion trashes, blocks delivery, and supports confirmed
   await access(deletedSidecarPath);
   await access(siblingPath);
   assert.equal(store.getTrashedFile(deletedFileId)?.id, deletedFileId);
+  assert.deepEqual(store.listBookmarkedFileIds(), []);
   assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM files WHERE id = ?').get(siblingFileId).count, 1);
   assert.equal((await fetch(`${baseUrl}/files/deleted-token`)).status, 404);
 
@@ -475,6 +496,7 @@ test('individual video deletion trashes, blocks delivery, and supports confirmed
     restoredVideo: true,
   });
   assert.equal(store.getTrashedFile(deletedFileId), null);
+  assert.deepEqual(store.listBookmarkedFileIds(), [deletedFileId]);
   assert.equal((await fetch(`${baseUrl}/files/deleted-token`)).status, 200);
 
   const deletedSharedRecord = await fetch(`${baseUrl}/api/videos/${siblingFileId}`, {

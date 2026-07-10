@@ -47,11 +47,12 @@ Cloudflare Access-protected archive.
 
 - Full-height, scroll-snap video feed optimized for mobile playback.
 - Fresh shuffled ordering per visit, plus an explicit Shuffle action.
-- All and browser-local Bookmarks feeds with creator filtering.
+- All and server-backed Bookmarks feeds with creator filtering and automatic
+  one-time migration of existing browser bookmarks.
 - Original captions and hashtags, a post-date fallback for captionless videos,
   creator links, and source links.
-- Bounded cursor pages, seven-card rendering, at most one adjacent video
-  preload, saved thumbnail reuse, and exact-video deep links.
+- Bounded cursor pages, seven-card rendering, two-video lookahead after the
+  active frame starts, saved thumbnail reuse, and exact-video deep links.
 - Seekable progress, remembered sound, autoplay control, guarded desktop
   shortcuts, and a one-time touch-control hint.
 - Creator profile pages with thumbnail grids that jump directly into the feed.
@@ -59,7 +60,8 @@ Cloudflare Access-protected archive.
   links, trash inspection, and restore.
 - Creator dashboard with persistent import progress, monitoring status,
   profile/library shortcuts, and typed-confirmation bulk trash.
-- Installable standalone metadata and mobile icons without caching private media.
+- Installable standalone metadata and mobile icons without an offline service
+  worker; immutable media may use the device's private HTTP cache.
 - Responsive, keyboard-aware navigation, menus, dialogs, and recovery states.
 
 Rewind currently indexes archived MP4 records. Photo/slideshow ZIPs delivered by
@@ -221,8 +223,9 @@ destinations can follow one creator without duplicating the underlying scan.
 | `/dashboard/creators` | Search creators, import profiles, and move creator archives to trash |
 | `/dashboard/settings` | Browser-local playback and default-feed preferences |
 
-Bookmarks and playback preferences are stored in the current browser. Archive
-files, imports, trash, and restore operations are server-backed.
+Bookmarks are stored in the archive database and playback preferences remain in
+the current browser. Existing local bookmarks migrate once on the next visit.
+Archive files, imports, trash, and restore operations are server-backed.
 
 ## Creator imports
 
@@ -264,6 +267,9 @@ Backend:
 - `POST /api/imports/:id/cancel`
 - `POST /api/imports/:id/retry`
 - `GET /api/trash?limit=`
+- `GET /api/bookmarks`
+- `POST /api/bookmarks`
+- `PUT|DELETE /api/bookmarks/:fileId`
 - `DELETE /api/videos/:fileId`
 - `POST /api/videos/:fileId/restore`
 - `DELETE /api/creators/:username/videos`
@@ -277,8 +283,9 @@ Rewind bridge:
 - `GET /api/creators`
 - `GET /api/videos?creatorId=&username=&fileId=&limit=` (legacy array response)
 - `GET /api/videos?page=1&cursor=&creatorId=&username=&fileId=&limit=`
+- `GET /api/videos?bookmarked=1&limit=5000`
 - `GET /api/stats`
-- Import, trash, and restore routes proxied to the backend
+- Bookmark, import, trash, and restore routes proxied to the backend
 - `GET|HEAD /media/:fileId`
 - `GET|HEAD /media/:fileId?download=1`
 - `GET|HEAD /thumbnail/:fileId.jpg`

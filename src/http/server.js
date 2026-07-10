@@ -29,6 +29,19 @@ export function createHttpHandler({ config, store, creatorImportService = null }
         return handleTrashRequest(req, res, { config, store, url });
       }
 
+      if (url.pathname === '/api/bookmarks') {
+        return handleBookmarksRequest(req, res, { config, store });
+      }
+
+      const bookmarkMatch = url.pathname.match(/^\/api\/bookmarks\/(\d+)$/);
+      if (bookmarkMatch) {
+        return handleBookmarkRequest(req, res, {
+          config,
+          store,
+          fileId: Number(bookmarkMatch[1]),
+        });
+      }
+
       const restoreVideoMatch = url.pathname.match(/^\/api\/videos\/(\d+)\/restore$/);
       if (restoreVideoMatch) {
         return handleVideoRestoreRequest(req, res, {
@@ -110,6 +123,47 @@ export async function handleVideoRequest(req, res, { config, store, fileId }) {
       error: error instanceof Error ? error.message : String(error),
     });
   }
+}
+
+export async function handleBookmarksRequest(req, res, { config, store }) {
+  if (!isImportAuthorized(req, config)) {
+    return sendJson(res, 401, { error: 'Unauthorized' });
+  }
+  if (req.method === 'GET') {
+    return sendJson(res, 200, { fileIds: store.listBookmarkedFileIds?.() ?? [] });
+  }
+  if (req.method !== 'POST') {
+    return sendJson(res, 405, { error: 'Method not allowed' });
+  }
+
+  try {
+    const body = await readJsonBody(req);
+    if (!Array.isArray(body.fileIds)) {
+      return sendJson(res, 400, { error: 'fileIds must be an array' });
+    }
+    return sendJson(res, 200, {
+      fileIds: store.addFileBookmarks?.(body.fileIds) ?? [],
+    });
+  } catch (error) {
+    const statusCode = Number(error?.statusCode) || 400;
+    return sendJson(res, statusCode, {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+export async function handleBookmarkRequest(req, res, { config, store, fileId }) {
+  if (!isImportAuthorized(req, config)) {
+    return sendJson(res, 401, { error: 'Unauthorized' });
+  }
+  if (req.method !== 'PUT' && req.method !== 'DELETE') {
+    return sendJson(res, 405, { error: 'Method not allowed' });
+  }
+
+  const bookmarked = req.method === 'PUT';
+  const updated = store.setFileBookmark?.(fileId, bookmarked);
+  if (!updated && bookmarked) return sendJson(res, 404, { error: 'Video not found' });
+  return sendJson(res, 200, { fileId: Number(fileId), bookmarked });
 }
 
 export async function handleCreatorVideosRequest(req, res, { config, store, username }) {

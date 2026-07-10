@@ -156,6 +156,11 @@ export class Store {
         UNIQUE(import_id, item_key)
       );
 
+      CREATE TABLE IF NOT EXISTS bookmarks (
+        file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+        created_at INTEGER NOT NULL
+      );
+
       CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_files_video_id ON files(video_id);
       CREATE INDEX IF NOT EXISTS idx_link_tokens_expires_at ON link_tokens(expires_at);
@@ -212,6 +217,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_creator_imports_username_status ON creator_imports(username, status);
       CREATE INDEX IF NOT EXISTS idx_creator_import_items_import_status_position
         ON creator_import_items(import_id, status, position, id);
+      CREATE INDEX IF NOT EXISTS idx_bookmarks_created_at ON bookmarks(created_at DESC);
     `);
     this.migrateLegacyDeliveryOwnership();
     this.migrateLegacyWatchSubscriptions();
@@ -1418,6 +1424,66 @@ export class Store {
       WHERE id = ?
     `).run(now, message, Number(fileId));
     return result.changes > 0;
+  }
+
+  listBookmarkedFileIds() {
+    return this.db.prepare(`
+      SELECT bookmarks.file_id
+      FROM bookmarks
+      JOIN files ON files.id = bookmarks.file_id
+      WHERE files.trashed_at IS NULL
+        AND lower(files.filename) LIKE '%.mp4'
+      ORDER BY bookmarks.created_at DESC, bookmarks.file_id DESC
+    `).all().map((row) => Number(row.file_id));
+  }
+
+  setFileBookmark(fileId, bookmarked, now = Date.now()) {
+    const numericId = Number(fileId);
+    if (!Number.isInteger(numericId) || numericId <= 0) return false;
+    if (!bookmarked) {
+      this.db.prepare('DELETE FROM bookmarks WHERE file_id = ?').run(numericId);
+      return true;
+    }
+    const result = this.db.prepare(`
+      INSERT INTO bookmarks (file_id, created_at)
+      SELECT id, ?
+      FROM files
+      WHERE id = ?
+        AND trashed_at IS NULL
+        AND lower(filename) LIKE '%.mp4'
+      ON CONFLICT(file_id) DO NOTHING
+    `).run(now, numericId);
+    if (result.changes > 0) return true;
+    return Boolean(this.db.prepare(`
+      SELECT 1
+      FROM bookmarks
+      JOIN files ON files.id = bookmarks.file_id
+      WHERE bookmarks.file_id = ?
+        AND files.trashed_at IS NULL
+    `).get(numericId));
+  }
+
+  addFileBookmarks(fileIds, now = Date.now()) {
+    const ids = normalizeIds(fileIds).slice(0, 5_000);
+    if (!ids.length) return this.listBookmarkedFileIds();
+    const insert = this.db.prepare(`
+      INSERT INTO bookmarks (file_id, created_at)
+      SELECT id, ?
+      FROM files
+      WHERE id = ?
+        AND trashed_at IS NULL
+        AND lower(filename) LIKE '%.mp4'
+      ON CONFLICT(file_id) DO NOTHING
+    `);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const id of ids) insert.run(now, id);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+    return this.listBookmarkedFileIds();
   }
 
   trashFile(fileId, now = Date.now()) {

@@ -38,16 +38,18 @@ interface MobileFeedProps {
 }
 
 const BOOKMARK_STORAGE_KEY = "rewind-bookmarks";
+const BOOKMARK_MIGRATION_STORAGE_KEY = "rewind-bookmarks-server-migrated-v1";
 const FEED_HINT_STORAGE_KEY = "rewind-feed-hint-seen";
 const VIDEO_PAGE_SIZE = 36;
 const CARD_WINDOW_SIZE = 7;
 const CARD_WINDOW_BEHIND = 3;
-const PRELOAD_AHEAD = 1;
-const PLAYABLE_READY_STATE = 3;
+const PRELOAD_AHEAD = 2;
+const PLAYABLE_READY_STATE = 2;
 const KEYBOARD_SEEK_SECONDS = 5;
 
 export function MobileFeed({ creators, videos }: MobileFeedProps) {
   const searchParams = useSearchParams();
+  const apiBase = process.env.NEXT_PUBLIC_ARCHIVE_API_BASE?.replace(/\/+$/, "") || "";
   const requestedVideoId = searchParams.get("video") || "";
   const requestedCreatorId = searchParams.get("creator") || "all";
   const requestedJumpHandled = useRef(!requestedVideoId);
@@ -66,8 +68,9 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
   const archiveVideos = archive.videos;
   const {
     hasMoreVideos,
+    loadingBookmarkedVideos,
     loadingMoreVideos,
-    loadAllVideos,
+    loadBookmarkedVideos,
     loadMoreVideos,
   } = archive;
   const [activeId, setActiveId] = useState(requestedVideoId);
@@ -101,6 +104,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
   const progressRef = useRef<HTMLSpanElement>(null);
   const seekRef = useRef<HTMLInputElement>(null);
   const wasPausedBeforeDeleteRef = useRef(false);
+  const bookmarkMutationVersionsRef = useRef(new Map<string, number>());
   const { dialogRef, returnFocusRef } = useModalDialog(Boolean(deleteVideo), closeDeleteVideo);
 
   const liveVideos = useMemo(
@@ -229,23 +233,65 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
   }, [mutePreferenceReady, muted]);
 
   useEffect(() => {
+    const controller = new AbortController();
+    let localBookmarks = new Set<string>();
     try {
       const stored = JSON.parse(window.localStorage.getItem(BOOKMARK_STORAGE_KEY) || "[]");
       if (Array.isArray(stored)) {
-        // Bookmarks are a device-local archive preference until the backend exposes them.
+        localBookmarks = new Set(stored.filter((id): id is string => typeof id === "string"));
+        // Keep the existing device state visible while the server responds.
         // eslint-disable-next-line react-hooks/set-state-in-effect
-        setSaved(new Set(stored.filter((id): id is string => typeof id === "string")));
+        setSaved(localBookmarks);
       }
     } catch {
       window.localStorage.removeItem(BOOKMARK_STORAGE_KEY);
     }
-    setBookmarksReady(true);
-  }, []);
+
+    if (!apiBase) {
+      setBookmarksReady(true);
+      return () => controller.abort();
+    }
+
+    const shouldMigrate = localBookmarks.size > 0
+      && window.localStorage.getItem(BOOKMARK_MIGRATION_STORAGE_KEY) !== "1";
+    fetch(`${apiBase}/api/bookmarks`, {
+      method: shouldMigrate ? "POST" : "GET",
+      headers: shouldMigrate ? { "content-type": "application/json" } : undefined,
+      body: shouldMigrate ? JSON.stringify({ fileIds: [...localBookmarks] }) : undefined,
+      cache: "no-store",
+      signal: controller.signal,
+    })
+      .then(async (response) => {
+        const payload = await response.json().catch(() => ({})) as { fileIds?: unknown; error?: string };
+        if (!response.ok) throw new Error(payload.error || `Bookmark sync failed (${response.status})`);
+        return Array.isArray(payload.fileIds)
+          ? payload.fileIds.filter((id): id is number | string => typeof id === "number" || typeof id === "string")
+          : [];
+      })
+      .then((fileIds) => {
+        if (controller.signal.aborted) return;
+        setSaved(new Set(fileIds.map(String)));
+        window.localStorage.setItem(BOOKMARK_MIGRATION_STORAGE_KEY, "1");
+      })
+      .catch((error: unknown) => {
+        if (controller.signal.aborted) return;
+        setFeedStatus(error instanceof Error ? error.message : "Bookmarks could not sync.");
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setBookmarksReady(true);
+      });
+    return () => controller.abort();
+  }, [apiBase]);
 
   useEffect(() => {
     if (!bookmarksReady) return;
     window.localStorage.setItem(BOOKMARK_STORAGE_KEY, JSON.stringify([...saved]));
   }, [bookmarksReady, saved]);
+
+  useEffect(() => {
+    if (feedView !== "bookmarks" || !bookmarksReady) return;
+    void loadBookmarkedVideos();
+  }, [bookmarksReady, feedView, loadBookmarkedVideos]);
 
   useEffect(() => {
     activeIdRef.current = currentActiveId;
@@ -360,17 +406,38 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
   }, [autoplayEnabled, currentActiveId]);
 
   const toggleSaved = useCallback((id: string) => {
-    if (feedView === "bookmarks" && saved.has(id)) {
+    const wasSaved = saved.has(id);
+    const willSave = !wasSaved;
+    if (feedView === "bookmarks" && wasSaved) {
       const nextVideos = creatorVideos.filter((video) => video.id !== id && saved.has(video.id));
       resetFeedPosition(nextVideos[0]?.id || "");
     }
     setSaved((current) => {
       const next = new Set(current);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
+      if (willSave) next.add(id);
+      else next.delete(id);
       return next;
     });
-  }, [creatorVideos, feedView, resetFeedPosition, saved]);
+
+    if (!apiBase) return;
+    const version = (bookmarkMutationVersionsRef.current.get(id) || 0) + 1;
+    bookmarkMutationVersionsRef.current.set(id, version);
+    void fetch(`${apiBase}/api/bookmarks/${encodeURIComponent(id)}`, {
+      method: willSave ? "PUT" : "DELETE",
+    }).then(async (response) => {
+      const payload = await response.json().catch(() => ({})) as { error?: string };
+      if (!response.ok) throw new Error(payload.error || `Bookmark update failed (${response.status})`);
+    }).catch((error: unknown) => {
+      if (bookmarkMutationVersionsRef.current.get(id) !== version) return;
+      setSaved((current) => {
+        const next = new Set(current);
+        if (wasSaved) next.add(id);
+        else next.delete(id);
+        return next;
+      });
+      setFeedStatus(error instanceof Error ? error.message : "Bookmark update failed.");
+    });
+  }, [apiBase, creatorVideos, feedView, resetFeedPosition, saved]);
 
   async function shareVideo(video: SavedVideo) {
     if (navigator.share) {
@@ -404,7 +471,6 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
 
   async function confirmDeleteVideo() {
     if (!deleteVideo || deleting) return;
-    const apiBase = process.env.NEXT_PUBLIC_ARCHIVE_API_BASE?.replace(/\/+$/, "") || "";
     if (!apiBase) {
       setDeleteError("The live backend connection is required to move videos to trash.");
       return;
@@ -478,7 +544,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
 
   function selectFeedView(view: "all" | "bookmarks") {
     if (view === feedView) return;
-    if (view === "bookmarks" && hasMoreVideos) void loadAllVideos();
+    if (view === "bookmarks") void loadBookmarkedVideos();
     const nextVideos = view === "bookmarks"
       ? creatorVideos.filter((video) => saved.has(video.id))
       : creatorVideos;
@@ -689,11 +755,15 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
           {renderedVideos.map((video, windowIndex) => {
             const index = windowStart + windowIndex;
             const isActive = video.id === currentActiveId;
-            // Give the first visible video the connection to itself. Once it
-            // has a forward buffer, preload only the next card. Keeping older
-            // and farther cards poster-only prevents competing media streams.
+            // Give the first visible video the connection to itself. Once its
+            // first frame starts, preload the next two cards. Keeping older and
+            // farther cards poster-only prevents competing media streams.
             const shouldPreload = isActive
-              || (preloadReadyVideoId === currentActiveId && index === activeIndex + PRELOAD_AHEAD);
+              || (
+                preloadReadyVideoId === currentActiveId
+                && index > activeIndex
+                && index <= activeIndex + PRELOAD_AHEAD
+              );
             const isSaved = saved.has(video.id);
             const showControls = isActive && controlsVisible;
             return (
@@ -723,6 +793,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
                       }
                       if (seekRef.current) seekRef.current.value = String(value * 100);
                     }}
+                    onLoadedData={(event) => playIfReady(video.id, event.currentTarget)}
                     onCanPlay={(event) => {
                       if (activeIdRef.current === video.id) setPreloadReadyVideoId(video.id);
                       playIfReady(video.id, event.currentTarget);
@@ -734,6 +805,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
                       setBuffering(false);
                       setPlaybackError("");
                       setPaused(false);
+                      setPreloadReadyVideoId(video.id);
                       if (typeof element.requestVideoFrameCallback === "function") {
                         element.requestVideoFrameCallback(() => {
                           if (activeIdRef.current === video.id) setPresentedVideoId(video.id);
@@ -903,7 +975,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
           {filteredVideos.length === 0 ? (
             <div className={styles.emptyFeed}>
               <h2>
-                {archive.source === "loading" || archive.source === "refreshing"
+                {archive.source === "loading" || archive.source === "refreshing" || (feedView === "bookmarks" && !bookmarksReady)
                   ? "Loading videos…"
                   : archive.source === "error"
                     ? "Could not load the archive"
@@ -912,6 +984,8 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
               <p>
                 {archive.source === "error"
                   ? archive.error
+                  : feedView === "bookmarks" && loadingBookmarkedVideos
+                    ? "Loading your server bookmarks."
                   : feedView === "bookmarks"
                   ? "Bookmark a video and it will appear here."
                   : "There are no files for this creator."}

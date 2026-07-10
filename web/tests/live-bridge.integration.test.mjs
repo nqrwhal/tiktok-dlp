@@ -41,12 +41,17 @@ test("live bridge paginates active videos and serves an existing .image sidecar"
         title TEXT,
         created_at INTEGER
       );
+      CREATE TABLE bookmarks (
+        file_id INTEGER PRIMARY KEY,
+        created_at INTEGER
+      );
       INSERT INTO files VALUES
         (1, 'video-1', 'alice', 'https://example.com/1', '/app/data/downloads/alice/1.mp4', '1.mp4', 16, 100, NULL),
         (2, 'video-2', 'alice', 'https://example.com/2', '/app/data/downloads/alice/2.mp4', '2.mp4', 16, 200, NULL),
         (3, 'video-3', 'alice', 'https://example.com/3', '/app/data/downloads/alice/3.mp4', '3.mp4', 16, 300, NULL),
         (4, 'video-4', 'alice', 'https://example.com/4', '/app/data/downloads/alice/4.mp4', '4.mp4', 16, 400, NULL),
         (5, 'video-5', 'alice', 'https://example.com/5', '/app/data/downloads/alice/5.mp4', '5.mp4', 16, 500, 600);
+      INSERT INTO bookmarks VALUES (2, 1000);
     `,
   });
   assert.equal(sqlite.status, 0, sqlite.stderr);
@@ -98,6 +103,17 @@ test("live bridge paginates active videos and serves an existing .image sidecar"
 
   const legacyResponse = await fetch(`http://127.0.0.1:${port}/api/videos?limit=2`);
   assert.equal(Array.isArray(await legacyResponse.json()), true);
+
+  const bookmarkedResponse = await fetch(`http://127.0.0.1:${port}/api/videos?bookmarked=1&limit=10`);
+  assert.equal(bookmarkedResponse.status, 200);
+  assert.deepEqual((await bookmarkedResponse.json()).map((video) => video.id), ["2"]);
+
+  const mediaResponse = await fetch(`http://127.0.0.1:${port}/media/2`, {
+    headers: { range: "bytes=0-3" },
+  });
+  assert.equal(mediaResponse.status, 206);
+  assert.match(mediaResponse.headers.get("cache-control") || "", /max-age=604800/);
+  assert.match(mediaResponse.headers.get("cache-control") || "", /no-transform/);
 
   const thumbnailResponse = await fetch(`http://127.0.0.1:${port}/thumbnail/1.jpg`);
   const thumbnailBody = Buffer.from(await thumbnailResponse.arrayBuffer());

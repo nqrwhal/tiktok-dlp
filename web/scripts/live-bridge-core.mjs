@@ -8,6 +8,7 @@ export function buildVideoSql({
   fileId = 0,
   limit = 500,
   cursor = null,
+  bookmarkedOnly = false,
 } = {}) {
   const boundedLimit = Math.min(MAX_LEGACY_VIDEO_LIMIT, positiveInteger(limit, 500));
   const creatorClause = username
@@ -17,6 +18,9 @@ export function buildVideoSql({
   const cursorClause = cursor
     ? `AND (files.created_at < ${cursor.createdAt}
         OR (files.created_at = ${cursor.createdAt} AND files.id < ${cursor.fileId}))`
+    : "";
+  const bookmarkClause = bookmarkedOnly
+    ? "AND EXISTS (SELECT 1 FROM bookmarks WHERE bookmarks.file_id = files.id)"
     : "";
   return `
     SELECT
@@ -46,6 +50,7 @@ export function buildVideoSql({
       ${creatorClause}
       ${fileClause}
       ${cursorClause}
+      ${bookmarkClause}
     ORDER BY files.created_at DESC, files.id DESC
     LIMIT ${boundedLimit};
   `;

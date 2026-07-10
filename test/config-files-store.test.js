@@ -551,6 +551,7 @@ test('store migrates older databases before creating indexes for new columns', a
     const linkColumns = store.db.prepare('PRAGMA table_info(link_tokens)').all().map((column) => column.name);
     const importColumns = store.db.prepare('PRAGMA table_info(creator_imports)').all().map((column) => column.name);
     const importItemColumns = store.db.prepare('PRAGMA table_info(creator_import_items)').all().map((column) => column.name);
+    const bookmarkColumns = store.db.prepare('PRAGMA table_info(bookmarks)').all().map((column) => column.name);
     const indexes = store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all().map((index) => index.name);
     assert.ok(watchColumns.includes('creator_id'));
     assert.ok(watchColumns.includes('has_story'));
@@ -573,6 +574,39 @@ test('store migrates older databases before creating indexes for new columns', a
     assert.ok(importItemColumns.includes('metadata_json'));
     assert.ok(importItemColumns.includes('attempt_count'));
     assert.ok(indexes.includes('idx_creator_import_items_import_status_position'));
+    assert.deepEqual(bookmarkColumns, ['file_id', 'created_at']);
+    assert.ok(indexes.includes('idx_bookmarks_created_at'));
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('bookmarks persist on the server and hide while their file is trashed', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-bookmarks-'));
+  const store = createStore(path.join(dir, 'state.db'));
+  try {
+    const firstId = store.createFileRecord({
+      sourceUrl: 'https://www.tiktok.com/@creator/video/1',
+      filePath: path.join(dir, 'one.mp4'),
+      filename: 'one.mp4',
+      sizeBytes: 1,
+    }, 1000);
+    const secondId = store.createFileRecord({
+      sourceUrl: 'https://www.tiktok.com/@creator/video/2',
+      filePath: path.join(dir, 'two.mp4'),
+      filename: 'two.mp4',
+      sizeBytes: 2,
+    }, 2000);
+
+    assert.equal(store.setFileBookmark(firstId, true, 3000), true);
+    assert.deepEqual(store.addFileBookmarks([secondId, firstId, 999999], 4000), [secondId, firstId]);
+    store.trashFile(secondId, 5000);
+    assert.deepEqual(store.listBookmarkedFileIds(), [firstId]);
+    store.restoreTrashedFile(secondId);
+    assert.deepEqual(store.listBookmarkedFileIds(), [secondId, firstId]);
+    assert.equal(store.setFileBookmark(firstId, false), true);
+    assert.deepEqual(store.listBookmarkedFileIds(), [secondId]);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
