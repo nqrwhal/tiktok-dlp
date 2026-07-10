@@ -8,6 +8,8 @@ import {
   buildLinkHistoryEmbed,
   buildMonitorAlertPayload,
   handleButtonInteraction,
+  monitorScopeMatches,
+  resolveMonitorDeliveryScope,
 } from '../src/discord/client.js';
 import { createStore } from '../src/state/store.js';
 
@@ -274,7 +276,13 @@ test('monitor delete button removes saved post records and slideshow sidecars', 
       title: 'photo post',
     }, 1000);
     store.updateJob(jobId, { status: 'complete', file_id: fileId }, 1000);
-    store.createLinkToken({ token: 'monitor-token', fileId, expiresAt: 0 }, 1000);
+    store.createLinkToken({
+      token: 'monitor-token',
+      fileId,
+      scopeId: 'channel:channel-1',
+      deliveryType: 'monitor',
+      expiresAt: 0,
+    }, 1000);
     store.markVideoSeen({
       videoId: 'photo-1',
       username: 'creator',
@@ -292,6 +300,7 @@ test('monitor delete button removes saved post records and slideshow sidecars', 
       interaction: {
         customId: 'monitor:delete:monitor-token',
         guildId: 'guild-1',
+        channelId: 'channel-1',
         memberPermissions: { has: () => true },
         update: async (payload) => updates.push(payload),
         followUp: async (payload) => followUps.push(payload),
@@ -311,6 +320,44 @@ test('monitor delete button removes saved post records and slideshow sidecars', 
     store.close();
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('monitor scope compatibility stays bound to the original channel', async () => {
+  assert.equal(monitorScopeMatches('channel:channel-1', {
+    guildId: 'guild-1',
+    channelId: 'channel-1',
+  }), true);
+  assert.equal(monitorScopeMatches('channel:channel-1', {
+    guildId: 'guild-1',
+    channelId: 'channel-2',
+  }), false);
+  assert.equal(monitorScopeMatches('guild:guild-1', {
+    guildId: 'guild-2',
+    channelId: 'channel-1',
+  }), false);
+});
+
+test('legacy watch targets resolve to their Discord guild for new deliveries', async () => {
+  const fetched = [];
+  const resolved = await resolveMonitorDeliveryScope({
+    channels: {
+      cache: new Map(),
+      fetch: async (channelId) => {
+        fetched.push(channelId);
+        return { guildId: 'guild-1' };
+      },
+    },
+  }, {
+    guild_id: '',
+    channel_id: 'channel-1',
+  });
+
+  assert.deepEqual(fetched, ['channel-1']);
+  assert.deepEqual(resolved, {
+    guildId: 'guild-1',
+    channelId: 'channel-1',
+    scopeId: 'guild:guild-1',
+  });
 });
 
 test('link history embed shows temporary, permanent, and expired states', async () => {

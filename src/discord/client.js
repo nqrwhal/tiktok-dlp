@@ -533,7 +533,7 @@ export async function handleMonitorButton({ interaction, config, store }) {
     return true;
   }
 
-  if (record.scope_id && record.scope_id !== monitorScopeId(interaction)) {
+  if (!monitorScopeMatches(record.scope_id, interaction)) {
     await interaction.reply(buildNoticePayload({
       title: 'Wrong Watch Scope',
       description: 'This monitored delivery belongs to a different server or DM.',
@@ -1106,6 +1106,43 @@ export function monitorScopeId(interaction = {}) {
   const guildId = String(interaction?.guildId ?? '');
   if (guildId && !guildId.startsWith('dm:')) return `guild:${guildId}`;
   return `channel:${String(interaction?.channelId ?? '')}`;
+}
+
+export function monitorScopeMatches(scopeId, interaction = {}) {
+  const storedScopeId = String(scopeId ?? '');
+  if (!storedScopeId) return true;
+  if (storedScopeId === monitorScopeId(interaction)) return true;
+
+  // Legacy watch subscriptions were migrated without a guild id, so their
+  // monitor deliveries were scoped to the destination channel. A button click
+  // in that same guild now resolves to a guild scope. Keep those existing
+  // buttons usable without allowing the delivery to cross channel boundaries.
+  const channelId = String(interaction?.channelId ?? '');
+  return Boolean(channelId && storedScopeId === `channel:${channelId}`);
+}
+
+export async function resolveMonitorDeliveryScope(client, target = {}) {
+  const channelId = String(target?.channelId ?? target?.channel_id ?? '');
+  let guildId = String(target?.guildId ?? target?.guild_id ?? '');
+
+  if (!guildId && channelId) {
+    let channel = client?.channels?.cache?.get?.(channelId) ?? null;
+    if (!channel && typeof client?.channels?.fetch === 'function') {
+      try {
+        channel = await client.channels.fetch(channelId);
+      } catch {
+        // Sending the alert will report an inaccessible channel. Falling back
+        // to a channel scope keeps DM targets and legacy records safe.
+      }
+    }
+    guildId = String(channel?.guildId ?? channel?.guild?.id ?? '');
+  }
+
+  return {
+    guildId,
+    channelId,
+    scopeId: monitorScopeId({ guildId, channelId }),
+  };
 }
 
 async function acknowledgeMonitorDelete(interaction, payload) {

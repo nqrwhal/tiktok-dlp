@@ -1,7 +1,14 @@
 import { loadConfig, loadEnvFile, ensureRuntimeDirs, validateRuntimeConfig } from './config.js';
 import { createStore } from './state/store.js';
 import { startHttpServer } from './http/server.js';
-import { monitorScopeId, startDiscordBot, sendDeletionAlert, sendUsernameChangeAlert, sendVideoAlert } from './discord/client.js';
+import {
+  monitorScopeId,
+  resolveMonitorDeliveryScope,
+  startDiscordBot,
+  sendDeletionAlert,
+  sendUsernameChangeAlert,
+  sendVideoAlert,
+} from './discord/client.js';
 import { registerCommands } from './discord/register-commands.js';
 import { TikTokMonitor, resolveVideoMediaType } from './tiktok/monitor.js';
 import { fetchVideoMetadata } from './tiktok/ytdlp.js';
@@ -82,11 +89,12 @@ const monitor = new TikTokMonitor({
       channel_id: watch?.channel_id || config.discordChannelId,
     }];
     const outcomes = await Promise.allSettled(targets.map(async (subscription) => {
+      const targetScope = await resolveMonitorDeliveryScope(discordClient, subscription);
       const scopedResult = await downloadService.createDeliveryForAsset(result, {
         type: 'monitor',
-        guildId: subscription.guild_id,
-        channelId: subscription.channel_id,
-        scopeId: monitorScopeId({ guildId: subscription.guild_id, channelId: subscription.channel_id }),
+        guildId: targetScope.guildId,
+        channelId: targetScope.channelId,
+        scopeId: targetScope.scopeId,
         permanent: true,
       });
       await sendVideoAlert({
@@ -108,8 +116,13 @@ const monitor = new TikTokMonitor({
     const watch = store.getWatch(video?.username ?? '') ?? null;
     const subscriptions = store.listWatchSubscriptions?.(watch?.username ?? '') ?? [];
     await Promise.allSettled(subscriptions.map(async (subscription) => {
-      const scopeId = monitorScopeId({ guildId: subscription.guild_id, channelId: subscription.channel_id });
-      const permanentToken = store.getLatestPermanentTokenForVideo?.(video?.video_id, { scopeId }) ?? '';
+      const targetScope = await resolveMonitorDeliveryScope(discordClient, subscription);
+      const legacyChannelScopeId = monitorScopeId({ channelId: targetScope.channelId });
+      const permanentToken = store.getLatestPermanentTokenForVideo?.(video?.video_id, {
+        scopeId: targetScope.scopeId,
+      }) || (targetScope.scopeId !== legacyChannelScopeId
+        ? store.getLatestPermanentTokenForVideo?.(video?.video_id, { scopeId: legacyChannelScopeId })
+        : '') || '';
       await sendDeletionAlert({
         client: discordClient,
         config,
