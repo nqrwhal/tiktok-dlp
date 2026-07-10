@@ -42,7 +42,7 @@ for (const [pathname, expectedContent] of routes) {
     assert.match(html, expectedContent);
     if (pathname === "/") {
       assert.match(html, />Bookmarks<\/button>/i);
-      assert.match(html, /preload="auto"/i);
+      assert.equal(html.match(/preload="auto"/gi)?.length, 5);
     }
     if (pathname === "/dashboard" || pathname === "/dashboard/videos") {
       assert.match(html, /href="\/\?video=v-/i);

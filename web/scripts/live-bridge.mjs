@@ -323,10 +323,13 @@ async function serveMedia(request, response, fileId) {
   const localPath = await ensureCached(record);
   const fileStats = await stat(localPath);
   const range = parseRange(request.headers.range, fileStats.size);
+  const modifiedAt = fileStats.mtime.toUTCString();
   const headers = {
     "Accept-Ranges": "bytes",
-    "Cache-Control": "private, no-cache",
+    "Cache-Control": "private, max-age=86400, immutable",
     "Content-Type": "video/mp4",
+    ETag: `"${fileId}-${fileStats.size}-${Math.trunc(fileStats.mtimeMs)}"`,
+    "Last-Modified": modifiedAt,
   };
 
   if (range === null && request.headers.range) {

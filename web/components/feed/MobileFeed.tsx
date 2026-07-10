@@ -32,7 +32,8 @@ interface MobileFeedProps {
 
 const BOOKMARK_STORAGE_KEY = "rewind-bookmarks";
 const PRELOAD_BEHIND = 1;
-const PRELOAD_AHEAD = 2;
+const PRELOAD_AHEAD = 4;
+const PLAYABLE_READY_STATE = 3;
 
 export function MobileFeed({ creators, videos }: MobileFeedProps) {
   const searchParams = useSearchParams();
@@ -81,6 +82,22 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
       ? ""
       : filteredVideos[0]?.id ?? "";
   const activeIndex = filteredVideos.findIndex((video) => video.id === currentActiveId);
+
+  const playIfReady = useCallback((id: string, video: HTMLVideoElement) => {
+    if (id !== currentActiveId || paused) return;
+
+    video.muted = muted;
+    if (video.readyState < PLAYABLE_READY_STATE) {
+      // Keep the poster visible and audio stopped until a video frame and a
+      // small forward buffer are decoded. Safari can otherwise start AAC
+      // playback several seconds before a heavier H.264/HEVC frame appears.
+      video.pause();
+      if (video.networkState === HTMLMediaElement.NETWORK_EMPTY) video.load();
+      return;
+    }
+
+    video.play().catch(() => undefined);
+  }, [currentActiveId, muted, paused]);
 
   useEffect(() => {
     // Start muted for autoplay, then restore this device's last explicit choice.
@@ -153,12 +170,22 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
     for (const [id, video] of videoRefs.current) {
       video.muted = muted;
       if (id === currentActiveId && !paused) {
-        video.play().catch(() => undefined);
+        playIfReady(id, video);
       } else {
         video.pause();
       }
     }
-  }, [currentActiveId, muted, paused]);
+  }, [currentActiveId, muted, paused, playIfReady]);
+
+  useEffect(() => {
+    if (activeIndex < 0) return;
+
+    const lastIndex = Math.min(filteredVideos.length - 1, activeIndex + PRELOAD_AHEAD);
+    for (let index = activeIndex; index <= lastIndex; index += 1) {
+      const video = videoRefs.current.get(filteredVideos[index].id);
+      if (video?.networkState === HTMLMediaElement.NETWORK_EMPTY) video.load();
+    }
+  }, [activeIndex, filteredVideos]);
 
   const setVideoRef = useCallback(
     (id: string, node: HTMLVideoElement | null) => {
@@ -274,6 +301,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
                     const element = event.currentTarget;
                     setProgress(element.duration ? element.currentTime / element.duration : 0);
                   }}
+                  onCanPlay={(event) => playIfReady(video.id, event.currentTarget)}
                 />
                 <div className={`${styles.videoTint} ${showControls ? styles.videoTintVisible : ""}`} />
                 <button
