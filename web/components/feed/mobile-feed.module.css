@@ -40,10 +40,11 @@
 .feedTabActive {
   position: relative;
   border: 0;
-  padding: 3px 0 7px;
+  min-height: 44px;
+  padding: 12px 0 9px;
   background: transparent;
   color: rgba(255, 255, 255, 0.58);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 650;
 }
 
@@ -85,14 +86,19 @@
 .iconButton,
 .minimalActions > button {
   display: grid;
-  width: 38px;
-  height: 38px;
+  width: 44px;
+  height: 44px;
   place-items: center;
   border: 1px solid rgba(255, 255, 255, 0.16);
   border-radius: 50%;
   background: rgba(6, 8, 7, 0.52);
   color: white;
   backdrop-filter: blur(12px);
+}
+
+.iconButton:disabled {
+  cursor: not-allowed;
+  opacity: 0.38;
 }
 
 .feedScroller {
@@ -115,11 +121,12 @@
   overflow: hidden;
   scroll-snap-align: start;
   scroll-snap-stop: always;
-  background: #000;
+  background: var(--wash);
   isolation: isolate;
 }
 
 .video,
+.videoPoster,
 .videoTint,
 .videoTapTarget {
   position: absolute;
@@ -134,8 +141,21 @@
   background: #000;
 }
 
-.videoTint {
+.videoPoster {
   z-index: -2;
+  object-fit: cover;
+  background: var(--wash);
+  opacity: 1;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+
+.videoPosterHidden {
+  opacity: 0;
+}
+
+.videoTint {
+  z-index: -1;
   background: linear-gradient(180deg, rgba(0, 0, 0, 0.18) 38%, rgba(0, 0, 0, 0.78) 100%);
   opacity: 0;
   pointer-events: none;
@@ -192,7 +212,7 @@
   width: max-content;
   margin-bottom: 7px;
   border-radius: 4px;
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 700;
   pointer-events: none;
 }
@@ -206,7 +226,7 @@
   text-underline-offset: 3px;
 }
 
-.videoMeta h1 {
+.videoMeta h2 {
   display: -webkit-box;
   max-width: 42ch;
   margin: 0;
@@ -225,10 +245,16 @@
   margin: 7px 0 0;
   overflow: hidden;
   color: rgba(255, 255, 255, 0.74);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.4;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
+}
+
+.videoMeta .playbackStatus {
+  margin-top: 8px;
+  color: rgba(255, 255, 255, 0.88);
+  font-size: 11px;
 }
 
 .tags {
@@ -237,7 +263,7 @@
   gap: 7px;
   margin-top: 8px;
   color: rgba(255, 255, 255, 0.74);
-  font-size: 10px;
+  font-size: 11px;
 }
 
 .minimalActions {
@@ -281,7 +307,7 @@
 .moreMenu button,
 .moreMenu a {
   display: flex;
-  min-height: 40px;
+  min-height: 44px;
   align-items: center;
   gap: 9px;
   border: 0;
@@ -289,7 +315,7 @@
   padding: 0 10px;
   background: transparent;
   color: #d4d9d2;
-  font-size: 11px;
+  font-size: 12px;
   text-align: left;
 }
 
@@ -310,6 +336,7 @@
 
 .progressTrack span {
   display: block;
+  width: 0;
   height: 100%;
   background: rgba(255, 255, 255, 0.92);
   transition: width 100ms linear;
@@ -333,7 +360,57 @@
 .emptyFeed p {
   margin: 0;
   color: #858c83;
+  font-size: 13px;
+}
+
+.emptyActions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+.emptyActions button,
+.emptyActions a,
+.feedNotice button {
+  display: inline-flex;
+  min-height: 44px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 9px;
+  padding: 0 14px;
+  background: #171b18;
+  color: #f4f7ef;
   font-size: 12px;
+  font-weight: 680;
+}
+
+.feedNotice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid rgba(255, 145, 135, 0.24);
+  border-radius: 9px;
+  padding: 8px 10px;
+  background: rgba(26, 13, 12, 0.88);
+  color: #ffd3cf;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.feedNotice span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.feedNotice button {
+  min-height: 34px;
+  flex: 0 0 auto;
+  padding: 0 10px;
 }
 
 @media (min-width: 760px) {

@@ -10,7 +10,7 @@
   top: 0;
   display: grid;
   min-height: 56px;
-  grid-template-columns: 40px 1fr 40px;
+  grid-template-columns: 44px 1fr 44px;
   align-items: center;
   gap: 10px;
   padding: max(8px, env(safe-area-inset-top)) 12px 8px;
@@ -30,8 +30,8 @@
 
 .iconButton {
   display: grid;
-  width: 40px;
-  height: 40px;
+  width: 44px;
+  height: 44px;
   place-items: center;
   border-radius: 50%;
   color: #eef2eb;
@@ -89,7 +89,7 @@
 
 .profileIdentity span {
   color: #8f978d;
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .feedButton {
@@ -121,8 +121,32 @@
   border-top: 1px solid rgba(244, 247, 239, 0.1);
   border-bottom: 1px solid rgba(244, 247, 239, 0.1);
   color: #f4f7ef;
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 680;
+}
+
+.galleryError {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin: 0 auto 14px;
+  border: 1px solid rgba(255, 128, 116, 0.24);
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: rgba(255, 107, 93, 0.06);
+  color: #ffc4be;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.galleryError button {
+  min-height: 44px;
+  flex: 0 0 auto;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 8px;
+  padding: 0 12px;
+  background: #171b18;
 }
 
 .videoGrid {
@@ -173,7 +197,7 @@
   background: rgba(0, 0, 0, 0.68);
   color: white;
   font-family: var(--font-geist-mono), monospace;
-  font-size: 9px;
+  font-size: 10px;
   font-weight: 650;
   line-height: 1;
 }
@@ -186,6 +210,51 @@
   color: #8f978d;
   font-size: 12px;
   text-align: center;
+}
+
+.galleryState {
+  display: grid;
+  min-height: calc(100dvh - 64px);
+  place-content: center;
+  justify-items: center;
+  gap: 10px;
+  padding: 30px;
+  text-align: center;
+}
+
+.galleryState h1 {
+  margin: 0;
+  font-size: 22px;
+  letter-spacing: -0.035em;
+}
+
+.galleryState p {
+  max-width: 48ch;
+  margin: 0;
+  color: #929a90;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.galleryState > div {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.galleryState a,
+.galleryState button {
+  display: inline-flex;
+  min-height: 44px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(244, 247, 239, 0.14);
+  border-radius: 9px;
+  padding: 0 14px;
+  background: #151915;
+  color: #f4f7ef;
+  font-size: 12px;
+  font-weight: 680;
 }
 
 @media (min-width: 720px) {

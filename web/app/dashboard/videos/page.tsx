@@ -8,9 +8,10 @@ export const metadata: Metadata = {
 };
 
 export default function VideosPage() {
+  const liveMode = Boolean(process.env.NEXT_PUBLIC_ARCHIVE_API_BASE);
   return (
     <div className={styles.pageWrap}>
-      <VideoLibrary creators={mockCreators} videos={mockVideos} />
+      <VideoLibrary creators={liveMode ? [] : mockCreators} videos={liveMode ? [] : mockVideos} />
     </div>
   );
 }

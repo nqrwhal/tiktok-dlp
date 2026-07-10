@@ -7,7 +7,7 @@
 .trigger {
   display: flex;
   width: 100%;
-  min-height: 42px;
+  min-height: 44px;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
@@ -16,8 +16,15 @@
   padding: 0 12px;
   background: #121512;
   color: #f4f7ef;
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 620;
+}
+
+.trigger > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .menu {
@@ -41,7 +48,7 @@
 .optionSelected {
   display: flex;
   width: 100%;
-  min-height: 38px;
+  min-height: 44px;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
@@ -50,7 +57,7 @@
   padding: 0 10px;
   background: transparent;
   color: #a4aba2;
-  font-size: 11px;
+  font-size: 12px;
   text-align: left;
 }
 
@@ -86,12 +93,12 @@
 }
 
 .compact .trigger {
-  min-height: 36px;
+  min-height: 44px;
   border-color: rgba(255, 255, 255, 0.2);
   border-radius: 999px;
   background: rgba(8, 10, 9, 0.58);
   backdrop-filter: blur(14px);
-  font-size: 10px;
+  font-size: 11px;
 }
 
 .compact .menu {
@@ -103,7 +110,7 @@
 
 @media (max-width: 600px) {
   .picker:not(.compact) .menu {
-    right: 0;
-    left: auto;
+    right: auto;
+    left: 0;
   }
 }

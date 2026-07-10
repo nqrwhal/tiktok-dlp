@@ -40,8 +40,8 @@
 
 .mobileMenuButton {
   display: grid;
-  width: 40px;
-  height: 40px;
+  width: 44px;
+  height: 44px;
   place-items: center;
   border: 1px solid var(--line);
   border-radius: 10px;
@@ -57,15 +57,20 @@
   display: flex;
   width: min(82vw, 292px);
   flex-direction: column;
+  overflow-y: auto;
   padding: max(28px, env(safe-area-inset-top)) 20px 22px;
   border-left: 1px solid var(--line);
   background: #0f1210;
   box-shadow: -24px 0 80px rgba(0, 0, 0, 0.45);
+  visibility: hidden;
+  pointer-events: none;
   transform: translateX(102%);
-  transition: transform 180ms ease;
+  transition: transform 180ms ease, visibility 180ms ease;
 }
 
 .sidebarOpen {
+  visibility: visible;
+  pointer-events: auto;
   transform: translateX(0);
 }
 
@@ -178,7 +183,7 @@
 
 .primaryButton {
   display: inline-flex;
-  min-height: 42px;
+  min-height: 44px;
   flex: 0 0 auto;
   align-items: center;
   justify-content: center;
@@ -250,7 +255,7 @@
 
 .metricCard > span {
   color: #929a90;
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
 }
 
@@ -374,7 +379,7 @@
 
 .recentTitle strong {
   overflow: hidden;
-  font-size: 11px;
+  font-size: 13px;
   font-weight: 620;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -383,7 +388,7 @@
 .recentTitle span,
 .recentTime {
   color: #747c72;
-  font-size: 9px;
+  font-size: 11px;
 }
 
 .recentTime {
@@ -568,12 +573,12 @@
 }
 
 .healthCard strong {
-  font-size: 10px;
+  font-size: 12px;
 }
 
 .healthCard small {
   color: #747c72;
-  font-size: 8px;
+  font-size: 10px;
 }
 
 .healthyDot {
@@ -635,7 +640,37 @@
 .resultCount {
   margin-left: auto;
   color: #747c72;
-  font-size: 10px;
+  font-size: 12px;
+}
+
+.errorNotice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 14px;
+  border: 1px solid rgba(255, 128, 116, 0.24);
+  border-radius: 10px;
+  padding: 11px 12px;
+  background: rgba(255, 107, 93, 0.06);
+  color: #ffc4be;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.errorNotice button {
+  min-height: 40px;
+  flex: 0 0 auto;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 8px;
+  padding: 0 12px;
+  background: #1a1f1b;
+}
+
+.inlineEmpty {
+  padding: 20px 0;
+  color: #899187;
+  font-size: 12px;
 }
 
 .selectionBar {
@@ -678,7 +713,7 @@
 }
 
 .libraryCard {
-  overflow: hidden;
+  overflow: visible;
   border-radius: 13px;
 }
 
@@ -768,7 +803,7 @@
   padding: 2px 4px;
   border-radius: 4px;
   background: rgba(0, 0, 0, 0.55);
-  font-size: 7px;
+  font-size: 9px;
 }
 
 .videoIdentity > div:last-child {
@@ -780,7 +815,7 @@
 .videoIdentity strong {
   display: -webkit-box;
   overflow: hidden;
-  font-size: 11px;
+  font-size: 13px;
   line-height: 1.35;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
@@ -790,7 +825,7 @@
 .tableMuted,
 .tableCreator {
   color: #747c72;
-  font-size: 8px;
+  font-size: 11px;
 }
 
 .tableCreator,
@@ -810,8 +845,8 @@
 .rowActions > a,
 .videoActions > button {
   display: grid;
-  width: 33px;
-  height: 33px;
+  width: 44px;
+  height: 44px;
   place-items: center;
   border: 0;
   border-radius: 7px;
@@ -827,7 +862,8 @@
   position: absolute;
   z-index: 20;
   right: 0;
-  bottom: 39px;
+  top: 48px;
+  bottom: auto;
   min-width: 150px;
   border: 1px solid #313831;
   border-radius: 9px;
@@ -836,10 +872,11 @@
   box-shadow: 0 14px 32px rgba(0, 0, 0, 0.42);
 }
 
-.videoActionMenu button {
+.videoActionMenu button,
+.videoActionMenu a {
   display: flex;
   width: 100%;
-  height: 38px;
+  min-height: 44px;
   align-items: center;
   justify-content: flex-start;
   gap: 9px;
@@ -847,15 +884,21 @@
   border-radius: 7px;
   padding: 0 10px;
   background: transparent;
-  color: #ff9187;
-  font-size: 10px;
+  color: #d8ddd6;
+  font-size: 12px;
   white-space: nowrap;
 }
 
 .videoActionMenu button:hover,
-.videoActionMenu button:focus-visible {
+.videoActionMenu button:focus-visible,
+.videoActionMenu a:hover,
+.videoActionMenu a:focus-visible {
   outline: 0;
   background: rgba(255, 255, 255, 0.055);
+}
+
+.videoActionMenu button {
+  color: #ff9187;
 }
 
 .tableEmpty {
@@ -870,11 +913,11 @@
 
 .tableEmpty strong {
   color: var(--paper);
-  font-size: 12px;
+  font-size: 14px;
 }
 
 .tableEmpty span {
-  font-size: 9px;
+  font-size: 12px;
 }
 
 .importPanel {
@@ -904,7 +947,7 @@
 .importNote,
 .importError {
   margin: 0;
-  font-size: 9px;
+  font-size: 11px;
   line-height: 1.5;
 }
 
@@ -942,19 +985,19 @@
 .importRow > div:first-child span,
 .importRow > p {
   color: #777f76;
-  font-size: 8px;
+  font-size: 11px;
 }
 
 .importStatus {
   display: inline-flex;
-  height: 25px;
+  min-height: 30px;
   align-items: center;
   gap: 5px;
   border-radius: 999px;
   padding: 0 9px;
   background: rgba(255, 255, 255, 0.05);
   color: #a8afa6;
-  font-size: 8px;
+  font-size: 11px;
   text-transform: capitalize;
 }
 
@@ -984,12 +1027,12 @@
 
 .importRow dt {
   color: #747c72;
-  font-size: 7px;
+  font-size: 10px;
 }
 
 .importRow dd {
   margin: 0;
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 700;
 }
 
@@ -1036,8 +1079,8 @@
 
 .creatorMenuTrigger {
   display: grid;
-  width: 34px;
-  height: 34px;
+  width: 44px;
+  height: 44px;
   place-items: center;
   border: 0;
   border-radius: 8px;
@@ -1068,7 +1111,7 @@
 .creatorActionMenu button {
   display: flex;
   width: 100%;
-  height: 38px;
+  min-height: 44px;
   align-items: center;
   justify-content: flex-start;
   gap: 9px;
@@ -1077,7 +1120,7 @@
   padding: 0 10px;
   background: transparent;
   color: #d8ddd6;
-  font-size: 10px;
+  font-size: 12px;
   text-decoration: none;
 }
 
@@ -1105,7 +1148,7 @@
   padding: 10px 12px;
   background: rgba(201, 255, 74, 0.055);
   color: #cbd2c8;
-  font-size: 10px;
+  font-size: 12px;
 }
 
 .confirmScrim {
@@ -1149,7 +1192,7 @@
 .confirmDialog p {
   margin: 0;
   color: #899187;
-  font-size: 10px;
+  font-size: 12px;
   line-height: 1.55;
 }
 
@@ -1161,7 +1204,7 @@
 .confirmVideoTitle {
   margin-bottom: 3px;
   color: #e7ebe5;
-  font-size: 11px;
+  font-size: 13px;
 }
 
 .confirmVideoMeta {
@@ -1176,7 +1219,7 @@
 
 .confirmField span {
   color: #aeb5ac;
-  font-size: 10px;
+  font-size: 12px;
 }
 
 .confirmField input {
@@ -1188,7 +1231,7 @@
   outline: 0;
   background: #0b0e0c;
   color: var(--paper);
-  font-size: 11px;
+  font-size: 14px;
 }
 
 .confirmField input:focus {
@@ -1203,7 +1246,7 @@
 
 .confirmActions button {
   display: inline-flex;
-  height: 38px;
+  min-height: 44px;
   align-items: center;
   justify-content: center;
   gap: 7px;
@@ -1212,7 +1255,7 @@
   padding: 0 13px;
   background: #171c18;
   color: #d7dcd5;
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 700;
 }
 
@@ -1236,7 +1279,7 @@
 .creatorCard > p {
   margin: 0;
   color: #777f76;
-  font-size: 10px;
+  font-size: 12px;
 }
 
 .creatorStats {
@@ -1260,7 +1303,7 @@
 
 .creatorStats span {
   color: #747c72;
-  font-size: 8px;
+  font-size: 11px;
 }
 
 .creatorSync {
@@ -1268,7 +1311,7 @@
   align-items: center;
   gap: 7px;
   color: #858d83;
-  font-size: 9px;
+  font-size: 11px;
 }
 
 .creatorCardFooter {
@@ -1279,13 +1322,29 @@
   padding-top: 14px;
   border-top: 1px solid var(--line);
   color: #939b91;
-  font-size: 9px;
+  font-size: 11px;
+}
+
+.monitoringOn,
+.monitoringOff {
+  border-radius: 999px;
+  padding: 5px 8px;
+  background: rgba(255, 255, 255, 0.045);
+  font-weight: 680;
+}
+
+.monitoringOn {
+  color: var(--acid);
+}
+
+.monitoringOff {
+  color: #8b9389;
 }
 
 .switch {
   position: relative;
-  width: 38px;
-  height: 22px;
+  width: 44px;
+  height: 26px;
   border: 0;
   border-radius: 99px;
   background: #303530;
@@ -1296,8 +1355,8 @@
   position: absolute;
   top: 3px;
   left: 3px;
-  width: 16px;
-  height: 16px;
+  width: 20px;
+  height: 20px;
   border-radius: 50%;
   background: #c5cbc3;
   transition: transform 160ms ease;
@@ -1309,7 +1368,7 @@
 
 .switchOn > span {
   background: #12150f;
-  transform: translateX(16px);
+  transform: translateX(18px);
 }
 
 .settingsForm {
@@ -1357,13 +1416,13 @@
 
 .settingToggleRow strong,
 .formField > span {
-  font-size: 10px;
+  font-size: 13px;
   font-weight: 620;
 }
 
 .settingToggleRow > div > span {
   color: #747c72;
-  font-size: 9px;
+  font-size: 12px;
   line-height: 1.45;
 }
 
@@ -1382,7 +1441,7 @@
   outline: 0;
   background: #0f1210;
   color: var(--paper);
-  font-size: 10px;
+  font-size: 14px;
 }
 
 .inputSuffix {
@@ -1394,7 +1453,7 @@
   top: 50%;
   right: 11px;
   color: #737b71;
-  font-size: 9px;
+  font-size: 11px;
   transform: translateY(-50%);
 }
 
@@ -1403,6 +1462,7 @@
   z-index: 10;
   bottom: 12px;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: flex-end;
   gap: 18px;
@@ -1414,11 +1474,12 @@
 }
 
 .settingsFooter > span {
-  display: none;
+  display: flex;
   align-items: center;
   gap: 6px;
+  margin-right: auto;
   color: #7b8379;
-  font-size: 9px;
+  font-size: 11px;
 }
 
 @media (max-width: 560px) {
@@ -1457,7 +1518,6 @@
 
   .settingsFooter > span {
     display: flex;
-    margin-right: auto;
   }
 }
 
@@ -1481,7 +1541,13 @@
     border-right: 1px solid var(--line);
     border-left: 0;
     box-shadow: none;
+    visibility: visible;
+    pointer-events: auto;
     transform: none;
+  }
+
+  .menuScrim {
+    display: none;
   }
 
   .dashboardMain {
@@ -1507,7 +1573,7 @@
   .tableHeader,
   .videoRow {
     display: grid;
-    grid-template-columns: 32px minmax(260px, 1.8fr) minmax(100px, 0.7fr) 90px 70px 72px;
+    grid-template-columns: minmax(260px, 1.8fr) minmax(100px, 0.7fr) 90px 70px 72px;
     align-items: center;
     gap: 14px;
   }
@@ -1517,7 +1583,7 @@
     padding: 0 14px;
     border-bottom: 1px solid var(--line);
     color: #737b71;
-    font-size: 8px;
+    font-size: 10px;
     font-weight: 700;
     letter-spacing: 0.08em;
     text-transform: uppercase;

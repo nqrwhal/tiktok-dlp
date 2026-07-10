@@ -23,7 +23,10 @@ const importApiToken = process.env.LIVE_IMPORT_API_TOKEN || "";
 const publicBaseUrl = (process.env.LIVE_PUBLIC_BASE_URL || "").replace(/\/+$/, "");
 const inflightCopies = new Map();
 const inflightThumbnails = new Map();
+const limitVideoCopies = createTaskLimiter(2);
+const limitThumbnailGeneration = createTaskLimiter(2);
 let videoCache = { loadedAt: 0, rows: [] };
+let videoCacheLoadPromise = null;
 let metadataCache = { loadedAt: 0, byId: {} };
 
 const CREATOR_SQL = `
@@ -83,7 +86,13 @@ const STATS_SQL = `
       FROM files
       WHERE lower(filename) LIKE '%.mp4'
         AND created_at >= (unixepoch('now', '-7 days') * 1000)
-    ) AS new_this_week;
+    ) AS new_this_week,
+    (
+      SELECT COUNT(*)
+      FROM files
+      WHERE lower(filename) LIKE '%.mp4'
+        AND created_at >= (unixepoch('now', 'start of day') * 1000)
+    ) AS added_today;
 `;
 
 await mkdir(cacheDir, { recursive: true });
@@ -115,13 +124,37 @@ const server = http.createServer(async (request, response) => {
     if (request.method === "GET" && url.pathname === "/api/videos") {
       const creatorId = String(url.searchParams.get("creatorId") || "").toLowerCase();
       const username = String(url.searchParams.get("username") || "").trim();
-      const limit = Math.min(username ? 2_000 : 500, positiveInteger(url.searchParams.get("limit"), 100));
-      const rows = username
-        ? await remoteSql(buildVideoSql({ username, limit }))
-        : await loadVideoRows();
+      const fileId = positiveInteger(url.searchParams.get("fileId"), 0);
+      const limit = Math.min(5_000, positiveInteger(url.searchParams.get("limit"), 100));
+      let resolvedUsername = username || creatorId;
+      let baseRows = resolvedUsername
+        ? await remoteSql(buildVideoSql({ username: resolvedUsername, limit }))
+        : limit <= 500
+          ? await loadVideoRows()
+          : await remoteSql(buildVideoSql({ limit }));
+      if (!resolvedUsername && limit > 500) {
+        videoCache = { loadedAt: Date.now(), rows: baseRows };
+      }
+      if (creatorId && !username && baseRows.length === 0) {
+        const legacyUsername = await resolveCreatorUsername(creatorId);
+        if (legacyUsername && legacyUsername.toLowerCase() !== resolvedUsername.toLowerCase()) {
+          resolvedUsername = legacyUsername;
+          baseRows = await remoteSql(buildVideoSql({ username: resolvedUsername, limit }));
+        }
+      }
+      const rows = [...baseRows];
+      if (fileId) {
+        const exactIndex = rows.findIndex((row) => Number(row.id) === fileId);
+        if (exactIndex < 0) {
+          const exactRows = await remoteSql(buildVideoSql({ fileId, limit: 1 }));
+          rows.unshift(...exactRows);
+        } else if (exactIndex >= limit) {
+          rows.unshift(...rows.splice(exactIndex, 1));
+        }
+      }
       const metadataById = await loadMetadataIndex();
-      const filtered = creatorId && !username
-        ? rows.filter((row) => creatorKey(row.username) === creatorId || String(row.username).toLowerCase() === creatorId)
+      const filtered = creatorId
+        ? rows.filter((row) => creatorMatches(row.username, creatorId))
         : rows;
       sendJson(response, 200, filtered.slice(0, limit).map((row) => (
         toVideo(row, request, metadataById[String(row.video_id || "")] || {})
@@ -138,6 +171,7 @@ const server = http.createServer(async (request, response) => {
         storageUsed: formatBytes(sizeBytes),
         storagePercent: Math.min(100, Math.round((sizeBytes / (10 * 1024 ** 3)) * 100)),
         newThisWeek: Number(row.new_this_week || 0),
+        addedToday: Number(row.added_today || 0),
       });
       return;
     }
@@ -227,9 +261,16 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
 async function loadVideoRows({ force = false } = {}) {
   const now = Date.now();
   if (!force && now - videoCache.loadedAt < 15_000) return videoCache.rows;
-  const rows = await remoteSql(buildVideoSql());
-  videoCache = { loadedAt: now, rows };
-  return rows;
+  if (videoCacheLoadPromise) return videoCacheLoadPromise;
+  videoCacheLoadPromise = remoteSql(buildVideoSql())
+    .then((rows) => {
+      videoCache = { loadedAt: Date.now(), rows };
+      return rows;
+    })
+    .finally(() => {
+      videoCacheLoadPromise = null;
+    });
+  return videoCacheLoadPromise;
 }
 
 async function clearCachedFile(fileId) {
@@ -243,11 +284,12 @@ async function clearCachedFile(fileId) {
   }
 }
 
-function buildVideoSql({ username = "", limit = 500 } = {}) {
-  const boundedLimit = Math.min(username ? 2_000 : 500, positiveInteger(limit, 500));
+function buildVideoSql({ username = "", fileId = 0, limit = 500 } = {}) {
+  const boundedLimit = Math.min(5_000, positiveInteger(limit, 500));
   const creatorClause = username
     ? `AND lower(files.username) = lower(${sqliteString(username)})`
     : "";
+  const fileClause = fileId ? `AND files.id = ${positiveInteger(fileId, 0)}` : "";
   return `
     SELECT
       files.id,
@@ -273,9 +315,22 @@ function buildVideoSql({ username = "", limit = 500 } = {}) {
     FROM files
     WHERE lower(files.filename) LIKE '%.mp4'
       ${creatorClause}
+      ${fileClause}
     ORDER BY files.created_at DESC, files.id DESC
     LIMIT ${boundedLimit};
   `;
+}
+
+async function resolveCreatorUsername(creatorId) {
+  if (!creatorId) return "";
+  const rows = await remoteSql(CREATOR_SQL);
+  return String(rows.find((row) => creatorMatches(row.username, creatorId))?.username || "");
+}
+
+function creatorMatches(username, creatorId) {
+  const normalizedUsername = String(username || "").trim().toLowerCase();
+  const normalizedId = String(creatorId || "").trim().toLowerCase();
+  return normalizedUsername === normalizedId || legacyCreatorKey(username) === normalizedId;
 }
 
 async function loadMetadataIndex({ force = false } = {}) {
@@ -313,8 +368,7 @@ async function loadMetadataIndex({ force = false } = {}) {
 }
 
 async function serveMedia(request, response, fileId) {
-  const rows = await loadVideoRows();
-  const record = rows.find((row) => Number(row.id) === fileId);
+  const record = await findVideoRow(fileId);
   if (!record) {
     sendJson(response, 404, { error: "Video not found" });
     return;
@@ -324,6 +378,8 @@ async function serveMedia(request, response, fileId) {
   const fileStats = await stat(localPath);
   const range = parseRange(request.headers.range, fileStats.size);
   const modifiedAt = fileStats.mtime.toUTCString();
+  const requestUrl = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
+  const wantsDownload = requestUrl.searchParams.get("download") === "1";
   const headers = {
     "Accept-Ranges": "bytes",
     "Cache-Control": "private, max-age=86400, immutable",
@@ -331,6 +387,10 @@ async function serveMedia(request, response, fileId) {
     ETag: `"${fileId}-${fileStats.size}-${Math.trunc(fileStats.mtimeMs)}"`,
     "Last-Modified": modifiedAt,
   };
+  if (wantsDownload) {
+    const filename = String(record.filename || `${record.id}.mp4`).replace(/["\\\r\n]/g, "_");
+    headers["Content-Disposition"] = `attachment; filename="${filename}"`;
+  }
 
   if (range === null && request.headers.range) {
     response.writeHead(416, {
@@ -367,8 +427,7 @@ async function serveMedia(request, response, fileId) {
 }
 
 async function serveThumbnail(request, response, fileId) {
-  const rows = await loadVideoRows();
-  const record = rows.find((row) => Number(row.id) === fileId);
+  const record = await findVideoRow(fileId);
   if (!record) {
     sendJson(response, 404, { error: "Video not found" });
     return;
@@ -388,6 +447,14 @@ async function serveThumbnail(request, response, fileId) {
   await pipeline(createReadStream(thumbnailPath), response);
 }
 
+async function findVideoRow(fileId) {
+  const rows = await loadVideoRows();
+  const cached = rows.find((row) => Number(row.id) === Number(fileId));
+  if (cached) return cached;
+  const [exact] = await remoteSql(buildVideoSql({ fileId, limit: 1 }));
+  return exact || null;
+}
+
 async function ensureCached(record) {
   if (localMode) return resolveArchivePath(record.path);
 
@@ -403,7 +470,8 @@ async function ensureCached(record) {
   }
 
   if (inflightCopies.has(record.id)) return inflightCopies.get(record.id);
-  const copyPromise = copyFromRemote(record, localPath).finally(() => inflightCopies.delete(record.id));
+  const copyPromise = limitVideoCopies(() => copyFromRemote(record, localPath))
+    .finally(() => inflightCopies.delete(record.id));
   inflightCopies.set(record.id, copyPromise);
   return copyPromise;
 }
@@ -459,7 +527,7 @@ async function ensureThumbnail(record) {
   }
 
   if (inflightThumbnails.has(record.id)) return inflightThumbnails.get(record.id);
-  const thumbnailPromise = copyThumbnailFromRemote(record, localPath)
+  const thumbnailPromise = limitThumbnailGeneration(() => copyThumbnailFromRemote(record, localPath))
     .finally(() => inflightThumbnails.delete(record.id));
   inflightThumbnails.set(record.id, thumbnailPromise);
   return thumbnailPromise;
@@ -779,6 +847,10 @@ function cleanTitle(value, videoId, createdAt) {
 }
 
 function creatorKey(username) {
+  return String(username || "unknown").trim().toLowerCase() || "unknown";
+}
+
+function legacyCreatorKey(username) {
   return String(username || "unknown").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "unknown";
 }
 
@@ -818,6 +890,31 @@ function formatBytes(bytes) {
   if (value < 1024 ** 2) return `${(value / 1024).toFixed(1)} KB`;
   if (value < 1024 ** 3) return `${(value / 1024 ** 2).toFixed(1)} MB`;
   return `${(value / 1024 ** 3).toFixed(1)} GB`;
+}
+
+function createTaskLimiter(maxConcurrent) {
+  const limit = Math.max(1, positiveInteger(maxConcurrent, 1));
+  const queue = [];
+  let active = 0;
+
+  function runNext() {
+    while (active < limit && queue.length) {
+      const entry = queue.shift();
+      active += 1;
+      Promise.resolve()
+        .then(entry.task)
+        .then(entry.resolve, entry.reject)
+        .finally(() => {
+          active -= 1;
+          runNext();
+        });
+    }
+  }
+
+  return (task) => new Promise((resolve, reject) => {
+    queue.push({ task, resolve, reject });
+    runNext();
+  });
 }
 
 function positiveInteger(value, fallback) {

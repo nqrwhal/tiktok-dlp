@@ -3,6 +3,7 @@
 import {
   CircleAlert,
   DownloadCloud,
+  Grid3X3,
   Library,
   LoaderCircle,
   MoreHorizontal,
@@ -12,10 +13,11 @@ import {
   X,
 } from "lucide-react";
 import Link from "next/link";
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { mockStats, mockVideos } from "../../lib/mock-data";
 import type { Creator, CreatorImport } from "../../lib/types";
 import { useArchiveData } from "../../lib/useArchiveData";
+import { useModalDialog } from "../../lib/useModalDialog";
 import styles from "./dashboard.module.css";
 
 export function CreatorManager({ creators }: { creators: Creator[] }) {
@@ -23,10 +25,11 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
     fallbackCreators: creators,
     fallbackVideos: mockVideos,
     fallbackStats: mockStats,
+    includeVideos: false,
+    includeStats: false,
   });
   const apiBase = process.env.NEXT_PUBLIC_ARCHIVE_API_BASE?.replace(/\/+$/, "") || "";
   const [query, setQuery] = useState("");
-  const [enabled, setEnabled] = useState<Record<string, boolean>>({});
   const [importOpen, setImportOpen] = useState(false);
   const [importUsername, setImportUsername] = useState("");
   const [maxMinutes, setMaxMinutes] = useState("2");
@@ -39,21 +42,35 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
   const [deleteError, setDeleteError] = useState("");
   const [deleting, setDeleting] = useState(false);
   const [actionMessage, setActionMessage] = useState("");
+  const terminalImports = useRef(new Set<number>());
   const liveCreators = archive.creators;
+  const refreshArchive = archive.refresh;
+  const { dialogRef, returnFocusRef } = useModalDialog(Boolean(deleteCreator), closeDeleteConfirmation);
 
   const loadImports = useCallback(async () => {
     if (!apiBase) return;
     const response = await fetch(`${apiBase}/api/imports?limit=8`, { cache: "no-store" });
     const payload = await response.json() as { imports?: CreatorImport[]; error?: string };
     if (!response.ok) throw new Error(payload.error || `Import status failed (${response.status})`);
-    setImports(payload.imports || []);
-  }, [apiBase]);
+    const nextImports = payload.imports || [];
+    setImports(nextImports);
+    const newlyTerminal = nextImports.filter(
+      (entry) => (entry.status === "completed" || entry.status === "failed")
+        && !terminalImports.current.has(entry.id),
+    );
+    for (const entry of newlyTerminal) terminalImports.current.add(entry.id);
+    if (newlyTerminal.length) {
+      refreshArchive();
+    }
+  }, [apiBase, refreshArchive]);
 
   const hasActiveImport = imports.some((entry) => entry.status === "queued" || entry.status === "running");
   useEffect(() => {
     if (!importOpen || !hasActiveImport) return;
     const timer = window.setInterval(() => {
-      void loadImports().catch(() => undefined);
+      void loadImports().catch((error: unknown) => {
+        setImportError(error instanceof Error ? error.message : String(error));
+      });
     }, 4_000);
     return () => window.clearInterval(timer);
   }, [hasActiveImport, importOpen, loadImports]);
@@ -67,8 +84,11 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
     }
     function handleKeyDown(event: KeyboardEvent) {
       if (event.key !== "Escape") return;
+      const trigger = actionCreatorId
+        ? document.getElementById(`creator-actions-${actionCreatorId}`)
+        : null;
       setActionCreatorId("");
-      if (!deleting) closeDeleteConfirmation();
+      if (trigger) window.requestAnimationFrame(() => trigger.focus());
     }
     document.addEventListener("pointerdown", handlePointerDown);
     document.addEventListener("keydown", handleKeyDown);
@@ -76,7 +96,7 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
       document.removeEventListener("pointerdown", handlePointerDown);
       document.removeEventListener("keydown", handleKeyDown);
     };
-  }, [deleting]);
+  }, [actionCreatorId]);
 
   const filtered = useMemo(() => {
     const normalized = query.trim().toLowerCase();
@@ -138,6 +158,7 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
   }
 
   function openDeleteConfirmation(creator: Creator) {
+    returnFocusRef.current = document.getElementById(`creator-actions-${creator.id}`);
     setActionCreatorId("");
     setDeleteCreator(creator);
     setDeleteConfirmation("");
@@ -145,6 +166,7 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
   }
 
   function closeDeleteConfirmation() {
+    if (deleting) return;
     setDeleteCreator(null);
     setDeleteConfirmation("");
     setDeleteError("");
@@ -186,6 +208,7 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
           ? `Deleted ${deletedVideos} videos for @${deleteCreator.username}; ${failedVideos} could not be removed.`
           : `Deleted ${deletedVideos} videos for @${deleteCreator.username}.`,
       );
+      returnFocusRef.current = document.getElementById("creator-import-button");
       closeDeleteConfirmation();
       archive.refresh();
     } catch (error) {
@@ -203,6 +226,7 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
         </div>
         <button
           className={styles.primaryButton}
+          id="creator-import-button"
           type="button"
           onClick={toggleImportPanel}
           aria-expanded={importOpen}
@@ -266,7 +290,7 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
                     <div><dt>Too long</dt><dd>{entry.skippedDurationCount}</dd></div>
                     <div><dt>Failed</dt><dd>{entry.failedCount}</dd></div>
                   </dl>
-                  {entry.lastError && entry.status === "failed" ? <p>{entry.lastError}</p> : null}
+                  {entry.lastError && (entry.status === "failed" || entry.failedCount > 0) ? <p>{entry.lastError}</p> : null}
                 </article>
               ))}
             </div>
@@ -288,6 +312,12 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
       </div>
 
       {actionMessage ? <p className={styles.actionMessage} role="status">{actionMessage}</p> : null}
+      {archive.error ? (
+        <div className={styles.errorNotice} role="alert">
+          <span>{archive.error}</span>
+          <button type="button" onClick={archive.refresh}>Retry</button>
+        </div>
+      ) : null}
 
       <section className={styles.creatorGrid}>
         {filtered.map((creator) => (
@@ -302,19 +332,25 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
               <div className={styles.creatorActions} data-creator-actions>
                 <button
                   className={styles.creatorMenuTrigger}
+                  id={`creator-actions-${creator.id}`}
                   type="button"
                   aria-label={`More actions for ${creator.username}`}
-                  aria-haspopup="menu"
+                  aria-controls={`creator-menu-${creator.id}`}
                   aria-expanded={actionCreatorId === creator.id}
                   onClick={() => setActionCreatorId((current) => current === creator.id ? "" : creator.id)}
                 >
                   <MoreHorizontal size={20} />
                 </button>
                 {actionCreatorId === creator.id ? (
-                  <div className={styles.creatorActionMenu} role="menu">
+                  <div className={styles.creatorActionMenu} id={`creator-menu-${creator.id}`}>
+                    <Link
+                      href={`/creator?creator=${encodeURIComponent(creator.id)}`}
+                    >
+                      <Grid3X3 size={15} />
+                      Open profile
+                    </Link>
                     <Link
                       href={`/dashboard/videos?creator=${encodeURIComponent(creator.id)}&username=${encodeURIComponent(creator.username)}`}
-                      role="menuitem"
                     >
                       <Library size={15} />
                       View videos
@@ -322,7 +358,6 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
                     <button
                       className={styles.creatorActionDanger}
                       type="button"
-                      role="menuitem"
                       disabled={creator.videoCount === 0}
                       onClick={() => openDeleteConfirmation(creator)}
                     >
@@ -333,7 +368,7 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
                 ) : null}
               </div>
             </div>
-            <h2>{creator.displayName}</h2>
+            <h2><Link href={`/creator?creator=${encodeURIComponent(creator.id)}`}>{creator.displayName}</Link></h2>
             <p>@{creator.username}</p>
             <div className={styles.creatorStats}>
               <div><strong>{creator.videoCount}</strong><span>Videos</span></div>
@@ -350,36 +385,36 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
               </span>
             </div>
             <div className={styles.creatorCardFooter}>
-              <span>Monitoring</span>
-              <button
-                className={`${styles.switch} ${(enabled[creator.id] ?? creator.enabled) ? styles.switchOn : ""}`}
-                onClick={() =>
-                  setEnabled((current) => ({
-                    ...current,
-                    [creator.id]: !(current[creator.id] ?? creator.enabled),
-                  }))
-                }
-                type="button"
-                role="switch"
-                aria-checked={enabled[creator.id] ?? creator.enabled}
-                aria-label={`${(enabled[creator.id] ?? creator.enabled) ? "Disable" : "Enable"} monitoring for ${creator.username}`}
-              >
-                <span />
-              </button>
+              <span>{creator.enabled ? "Monitoring enabled" : "Saved archive only"}</span>
+              <span className={creator.enabled ? styles.monitoringOn : styles.monitoringOff}>
+                {creator.enabled ? "Monitored" : "Not monitored"}
+              </span>
             </div>
           </article>
         ))}
       </section>
+      {filtered.length === 0 ? (
+        <div className={styles.tableEmpty}>
+          <Search size={25} />
+          <strong>
+            {archive.source === "loading" || archive.source === "refreshing"
+              ? "Loading creators…"
+              : archive.source === "error" ? "Could not load creators" : "No matching creators"}
+          </strong>
+          <span>{archive.source === "error" ? "Retry the live archive connection." : "Try a different search term."}</span>
+        </div>
+      ) : null}
 
       {deleteCreator ? (
         <div
           className={styles.confirmScrim}
-          onMouseDown={(event) => {
+          onPointerDown={(event) => {
             if (event.target === event.currentTarget && !deleting) closeDeleteConfirmation();
           }}
         >
           <section
             className={styles.confirmDialog}
+            ref={dialogRef}
             role="dialog"
             aria-modal="true"
             aria-labelledby="delete-creator-title"
@@ -389,12 +424,15 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
               <h2 id="delete-creator-title">Delete all videos?</h2>
               <p>
                 This permanently removes {deleteCreator.videoCount} archived {deleteCreator.videoCount === 1 ? "video" : "videos"}
-                {" "}and saved metadata for @{deleteCreator.username}. The creator stays in your monitoring list.
+                {" "}and saved metadata for @{deleteCreator.username}. {deleteCreator.enabled
+                  ? "The creator stays in your monitoring list."
+                  : "This saved-only creator will be removed from the creator list."}
               </p>
             </div>
             <label className={styles.confirmField}>
               <span>Type <strong>@{deleteCreator.username}</strong> to confirm</span>
               <input
+                data-dialog-initial
                 autoFocus
                 value={deleteConfirmation}
                 onChange={(event) => setDeleteConfirmation(event.target.value)}

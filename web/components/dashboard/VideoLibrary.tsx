@@ -1,7 +1,6 @@
 "use client";
 
 import {
-  CheckCircle2,
   Download,
   ExternalLink,
   LoaderCircle,
@@ -14,9 +13,11 @@ import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { CreatorPicker } from "../CreatorPicker";
+import { resolveCreatorId } from "../../lib/creator-id";
 import { mockStats } from "../../lib/mock-data";
 import type { Creator, SavedVideo } from "../../lib/types";
 import { useArchiveData } from "../../lib/useArchiveData";
+import { useModalDialog } from "../../lib/useModalDialog";
 import styles from "./dashboard.module.css";
 
 export function VideoLibrary({
@@ -39,10 +40,15 @@ export function VideoLibrary({
     fallbackStats: mockStats,
     videoCreatorId: creatorFilter.id === "all" ? "" : creatorFilter.id,
     videoUsername: creatorFilter.username,
+    videoLimit: 5_000,
+    includeStats: false,
   });
   const liveCreators = archive.creators;
+  const resolvedCreatorFilter = useMemo(
+    () => resolveCreatorId(creatorFilter.id, liveCreators),
+    [creatorFilter.id, liveCreators],
+  );
   const [query, setQuery] = useState("");
-  const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const [actionVideoId, setActionVideoId] = useState("");
   const [deleteVideo, setDeleteVideo] = useState<SavedVideo | null>(null);
   const [deleteError, setDeleteError] = useState("");
@@ -53,6 +59,7 @@ export function VideoLibrary({
     () => archive.videos.filter((video) => !removedVideoIds.has(video.id)),
     [archive.videos, removedVideoIds],
   );
+  const { dialogRef, returnFocusRef } = useModalDialog(Boolean(deleteVideo), closeDeleteVideo);
 
   useEffect(() => {
     function handlePointerDown(event: PointerEvent) {
@@ -63,8 +70,11 @@ export function VideoLibrary({
     }
     function handleKeyDown(event: KeyboardEvent) {
       if (event.key !== "Escape") return;
+      const trigger = actionVideoId
+        ? document.getElementById(`video-actions-${actionVideoId}`)
+        : null;
       setActionVideoId("");
-      if (!deleting) closeDeleteVideo();
+      if (trigger) window.requestAnimationFrame(() => trigger.focus());
     }
     document.addEventListener("pointerdown", handlePointerDown);
     document.addEventListener("keydown", handleKeyDown);
@@ -72,19 +82,21 @@ export function VideoLibrary({
       document.removeEventListener("pointerdown", handlePointerDown);
       document.removeEventListener("keydown", handleKeyDown);
     };
-  }, [deleting]);
+  }, [actionVideoId]);
 
   const filtered = useMemo(() => {
     const normalized = query.trim().toLowerCase();
     return liveVideos.filter((video) => {
-      const matchesCreator = creatorFilter.id === "all" || video.creatorId === creatorFilter.id;
+      const matchesCreator = resolvedCreatorFilter === "all" || video.creatorId === resolvedCreatorFilter;
       const matchesQuery =
         !normalized ||
         video.title.toLowerCase().includes(normalized) ||
-        video.username.toLowerCase().includes(normalized);
+        video.username.toLowerCase().includes(normalized) ||
+        video.description.toLowerCase().includes(normalized) ||
+        video.tags.some((tag) => tag.toLowerCase().includes(normalized));
       return matchesCreator && matchesQuery;
     });
-  }, [creatorFilter.id, liveVideos, query]);
+  }, [liveVideos, query, resolvedCreatorFilter]);
 
   function selectCreator(id: string) {
     setCreatorFilter({
@@ -93,22 +105,15 @@ export function VideoLibrary({
     });
   }
 
-  function toggleSelected(id: string) {
-    setSelected((current) => {
-      const next = new Set(current);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  }
-
   function openDeleteVideo(video: SavedVideo) {
+    returnFocusRef.current = document.getElementById(`video-actions-${video.id}`);
     setActionVideoId("");
     setDeleteVideo(video);
     setDeleteError("");
   }
 
   function closeDeleteVideo() {
+    if (deleting) return;
     setDeleteVideo(null);
     setDeleteError("");
   }
@@ -135,12 +140,12 @@ export function VideoLibrary({
       }
 
       setRemovedVideoIds((current) => new Set(current).add(deleteVideo.id));
-      setSelected((current) => {
-        const next = new Set(current);
-        next.delete(deleteVideo.id);
-        return next;
-      });
       setActionMessage(`Deleted “${deleteVideo.title}” from @${deleteVideo.username}.`);
+      const deletedIndex = filtered.findIndex((video) => video.id === deleteVideo.id);
+      const nextVideo = filtered[deletedIndex + 1] || filtered[deletedIndex - 1];
+      returnFocusRef.current = nextVideo
+        ? document.getElementById(`video-actions-${nextVideo.id}`)
+        : document.getElementById("video-library-feed-link");
       closeDeleteVideo();
       archive.refresh();
     } catch (error) {
@@ -156,9 +161,9 @@ export function VideoLibrary({
         <div>
           <h1>Videos</h1>
         </div>
-        <button className={styles.primaryButton} type="button">
-          <Download size={17} /> Export selected
-        </button>
+        <Link className={styles.primaryButton} href="/" id="video-library-feed-link">
+          <Play size={16} fill="currentColor" /> Open feed
+        </Link>
       </div>
 
       <div className={styles.filterBar}>
@@ -168,28 +173,23 @@ export function VideoLibrary({
           <input
             value={query}
             onChange={(event) => setQuery(event.target.value)}
-            placeholder="Search title or creator"
+            placeholder="Search videos"
           />
         </label>
-        <CreatorPicker creators={liveCreators} value={creatorFilter.id} onChange={selectCreator} />
+        <CreatorPicker creators={liveCreators} value={resolvedCreatorFilter} onChange={selectCreator} />
         <span className={styles.resultCount}>{filtered.length} results</span>
       </div>
 
       {actionMessage ? <p className={styles.actionMessage} role="status">{actionMessage}</p> : null}
-
-      {selected.size > 0 ? (
-        <div className={styles.selectionBar}>
-          <span><CheckCircle2 size={16} /> {selected.size} selected</span>
-          <div>
-            <button type="button"><Download size={15} /> Download</button>
-            <button className={styles.dangerText} type="button"><Trash2 size={15} /> Delete</button>
-          </div>
+      {archive.error ? (
+        <div className={styles.errorNotice} role="alert">
+          <span>{archive.error}</span>
+          <button type="button" onClick={archive.refresh}>Retry</button>
         </div>
       ) : null}
 
       <section className={styles.libraryCard}>
         <div className={styles.tableHeader}>
-          <span />
           <span>Video</span>
           <span>Creator</span>
           <span>Saved</span>
@@ -200,18 +200,9 @@ export function VideoLibrary({
           <article className={styles.videoRow} key={video.id}>
             <Link
               className={styles.videoRowLink}
-              href={`/?video=${encodeURIComponent(video.id)}`}
+              href={`/?creator=${encodeURIComponent(video.creatorId)}&video=${encodeURIComponent(video.id)}`}
               aria-label={`Play ${video.title}`}
             />
-            <label className={styles.checkboxWrap}>
-              <input
-                type="checkbox"
-                checked={selected.has(video.id)}
-                onChange={() => toggleSelected(video.id)}
-              />
-              <span />
-              <b className="sr-only">Select {video.title}</b>
-            </label>
             <div className={styles.videoIdentity}>
               <div
                 className={styles.libraryThumb}
@@ -227,7 +218,7 @@ export function VideoLibrary({
               </div>
               <div>
                 <strong>{video.title}</strong>
-                <small>{video.mediaType} · {video.id}</small>
+                <small>@{video.username} · saved {video.savedAtLabel} · {video.sizeLabel}</small>
               </div>
             </div>
             <span className={styles.tableCreator}>@{video.username}</span>
@@ -239,17 +230,25 @@ export function VideoLibrary({
               </a>
               <div className={styles.videoActions} data-video-actions>
                 <button
+                  id={`video-actions-${video.id}`}
                   type="button"
                   aria-label={`More actions for ${video.title} by @${video.username}, video ${video.id}`}
-                  aria-haspopup="menu"
+                  aria-controls={`video-menu-${video.id}`}
                   aria-expanded={actionVideoId === video.id}
                   onClick={() => setActionVideoId((current) => current === video.id ? "" : video.id)}
                 >
                   <MoreHorizontal size={18} />
                 </button>
                 {actionVideoId === video.id ? (
-                  <div className={styles.videoActionMenu} role="menu">
-                    <button type="button" role="menuitem" onClick={() => openDeleteVideo(video)}>
+                  <div className={styles.videoActionMenu} id={`video-menu-${video.id}`}>
+                    <a
+                      href={`${video.videoUrl}${video.videoUrl.includes("?") ? "&" : "?"}download=1`}
+                      download
+                    >
+                      <Download size={15} />
+                      Download video
+                    </a>
+                    <button type="button" onClick={() => openDeleteVideo(video)}>
                       <Trash2 size={15} />
                       Delete video
                     </button>
@@ -262,8 +261,14 @@ export function VideoLibrary({
         {filtered.length === 0 ? (
           <div className={styles.tableEmpty}>
             <Search size={25} />
-            <strong>No matching videos</strong>
-            <span>Try a different creator or search term.</span>
+            <strong>
+              {archive.source === "loading" || archive.source === "refreshing"
+                ? "Loading videos…"
+                : archive.source === "error" ? "Could not load videos" : "No matching videos"}
+            </strong>
+            <span>
+              {archive.source === "error" ? "Retry the live archive connection." : "Try a different creator or search term."}
+            </span>
           </div>
         ) : null}
       </section>
@@ -271,12 +276,13 @@ export function VideoLibrary({
       {deleteVideo ? (
         <div
           className={styles.confirmScrim}
-          onMouseDown={(event) => {
+          onPointerDown={(event) => {
             if (event.target === event.currentTarget && !deleting) closeDeleteVideo();
           }}
         >
           <section
             className={styles.confirmDialog}
+            ref={dialogRef}
             role="dialog"
             aria-modal="true"
             aria-labelledby="delete-video-title"
@@ -292,7 +298,7 @@ export function VideoLibrary({
             </div>
             {deleteError ? <p className={styles.importError} role="alert">{deleteError}</p> : null}
             <div className={styles.confirmActions}>
-              <button type="button" onClick={closeDeleteVideo} disabled={deleting}>Cancel</button>
+              <button data-dialog-initial type="button" onClick={closeDeleteVideo} disabled={deleting}>Cancel</button>
               <button
                 className={styles.confirmDeleteButton}
                 type="button"

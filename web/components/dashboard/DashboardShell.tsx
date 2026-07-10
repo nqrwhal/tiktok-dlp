@@ -11,7 +11,7 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import styles from "./dashboard.module.css";
 
 const navigation = [
@@ -24,6 +24,50 @@ const navigation = [
 export function DashboardShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const [menuOpen, setMenuOpen] = useState(false);
+  const menuButtonRef = useRef<HTMLButtonElement>(null);
+  const sidebarRef = useRef<HTMLElement>(null);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const menuButton = menuButtonRef.current;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const firstLink = sidebarRef.current?.querySelector<HTMLElement>("nav a");
+    window.requestAnimationFrame(() => firstLink?.focus());
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setMenuOpen(false);
+        return;
+      }
+      if (event.key !== "Tab" || !sidebarRef.current) return;
+      const focusable = Array.from(sidebarRef.current.querySelectorAll<HTMLElement>("a[href], button:not([disabled])"));
+      const first = focusable[0];
+      const last = focusable.at(-1);
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last?.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first?.focus();
+      }
+    }
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+      document.body.style.overflow = previousOverflow;
+      window.requestAnimationFrame(() => menuButton?.focus());
+    };
+  }, [menuOpen]);
+
+  useEffect(() => {
+    const desktop = window.matchMedia("(min-width: 980px)");
+    function closeAtDesktop(event: MediaQueryListEvent) {
+      if (event.matches) setMenuOpen(false);
+    }
+    desktop.addEventListener("change", closeAtDesktop);
+    return () => desktop.removeEventListener("change", closeAtDesktop);
+  }, []);
 
   return (
     <div className={styles.dashboardShell}>
@@ -33,16 +77,23 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
         </Link>
         <button
           className={styles.mobileMenuButton}
+          ref={menuButtonRef}
           onClick={() => setMenuOpen((open) => !open)}
           type="button"
           aria-expanded={menuOpen}
+          aria-controls="dashboard-navigation"
           aria-label={menuOpen ? "Close navigation" : "Open navigation"}
         >
           {menuOpen ? <X size={21} /> : <Menu size={21} />}
         </button>
       </header>
 
-      <aside className={`${styles.sidebar} ${menuOpen ? styles.sidebarOpen : ""}`}>
+      <aside
+        className={`${styles.sidebar} ${menuOpen ? styles.sidebarOpen : ""}`}
+        id="dashboard-navigation"
+        ref={sidebarRef}
+        aria-label="Dashboard navigation"
+      >
         <Link className={styles.brand} href="/">
           <span>R</span> rewind
         </Link>

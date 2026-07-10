@@ -8,5 +8,6 @@ export const metadata: Metadata = {
 };
 
 export default function CreatorPage() {
-  return <CreatorGallery creators={mockCreators} videos={mockVideos} />;
+  const liveMode = Boolean(process.env.NEXT_PUBLIC_ARCHIVE_API_BASE);
+  return <CreatorGallery creators={liveMode ? [] : mockCreators} videos={liveMode ? [] : mockVideos} />;
 }

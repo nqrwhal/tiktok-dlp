@@ -7,11 +7,12 @@ export const metadata: Metadata = {
 };
 
 export default function DashboardPage() {
+  const liveMode = Boolean(process.env.NEXT_PUBLIC_ARCHIVE_API_BASE);
   return (
     <DashboardOverview
-      fallbackCreators={mockCreators}
-      fallbackVideos={mockVideos}
-      fallbackStats={mockStats}
+      fallbackCreators={liveMode ? [] : mockCreators}
+      fallbackVideos={liveMode ? [] : mockVideos}
+      fallbackStats={liveMode ? { ...mockStats, creatorCount: 0, videoCount: 0, storageUsed: "0 B", storagePercent: 0, newThisWeek: 0 } : mockStats}
     />
   );
 }

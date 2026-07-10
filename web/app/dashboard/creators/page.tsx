@@ -8,9 +8,10 @@ export const metadata: Metadata = {
 };
 
 export default function CreatorsPage() {
+  const liveMode = Boolean(process.env.NEXT_PUBLIC_ARCHIVE_API_BASE);
   return (
     <div className={styles.pageWrap}>
-      <CreatorManager creators={mockCreators} />
+      <CreatorManager creators={liveMode ? [] : mockCreators} />
     </div>
   );
 }

@@ -3,7 +3,12 @@
 import { Check, Save } from "lucide-react";
 import { FormEvent, useEffect, useState } from "react";
 import {
+  type DefaultFeed,
+  readAutoplayPreference,
+  readDefaultFeed,
   readRememberSound,
+  writeAutoplayPreference,
+  writeDefaultFeed,
   writeRememberSound,
 } from "../../lib/playback-preferences";
 import styles from "./dashboard.module.css";
@@ -12,15 +17,20 @@ export function SettingsForm() {
   const [saved, setSaved] = useState(false);
   const [autoplay, setAutoplay] = useState(true);
   const [sound, setSound] = useState(true);
-  const [deletionAlerts, setDeletionAlerts] = useState(true);
+  const [defaultFeed, setDefaultFeed] = useState<DefaultFeed>("all");
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setSound(readRememberSound(window.localStorage));
+    setAutoplay(readAutoplayPreference(window.localStorage));
+    setDefaultFeed(readDefaultFeed(window.localStorage));
   }, []);
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    writeAutoplayPreference(window.localStorage, autoplay);
+    writeRememberSound(window.localStorage, sound);
+    writeDefaultFeed(window.localStorage, defaultFeed);
     setSaved(true);
     window.setTimeout(() => setSaved(false), 2200);
   }
@@ -44,80 +54,20 @@ export function SettingsForm() {
             label="Remember sound"
             description="Keep your last mute setting on this device."
             checked={sound}
-            onChange={(remember) => {
-              setSound(remember);
-              writeRememberSound(window.localStorage, remember);
-            }}
+            onChange={setSound}
           />
           <label className={styles.formField}>
             <span>Default feed</span>
-            <select defaultValue="all">
+            <select value={defaultFeed} onChange={(event) => setDefaultFeed(event.target.value as DefaultFeed)}>
               <option value="all">All creators</option>
-              <option value="latest">Latest downloads</option>
-              <option value="unwatched">Unwatched first</option>
-            </select>
-          </label>
-        </div>
-      </section>
-
-      <section className={styles.settingsSection}>
-        <div className={styles.settingsIntro}>
-          <span className={styles.sectionEyebrow}>Downloads</span>
-          <h2>Archive behavior</h2>
-          <p>Defaults for monitoring, retention, and new media.</p>
-        </div>
-        <div className={styles.settingsFields}>
-          <label className={styles.formField}>
-            <span>Poll interval</span>
-            <div className={styles.inputSuffix}>
-              <input type="number" min="30" defaultValue="60" />
-              <span>seconds</span>
-            </div>
-          </label>
-          <label className={styles.formField}>
-            <span>Download concurrency</span>
-            <select defaultValue="2">
-              <option value="1">1 at a time</option>
-              <option value="2">2 at a time</option>
-              <option value="3">3 at a time</option>
-            </select>
-          </label>
-          <SettingToggle
-            label="Deletion alerts"
-            description="Notify me if an original post disappears."
-            checked={deletionAlerts}
-            onChange={setDeletionAlerts}
-          />
-        </div>
-      </section>
-
-      <section className={styles.settingsSection}>
-        <div className={styles.settingsIntro}>
-          <span className={styles.sectionEyebrow}>Storage</span>
-          <h2>Retention</h2>
-          <p>Decide how the server handles older and temporary files.</p>
-        </div>
-        <div className={styles.settingsFields}>
-          <label className={styles.formField}>
-            <span>Temporary link lifetime</span>
-            <div className={styles.inputSuffix}>
-              <input type="number" min="5" defaultValue="30" />
-              <span>minutes</span>
-            </div>
-          </label>
-          <label className={styles.formField}>
-            <span>Cleanup policy</span>
-            <select defaultValue="expired">
-              <option value="expired">Remove expired temporary files</option>
-              <option value="manual">Manual cleanup only</option>
-              <option value="30-days">Remove unsaved files after 30 days</option>
+              <option value="bookmarks">Bookmarks</option>
             </select>
           </label>
         </div>
       </section>
 
       <div className={styles.settingsFooter}>
-        <span>{saved ? <><Check size={15} /> Preview settings saved</> : "Changes are stored locally in this frontend preview."}</span>
+        <span>{saved ? <><Check size={15} /> Settings saved</> : "These preferences apply to this browser."}</span>
         <button className={styles.primaryButton} type="submit">
           <Save size={16} /> Save changes
         </button>

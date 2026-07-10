@@ -39,6 +39,7 @@ export interface ArchiveStats {
   storageUsed: string;
   storagePercent: number;
   newThisWeek: number;
+  addedToday?: number;
 }
 
 export interface CreatorImport {

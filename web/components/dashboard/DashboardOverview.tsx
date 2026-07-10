@@ -17,10 +17,12 @@ export function DashboardOverview({
 }) {
   const archive = useArchiveData({ fallbackCreators, fallbackVideos, fallbackStats });
   const { creators, videos, stats } = archive;
+  const loading = archive.source === "loading" || archive.source === "refreshing";
   const activeCreators = creators.filter((creator) => creator.enabled).length;
   const needsAttention = creators.filter((creator) => creator.status === "attention").length;
   const today = new Date().toDateString();
-  const downloadsToday = videos.filter((video) => new Date(video.savedAt).toDateString() === today).length;
+  const downloadsToday = stats.addedToday
+    ?? videos.filter((video) => new Date(video.savedAt).toDateString() === today).length;
 
   return (
     <div className={styles.pageWrap}>
@@ -32,11 +34,18 @@ export function DashboardOverview({
       </div>
 
       <section className={styles.metricGrid} aria-label="Archive metrics">
-        <Metric label="Videos" value={String(stats.videoCount)} />
-        <Metric label="Creators" value={String(stats.creatorCount)} />
-        <Metric label="Storage" value={stats.storageUsed} />
-        <Metric label="Added today" value={String(downloadsToday)} />
+        <Metric label="Videos" value={loading ? "—" : String(stats.videoCount)} />
+        <Metric label="Creators" value={loading ? "—" : String(stats.creatorCount)} />
+        <Metric label="Storage" value={loading ? "—" : stats.storageUsed} />
+        <Metric label="Added today" value={loading ? "—" : String(downloadsToday)} />
       </section>
+
+      {archive.error ? (
+        <div className={styles.errorNotice} role="alert">
+          <span>{archive.error}</span>
+          <button type="button" onClick={archive.refresh}>Retry</button>
+        </div>
+      ) : null}
 
       <section className={styles.overviewGrid}>
         <div className={styles.contentCard}>
@@ -46,7 +55,11 @@ export function DashboardOverview({
           </div>
           <div className={styles.recentList}>
             {videos.slice(0, 5).map((video) => (
-              <Link className={styles.recentRow} href={`/?video=${encodeURIComponent(video.id)}`} key={video.id}>
+              <Link
+                className={styles.recentRow}
+                href={`/?creator=${encodeURIComponent(video.creatorId)}&video=${encodeURIComponent(video.id)}`}
+                key={video.id}
+              >
                 <div className={styles.videoThumb} style={{ "--thumb": video.accent } as React.CSSProperties}>
                   {video.thumbnailUrl ? (
                     // Live preview thumbnails come from a configurable local bridge URL.
@@ -62,6 +75,11 @@ export function DashboardOverview({
                 <span className={styles.recentTime}>{video.savedAtLabel}</span>
               </Link>
             ))}
+            {videos.length === 0 ? (
+              <div className={styles.inlineEmpty}>
+                {archive.source === "loading" || archive.source === "refreshing" ? "Loading recent files…" : "No saved videos yet."}
+              </div>
+            ) : null}
           </div>
         </div>
 
@@ -69,19 +87,16 @@ export function DashboardOverview({
           <div className={styles.contentCard}>
             <div className={styles.cardHeading}><h2>Storage</h2></div>
             <div className={styles.storageValue}>
-              <strong>{stats.storageUsed}</strong>
-              <span>of 10 GB</span>
-            </div>
-            <div className={styles.storageBar}>
-              <span style={{ width: `${stats.storagePercent}%` }} />
+              <strong>{loading ? "—" : stats.storageUsed}</strong>
+              <span>saved media</span>
             </div>
           </div>
 
           <div className={styles.contentCard}>
             <div className={styles.cardHeading}><h2>Monitor</h2></div>
             <dl className={styles.utilityList}>
-              <div><dt>Enabled</dt><dd>{activeCreators}</dd></div>
-              <div><dt>Needs attention</dt><dd>{needsAttention}</dd></div>
+              <div><dt>Enabled</dt><dd>{loading ? "—" : activeCreators}</dd></div>
+              <div><dt>Needs attention</dt><dd>{loading ? "—" : needsAttention}</dd></div>
             </dl>
           </div>
         </div>
@@ -94,7 +109,7 @@ export function DashboardOverview({
         </div>
         <div className={styles.creatorHealthGrid}>
           {creators.slice(0, 4).map((creator) => (
-            <div className={styles.healthCard} key={creator.id}>
+            <Link className={styles.healthCard} href={`/creator?creator=${encodeURIComponent(creator.id)}`} key={creator.id}>
               <span className={styles.creatorAvatar} style={{ "--avatar": creator.accent } as React.CSSProperties}>
                 {creator.initials}
               </span>
@@ -105,8 +120,13 @@ export function DashboardOverview({
               {creator.status === "attention" ? (
                 <CircleAlert className={styles.warningIcon} size={16} />
               ) : null}
-            </div>
+            </Link>
           ))}
+          {creators.length === 0 ? (
+            <div className={styles.inlineEmpty}>
+              {archive.source === "loading" || archive.source === "refreshing" ? "Loading creators…" : "No creators yet."}
+            </div>
+          ) : null}
         </div>
       </section>
     </div>
