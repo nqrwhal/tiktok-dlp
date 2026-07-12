@@ -765,10 +765,16 @@ test('watch subscriptions keep guild destinations independent while sharing one 
     store.addWatch('creator', { guildId: 'guild-2', channelId: 'channel-2', createdBy: 'manager-2' }, 1100);
     store.addWatch('creator', { guildId: 'dm:dm-channel-1', channelId: 'dm-channel-1', createdBy: 'owner-1' }, 1150);
     store.addWatch('creator', { guildId: 'dm:dm-channel-2', channelId: 'dm-channel-2', createdBy: 'owner-2' }, 1160);
+    store.addWatch('legacy.creator', 'channel-1', 1170);
+    store.addWatch('other.legacy.creator', 'channel-3', 1180);
 
-    assert.equal(store.listWatches().length, 1);
+    assert.equal(store.listWatches().length, 3);
     assert.equal(store.listWatchesForScope({ guildId: 'guild-1' })[0].subscription_channel_id, 'channel-1');
     assert.equal(store.listWatchesForScope({ guildId: 'guild-2' })[0].subscription_channel_id, 'channel-2');
+    assert.deepEqual(
+      store.listWatchesForScope({ guildId: 'guild-1', channelId: 'channel-1' }).map((watch) => watch.username),
+      ['creator', 'legacy.creator'],
+    );
     assert.equal(store.hasWatchSubscription('creator', { guildId: 'guild-1' }), true);
     assert.equal(store.listWatchSubscriptions('creator').length, 4);
     store.migrateLegacyWatchSubscriptions();

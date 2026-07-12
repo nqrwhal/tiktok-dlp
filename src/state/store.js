@@ -353,15 +353,29 @@ export class Store {
     `).all();
   }
 
-  listWatchesForScope({ guildId = '' } = {}) {
+  listWatchesForScope({ guildId = '', channelId = '' } = {}) {
     return this.db.prepare(`
-      SELECT watched_users.*, watch_subscriptions.channel_id AS subscription_channel_id,
-        watch_subscriptions.created_by AS subscription_created_by
-      FROM watch_subscriptions
-      JOIN watched_users ON watched_users.username = watch_subscriptions.username
-      WHERE watch_subscriptions.guild_id = ?
+      WITH ranked_subscriptions AS (
+        SELECT watch_subscriptions.*,
+          ROW_NUMBER() OVER (
+            PARTITION BY watch_subscriptions.username
+            ORDER BY CASE WHEN watch_subscriptions.guild_id = ? THEN 0 ELSE 1 END,
+              watch_subscriptions.id
+          ) AS scope_rank
+        FROM watch_subscriptions
+        WHERE watch_subscriptions.guild_id = ?
+          OR (
+            watch_subscriptions.guild_id = ''
+            AND watch_subscriptions.channel_id = ?
+          )
+      )
+      SELECT watched_users.*, ranked_subscriptions.channel_id AS subscription_channel_id,
+        ranked_subscriptions.created_by AS subscription_created_by
+      FROM ranked_subscriptions
+      JOIN watched_users ON watched_users.username = ranked_subscriptions.username
+      WHERE ranked_subscriptions.scope_rank = 1
       ORDER BY watched_users.username
-    `).all(String(guildId ?? ''));
+    `).all(String(guildId ?? ''), String(guildId ?? ''), String(channelId ?? ''));
   }
 
   getWatchSubscription(username, { guildId = '' } = {}) {
