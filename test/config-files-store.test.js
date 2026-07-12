@@ -16,6 +16,7 @@ import {
 } from '../src/util/files.js';
 import { createStore } from '../src/state/store.js';
 import { buildDeliveryPayload, canManageWatches, handleLinkButton, shouldIgnoreMessage, shouldShowHelp } from '../src/discord/client.js';
+import { buildNoticePayload, truncateText } from '../src/discord/ui.js';
 import { cleanupExpiredDownloads } from '../src/cleanup/downloads.js';
 
 test('loadEnvFile reads simple env files without overriding existing values', async () => {
@@ -116,6 +117,19 @@ test('delivery size helper respects configured Discord limit', () => {
   assert.equal(shouldUploadToDiscord(10, config), true);
   assert.equal(shouldUploadToDiscord(11, config), false);
   assert.equal(shouldUploadToDiscord(0, config), false);
+});
+
+test('notice embeds preserve intentional description line breaks', () => {
+  const payload = buildNoticePayload({
+    title: 'Watched Usernames',
+    description: '@first — last success: never\n@second — last success: never',
+  });
+
+  assert.equal(
+    payload.embeds[0].toJSON().description,
+    '@first — last success: never\n@second — last success: never',
+  );
+  assert.equal(truncateText('line one\nline two', 100), 'line one line two');
 });
 
 test('store persists watches, seen videos, jobs, files, and link tokens', async () => {

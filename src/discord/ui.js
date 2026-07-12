@@ -13,7 +13,7 @@ export function buildNoticePayload({ title, description, color = UI_COLORS.info,
       new EmbedBuilder()
         .setColor(color)
         .setTitle(truncateText(title, 256))
-        .setDescription(truncateText(description, 4000))
+        .setDescription(truncateText(description, 4000, { preserveLineBreaks: true }))
         .setTimestamp(new Date()),
     ],
   };
@@ -53,8 +53,14 @@ export function formatLinkState(expiresAt, now = Date.now()) {
   return `${value <= now ? 'expired' : 'expires'} ${formatDate(value)}`;
 }
 
-export function truncateText(value, maxLength) {
-  const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+export function truncateText(value, maxLength, { preserveLineBreaks = false } = {}) {
+  const text = preserveLineBreaks
+    ? String(value ?? '')
+      .replace(/\r\n?/g, '\n')
+      .replace(/[^\S\n]+/g, ' ')
+      .replace(/ *\n */g, '\n')
+      .trim()
+    : String(value ?? '').replace(/\s+/g, ' ').trim();
   if (text.length <= maxLength) return text;
   if (maxLength <= 1) return text.slice(0, maxLength);
   if (maxLength <= 3) return text.slice(0, maxLength);
