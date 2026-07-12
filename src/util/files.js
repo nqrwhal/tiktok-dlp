@@ -30,10 +30,21 @@ export function storyUrl(username) {
 export function isTikTokUrl(value) {
   try {
     const url = new URL(String(value));
-    return /(^|\.)tiktok\.com$/i.test(url.hostname);
+    return url.protocol === 'https:'
+      && !url.username
+      && !url.password
+      && /(^|\.)tiktok\.com$/i.test(url.hostname);
   } catch {
     return false;
   }
+}
+
+export function assertTikTokDownloadUrl(value) {
+  const sourceUrl = String(value ?? '').trim();
+  if (!isTikTokUrl(sourceUrl)) {
+    throw new Error('A credential-free HTTPS TikTok URL is required.');
+  }
+  return sourceUrl;
 }
 
 export function extractTikTokUrls(value, limit = 5) {

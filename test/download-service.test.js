@@ -123,3 +123,41 @@ test('DownloadService applies per-user ingress limits before queuing more work',
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+
+test('DownloadService rejects unsafe sources before creating jobs or invoking download work', async () => {
+  let jobs = 0;
+  let metadataCalls = 0;
+  let downloadCalls = 0;
+  const service = createDownloadService({
+    config: { downloadDir: '/tmp/downloads' },
+    store: {
+      createJob() {
+        jobs += 1;
+        return jobs;
+      },
+    },
+    metadataFetcher: async () => {
+      metadataCalls += 1;
+      return {};
+    },
+    downloader: async () => {
+      downloadCalls += 1;
+      return {};
+    },
+  });
+
+  for (const sourceUrl of [
+    'http://www.tiktok.com/@creator/video/1234567890123456789',
+    'https://user:password@www.tiktok.com/@creator/video/1234567890123456789',
+    'https://www.tiktok.com.evil.test/@creator/video/1234567890123456789',
+    'tiktokuser:internal-profile-id',
+    'not a URL',
+  ]) {
+    await assert.rejects(service.request(sourceUrl), /credential-free HTTPS TikTok URL/i);
+  }
+
+  assert.equal(jobs, 0);
+  assert.equal(metadataCalls, 0);
+  assert.equal(downloadCalls, 0);
+});

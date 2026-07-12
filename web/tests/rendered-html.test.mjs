@@ -49,11 +49,18 @@ for (const [pathname, expectedContent] of routes) {
     }
     if (pathname.startsWith("/creator")) {
       assert.match(html, /href="\/\?creator=mina-makes(?:&amp;|&)video=v-1042"/i);
+      assert.match(html, /aria-controls="creator-video-grid"/i);
+      assert.match(html, />All videos loaded<\/button>/i);
     }
     if (pathname === "/dashboard" || pathname === "/dashboard/videos") {
       assert.match(html, /href="\/\?creator=[^"&]+(?:&amp;|&)video=v-/i);
     }
-    if (pathname === "/dashboard/videos") assert.doesNotMatch(html, /Export selected/i);
+    if (pathname === "/dashboard/videos") {
+      assert.doesNotMatch(html, /Export selected/i);
+      assert.match(html, /aria-controls="video-library-active-panel"/i);
+      assert.match(html, />All videos loaded<\/button>/i);
+      assert.match(html, /role="status">\d+ of \d+ videos loaded<\/span>/i);
+    }
     if (pathname === "/dashboard/settings") {
       assert.match(html, /Autoplay videos/i);
       assert.doesNotMatch(html, /Poll interval|frontend preview/i);

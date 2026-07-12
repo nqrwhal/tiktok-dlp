@@ -2,9 +2,13 @@
 .env
 .secrets
 node_modules
+**/node_modules
 data
 test
 *.log
 web/.live-cache
 web/.next
+web/.vinext
 web/dist
+web/tests
+web/.wrangler

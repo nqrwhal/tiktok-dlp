@@ -1130,3 +1130,78 @@ test('link button actions create, extend, and persist links', async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+
+test('shared-path lookup only materializes paths belonging to cleanup candidates', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-path-lookup-'));
+  const store = createStore(path.join(dir, 'state.db'));
+  try {
+    const sharedPath = path.join(dir, 'shared.mp4');
+    const unrelatedPath = path.join(dir, 'unrelated.mp4');
+    const candidateId = store.createFileRecord({
+      videoId: 'candidate', sourceUrl: 'https://example.test/candidate', filePath: sharedPath, filename: 'shared.mp4', sizeBytes: 1,
+    }, 1000);
+    store.createFileRecord({
+      videoId: 'outside', sourceUrl: 'https://example.test/outside', filePath: sharedPath, filename: 'shared.mp4', sizeBytes: 1,
+    }, 1000);
+    store.createFileRecord({
+      videoId: 'unrelated', sourceUrl: 'https://example.test/unrelated', filePath: unrelatedPath, filename: 'unrelated.mp4', sizeBytes: 1,
+    }, 1000);
+
+    assert.deepEqual(store.listFilePathsReferencedOutside([candidateId]), [sharedPath]);
+    assert.deepEqual(store.listFilePathsReferencedOutside([]), []);
+    assert.ok(store.db.prepare('PRAGMA index_list(files)').all().some((index) => index.name === 'idx_files_path'));
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('cleanup drains old jobs across bounded batches and stops at its per-run row cap', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-job-prune-'));
+  const store = createStore(path.join(dir, 'state.db'));
+  const day = 24 * 60 * 60 * 1000;
+  try {
+    for (let index = 0; index < 5; index += 1) {
+      store.createJob({ type: 'manual', sourceUrl: `https://example.test/${index}` }, 1000 + index);
+    }
+    const pruneOldJobs = store.pruneOldJobs.bind(store);
+    const batchLimits = [];
+    store.pruneOldJobs = (before, limit, now) => {
+      batchLimits.push(limit);
+      return pruneOldJobs(before, limit, now);
+    };
+
+    const result = await cleanupExpiredDownloads({
+      config: { downloadDir: dir, cleanupBatchSize: 2, retentionDays: 1 },
+      store,
+      now: 2 * day,
+      log: { warn() {} },
+    });
+
+    assert.equal(result.prunedJobs, 5);
+    assert.deepEqual(batchLimits, [2, 2, 2]);
+    assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM jobs').get().count, 0);
+    assert.ok(store.db.prepare('PRAGMA index_list(jobs)').all().some((index) => index.name === 'idx_jobs_updated_at_id'));
+
+    let cappedCalls = 0;
+    const capped = await cleanupExpiredDownloads({
+      config: { downloadDir: dir, cleanupBatchSize: 1000, retentionDays: 1 },
+      store: {
+        listFilesWithoutActiveLinks: () => [],
+        deleteFileRecords: () => 0,
+        pruneOldJobs: (_before, limit) => {
+          cappedCalls += 1;
+          return limit;
+        },
+      },
+      now: 2 * day,
+      log: { warn() {} },
+    });
+    assert.equal(capped.prunedJobs, 10_000);
+    assert.equal(cappedCalls, 10);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});

@@ -71,7 +71,7 @@ function start(command, args) {
   children.add(child);
   child.once("exit", (code, signal) => {
     children.delete(child);
-    if (!stopping && code !== 0) {
+    if (!stopping) {
       console.error(`[rewind] ${command} stopped unexpectedly (${signal || code})`);
       stop("SIGTERM", 1);
     }
@@ -81,6 +81,7 @@ function start(command, args) {
 function stop(signal, exitCode = 0) {
   if (stopping) return;
   stopping = true;
+  process.exitCode = exitCode;
   gateway.close();
   for (const child of children) child.kill(signal);
   const timer = setTimeout(() => process.exit(exitCode), 1_000);

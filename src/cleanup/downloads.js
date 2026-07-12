@@ -1,6 +1,8 @@
 import { readdir, rm, rmdir } from 'node:fs/promises';
 import path from 'node:path';
 
+const MAX_PRUNED_JOBS_PER_RUN = 10_000;
+
 export async function cleanupExpiredDownloads({ config, store, now = Date.now(), log = console } = {}) {
   if (!config?.downloadDir || !store?.listFilesWithoutActiveLinks || !store?.deleteFileRecords) {
     throw new Error('cleanupExpiredDownloads requires config.downloadDir and compatible store methods.');
@@ -19,7 +21,13 @@ export async function cleanupExpiredDownloads({ config, store, now = Date.now(),
   };
   totals.expiredTokens = Number(store.deleteExpiredTokens?.(now) ?? 0);
   const retentionMs = Math.max(1, Number(config.retentionDays) || 30) * 24 * 60 * 60 * 1000;
-  totals.prunedJobs = Number(store.pruneOldJobs?.(now - retentionMs, batchSize) ?? 0);
+  const jobsCutoff = now - retentionMs;
+  while (store.pruneOldJobs && totals.prunedJobs < MAX_PRUNED_JOBS_PER_RUN) {
+    const limit = Math.min(batchSize, MAX_PRUNED_JOBS_PER_RUN - totals.prunedJobs);
+    const pruned = Number(store.pruneOldJobs(jobsCutoff, limit, now) ?? 0);
+    totals.prunedJobs += pruned;
+    if (pruned < limit) break;
+  }
   const orphanGraceMs = config.cleanupOrphanGraceMinutes == null
     ? 0
     : Math.max(1, Number(config.cleanupOrphanGraceMinutes) || 15) * 60 * 1000;

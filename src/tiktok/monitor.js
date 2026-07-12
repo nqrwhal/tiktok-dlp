@@ -361,12 +361,14 @@ export class TikTokMonitor {
     }
   }
 
-  async #runOnceInternal({ waitForDownloads = false, waitForDeletionChecks = false } = {}) {
+  async #runOnceInternal({ waitForDownloads = false, waitForDeletionChecks = false, watchOverride = null } = {}) {
     const cycleStartedAt = this.now();
     this.#lastPollAt = cycleStartedAt;
     this.#metrics.cycles += 1;
     this.#metrics.lastCycleStartedAt = cycleStartedAt;
-    const watches = await Promise.resolve(this.store.listWatches());
+    const watches = watchOverride
+      ? [watchOverride]
+      : await Promise.resolve(this.store.listWatches());
     const deletionPromises = await this.#queueDeletionChecks();
     const summary = {
       watchedUsers: 0,
@@ -667,8 +669,6 @@ export class TikTokMonitor {
         sourceUrl,
       });
       const mediaType = resolveVideoMediaType(video);
-      const seenAt = this.now();
-      await Promise.resolve(this.store.markVideoSeen(seenRecord, seenAt));
 
       await Promise.resolve(
         this.alert({
@@ -804,23 +804,16 @@ export class TikTokMonitor {
     if (!watch) {
       throw new Error(`@${normalized.username} is not registered as a watch.`);
     }
-    const originalListWatches = this.store.listWatches?.bind(this.store);
-    if (!originalListWatches) throw new Error('Store must provide listWatches().');
-    while (this.#runOncePromise) {
-      await this.#runOncePromise.catch(() => {});
-    }
-    this.store.listWatches = () => [{ ...watch, next_check_at: force ? null : watch.next_check_at }];
-    try {
-      const summary = await this.runOnce({ waitForDownloads: true });
-      return {
-        ...summary,
-        newVideos: summary.alertedVideos || summary.downloadedVideos,
-        queuedVideos: summary.queuedDownloads,
-        skipped: summary.seenVideos,
-      };
-    } finally {
-      this.store.listWatches = originalListWatches;
-    }
+    const summary = await this.runOnce({
+      waitForDownloads: true,
+      watchOverride: { ...watch, next_check_at: force ? null : watch.next_check_at },
+    });
+    return {
+      ...summary,
+      newVideos: summary.alertedVideos || summary.downloadedVideos,
+      queuedVideos: summary.queuedDownloads,
+      skipped: summary.seenVideos,
+    };
   }
 
   status() {

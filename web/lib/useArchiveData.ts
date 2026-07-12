@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { bookmarkedVideoPageParams, boundedVideoPageLimit, mergeVideoPage } from "./archive-data-state.mjs";
 import type { ArchiveStats, Creator, FeedPage, SavedVideo } from "./types";
 
 export type ArchiveDataSource = "mock" | "loading" | "refreshing" | "live" | "error";
@@ -46,10 +47,12 @@ export function useArchiveData({
   const [error, setError] = useState("");
   const [revision, setRevision] = useState(0);
   const [nextVideoCursor, setNextVideoCursor] = useState<string | null>(null);
+  const [nextBookmarkCursor, setNextBookmarkCursor] = useState<string | null>(null);
   const [loadingMoreVideos, setLoadingMoreVideos] = useState(false);
   const [loadingBookmarkedVideos, setLoadingBookmarkedVideos] = useState(false);
   const hasLoadedLiveData = useRef(false);
   const nextVideoCursorRef = useRef<string | null>(null);
+  const nextBookmarkCursorRef = useRef<string | null>(null);
   const loadingMoreVideosRef = useRef(false);
   const loadingBookmarkedVideosRef = useRef(false);
   const loadMoreRetryAfterRef = useRef(0);
@@ -57,7 +60,7 @@ export function useArchiveData({
   const videoGenerationRef = useRef(0);
   const refresh = useCallback(() => setRevision((current) => current + 1), []);
   const base = configuredBase?.replace(/\/+$/, "") || "";
-  const videoPageLimit = videoLimit || (videoCreatorId || videoUsername ? 2_000 : 500);
+  const videoPageLimit = boundedVideoPageLimit(videoLimit, paginateVideos);
 
   const makeVideoParams = useCallback((cursor = "") => {
     const videoParams = new URLSearchParams({ limit: String(videoPageLimit) });
@@ -155,7 +158,7 @@ export function useArchiveData({
     try {
       const page = await fetchVideoPage(cursor);
       if (generation !== videoGenerationRef.current) return;
-      setVideos((current) => mergeVideos(current, page.items));
+      setVideos((current) => mergeVideoPage(current, page).videos);
       nextVideoCursorRef.current = page.nextCursor;
       setNextVideoCursor(page.nextCursor);
       loadMoreRetryAfterRef.current = 0;
@@ -169,47 +172,23 @@ export function useArchiveData({
     }
   }, [configuredBase, fetchVideoPage, includeVideos, paginateVideos]);
 
-  const loadAllVideos = useCallback(async () => {
-    let cursor = nextVideoCursorRef.current;
-    if (!configuredBase || !includeVideos || !paginateVideos || !cursor || loadingMoreVideosRef.current) return;
-    const generation = videoGenerationRef.current;
-    loadingMoreVideosRef.current = true;
-    setLoadingMoreVideos(true);
-    const additions: SavedVideo[] = [];
-    try {
-      while (cursor) {
-        const page = await fetchVideoPage(cursor);
-        if (generation !== videoGenerationRef.current) return;
-        additions.push(...page.items);
-        cursor = page.nextCursor;
-      }
-      setVideos((current) => mergeVideos(current, additions));
-      nextVideoCursorRef.current = null;
-      setNextVideoCursor(null);
-      loadMoreRetryAfterRef.current = 0;
-    } catch (nextError) {
-      if (generation !== videoGenerationRef.current) return;
-      if (additions.length) setVideos((current) => mergeVideos(current, additions));
-      nextVideoCursorRef.current = cursor;
-      setNextVideoCursor(cursor);
-      loadMoreRetryAfterRef.current = Date.now() + VIDEO_PAGE_RETRY_DELAY_MS;
-      setError(errorMessage("bookmarked videos", nextError));
-    } finally {
-      loadingMoreVideosRef.current = false;
-      setLoadingMoreVideos(false);
-    }
-  }, [configuredBase, fetchVideoPage, includeVideos, paginateVideos]);
+  const fetchBookmarkedPage = useCallback(async (cursor = "") => {
+    const params = bookmarkedVideoPageParams(cursor);
+    const payload = await fetch(`${base}/api/videos?${params}`, {
+      cache: "no-store",
+    }).then(assertJsonResponse<SavedVideo[] | FeedPage>);
+    return normalizeVideoPage(payload);
+  }, [base]);
 
   const loadBookmarkedVideos = useCallback(async () => {
     if (!configuredBase || !includeVideos || loadingBookmarkedVideosRef.current) return [] as SavedVideo[];
     loadingBookmarkedVideosRef.current = true;
     setLoadingBookmarkedVideos(true);
     try {
-      const payload = await fetch(`${base}/api/videos?bookmarked=1&limit=5000`, {
-        cache: "no-store",
-      }).then(assertJsonResponse<SavedVideo[] | FeedPage>);
-      const page = normalizeVideoPage(payload);
-      setVideos((current) => mergeVideos(current, page.items));
+      const page = await fetchBookmarkedPage();
+      setVideos((current) => mergeVideoPage(current, page).videos);
+      nextBookmarkCursorRef.current = page.nextCursor;
+      setNextBookmarkCursor(page.nextCursor);
       return page.items;
     } catch (nextError) {
       setError(errorMessage("bookmarked videos", nextError));
@@ -218,7 +197,25 @@ export function useArchiveData({
       loadingBookmarkedVideosRef.current = false;
       setLoadingBookmarkedVideos(false);
     }
-  }, [base, configuredBase, includeVideos]);
+  }, [configuredBase, fetchBookmarkedPage, includeVideos]);
+
+  const loadMoreBookmarkedVideos = useCallback(async () => {
+    const cursor = nextBookmarkCursorRef.current;
+    if (!configuredBase || !includeVideos || !cursor || loadingBookmarkedVideosRef.current) return;
+    loadingBookmarkedVideosRef.current = true;
+    setLoadingBookmarkedVideos(true);
+    try {
+      const page = await fetchBookmarkedPage(cursor);
+      setVideos((current) => mergeVideoPage(current, page).videos);
+      nextBookmarkCursorRef.current = page.nextCursor;
+      setNextBookmarkCursor(page.nextCursor);
+    } catch (nextError) {
+      setError(errorMessage("more bookmarked videos", nextError));
+    } finally {
+      loadingBookmarkedVideosRef.current = false;
+      setLoadingBookmarkedVideos(false);
+    }
+  }, [configuredBase, fetchBookmarkedPage, includeVideos]);
 
   return {
     creators,
@@ -228,11 +225,12 @@ export function useArchiveData({
     error,
     refresh,
     hasMoreVideos: Boolean(nextVideoCursor),
+    hasMoreBookmarkedVideos: Boolean(nextBookmarkCursor),
     loadingMoreVideos,
     loadingBookmarkedVideos,
     loadMoreVideos,
-    loadAllVideos,
     loadBookmarkedVideos,
+    loadMoreBookmarkedVideos,
   };
 }
 
@@ -249,7 +247,7 @@ async function assertJsonResponse<T>(response: Response): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-function normalizeVideoPage(payload: SavedVideo[] | FeedPage): FeedPage {
+export function normalizeVideoPage(payload: SavedVideo[] | FeedPage): FeedPage {
   if (Array.isArray(payload)) return { items: payload, nextCursor: null };
   return {
     items: Array.isArray(payload.items) ? payload.items : [],
@@ -257,10 +255,4 @@ function normalizeVideoPage(payload: SavedVideo[] | FeedPage): FeedPage {
       ? payload.nextCursor
       : null,
   };
-}
-
-function mergeVideos(current: SavedVideo[], additions: SavedVideo[]): SavedVideo[] {
-  const byId = new Map(current.map((video) => [video.id, video]));
-  for (const video of additions) byId.set(video.id, video);
-  return [...byId.values()];
 }

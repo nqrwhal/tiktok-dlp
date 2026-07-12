@@ -5,7 +5,7 @@ import { once } from 'node:events';
 import { Readable } from 'node:stream';
 import os from 'node:os';
 import path from 'node:path';
-import { fileSize, isTikTokUrl, makeDownloadLayout, moveDirectoryContents, pickPrimaryVideo, profileUrl as makeProfileUrl, storyUrl as makeStoryUrl, slugify } from '../util/files.js';
+import { assertTikTokDownloadUrl, fileSize, isTikTokUrl, makeDownloadLayout, moveDirectoryContents, pickPrimaryVideo, profileUrl as makeProfileUrl, storyUrl as makeStoryUrl, slugify } from '../util/files.js';
 
 const METADATA_BASE_ARGS = [
   '--ignore-config',
@@ -61,7 +61,7 @@ export function buildMetadataArgs(sourceUrl, options = {}) {
   if (options.cookiesFile) args.push('--cookies', String(options.cookiesFile));
   if (options.ytdlpCookiesFile) args.push('--cookies', String(options.ytdlpCookiesFile));
   if (Array.isArray(options.extraArgs)) args.push(...options.extraArgs.map(String));
-  args.push(String(sourceUrl));
+  args.push('--', String(sourceUrl));
   return args;
 }
 
@@ -87,11 +87,15 @@ export function buildDownloadArgs(sourceUrl, options = {}) {
   const maxBytes = normalizePositiveInt(options.maxMediaDownloadBytes);
   if (maxBytes) args.push('--max-filesize', String(maxBytes));
   if (Array.isArray(options.extraArgs)) args.push(...options.extraArgs.map(String));
-  args.push(String(sourceUrl));
+  args.push('--', String(sourceUrl));
   return args;
 }
 
 export async function fetchVideoMetadata(sourceUrl, options = {}) {
+  return fetchYtDlpMetadata(assertTikTokDownloadUrl(sourceUrl), options);
+}
+
+async function fetchYtDlpMetadata(sourceUrl, options = {}) {
   try {
     const { stdout } = await runYtDlp(options.ytdlpPath ?? 'yt-dlp', buildMetadataArgs(sourceUrl, options), options);
     return parseJsonOutput(stdout, 'metadata');
@@ -105,8 +109,8 @@ export async function listProfileVideos(usernameOrUrl, options = {}) {
   const cachedSecUid = normalizeSecUid(options.watch?.sec_uid ?? options.watch?.secUid ?? options.secUid);
   const sourceUrl = cachedSecUid
     ? `tiktokuser:${cachedSecUid}`
-    : String(usernameOrUrl).startsWith('http') ? String(usernameOrUrl) : makeProfileUrl(usernameOrUrl);
-  const raw = await fetchVideoMetadata(sourceUrl, {
+    : String(usernameOrUrl).startsWith('http') ? assertTikTokDownloadUrl(usernameOrUrl) : makeProfileUrl(usernameOrUrl);
+  const raw = await fetchYtDlpMetadata(sourceUrl, {
     ...options,
     playlist: true,
     flatPlaylist: true,
@@ -194,6 +198,7 @@ export async function listProfileStories(usernameOrUrl, options = {}) {
 }
 
 export async function downloadVideo(sourceUrl, options = {}) {
+  sourceUrl = assertTikTokDownloadUrl(sourceUrl);
   const ytdlpPath = options.ytdlpPath ?? 'yt-dlp';
   const metadata = options.metadata ?? await fetchVideoMetadata(sourceUrl, options);
   const tempParent = options.downloadDir
@@ -304,6 +309,7 @@ export async function downloadVideo(sourceUrl, options = {}) {
 }
 
 export async function fetchPhotoPostMetadata(sourceUrl, options = {}) {
+  sourceUrl = assertTikTokDownloadUrl(sourceUrl);
   const fetchImpl = options.fetchImpl ?? globalThis.fetch;
   if (typeof fetchImpl !== 'function') {
     throw new Error('Fetch API is not available for TikTok photo fallback.');
@@ -636,8 +642,9 @@ function resolveMediaType(metadata = {}, sourceUrl = '') {
 function resolveProfileUrl(usernameOrUrl) {
   const text = String(usernameOrUrl ?? '');
   if (/^https?:\/\//i.test(text)) {
-    const username = extractUsernameFromUrl(text);
-    return username ? makeProfileUrl(username) : text;
+    const sourceUrl = assertTikTokDownloadUrl(text);
+    const username = extractUsernameFromUrl(sourceUrl);
+    return username ? makeProfileUrl(username) : sourceUrl;
   }
   return makeProfileUrl(text);
 }
@@ -648,21 +655,26 @@ async function fetchProfileStoryIdentity(profileUrl, options = {}) {
     throw new Error('Fetch API is not available for TikTok story lookup.');
   }
 
-  const response = await fetchImpl(String(profileUrl), {
-    redirect: 'follow',
+  const maxMetadataBytes = positiveOrDefault(options.maxStoryMetadataBytes, 10 * 1024 * 1024);
+  const response = await fetchWithLimits(String(profileUrl), fetchImpl, {
+    timeoutMs: fetchTimeoutMs(options),
+    maxBytes: maxMetadataBytes,
+    label: 'TikTok story profile',
     headers: {
       'user-agent': MOBILE_USER_AGENT,
       'accept-language': 'en-US,en;q=0.9',
       accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     },
   });
-  if (!response?.ok) {
-    throw new Error(`TikTok profile request failed with status ${response?.status ?? 'unknown'}.`);
-  }
 
+  const html = await readResponseText(response, {
+    maxBytes: maxMetadataBytes,
+    timeoutMs: fetchTimeoutMs(options),
+    label: 'TikTok story profile',
+  });
   let data;
   try {
-    data = parseRehydrationJson(await response.text());
+    data = parseRehydrationJson(html);
   } catch (error) {
     throw Object.assign(new Error('TikTok profile identity data was not found.'), {
       kind: 'story_profile_not_found',
@@ -703,8 +715,11 @@ async function fetchStoryItemList(profile, options = {}) {
   apiUrl.searchParams.set('aid', '1988');
   apiUrl.searchParams.set('count', String(Number(options.limit ?? 4) || 4));
 
-  const response = await fetchImpl(apiUrl.toString(), {
-    redirect: 'follow',
+  const maxMetadataBytes = positiveOrDefault(options.maxStoryMetadataBytes, 10 * 1024 * 1024);
+  const response = await fetchWithLimits(apiUrl.toString(), fetchImpl, {
+    timeoutMs: fetchTimeoutMs(options),
+    maxBytes: maxMetadataBytes,
+    label: 'TikTok story',
     headers: {
       'user-agent': MOBILE_USER_AGENT,
       'accept-language': 'en-US,en;q=0.9',
@@ -712,11 +727,20 @@ async function fetchStoryItemList(profile, options = {}) {
       referer: profile.profileUrl || makeProfileUrl(profile.username || ''),
     },
   });
-  if (!response?.ok) {
-    throw new Error(`TikTok story request failed with status ${response?.status ?? 'unknown'}.`);
+  const payloadText = await readResponseText(response, {
+    maxBytes: maxMetadataBytes,
+    timeoutMs: fetchTimeoutMs(options),
+    label: 'TikTok story',
+  });
+  let payload;
+  try {
+    payload = JSON.parse(payloadText);
+  } catch (error) {
+    throw Object.assign(new Error('TikTok story response was not valid JSON.'), {
+      kind: 'invalid_json',
+      cause: error,
+    });
   }
-
-  const payload = await response.json();
   const statusCode = numberOrNull(payload?.statusCode ?? payload?.status_code ?? 0) ?? 0;
   if (statusCode !== 0) {
     throw Object.assign(new Error(String(payload?.statusMsg ?? payload?.status_msg ?? 'TikTok story request failed.')), {
@@ -781,6 +805,7 @@ function firstStringValue(value) {
     }
   }
   if (value && typeof value === 'object') {
+
     return firstStringValue(value.UrlList ?? value.urlList ?? value.urls ?? value.url);
   }
   return '';
@@ -1282,7 +1307,11 @@ async function readResponseText(response, { maxBytes, timeoutMs = 30_000, label 
   if (!body) {
     const text = typeof response?.text === 'function'
       ? await response.text()
-      : Buffer.from(await response.arrayBuffer()).toString('utf8');
+      : typeof response?.arrayBuffer === 'function'
+        ? Buffer.from(await response.arrayBuffer()).toString('utf8')
+        : typeof response?.json === 'function'
+          ? JSON.stringify(await response.json())
+          : '';
     if (Buffer.byteLength(text) > limit) {
       throw Object.assign(new Error(`${label} exceeds the configured size limit of ${formatByteLimit(limit)}.`), {
         kind: 'media_size_limit',
@@ -1501,6 +1530,7 @@ function makeZipEndRecord(entryCount, centralDirectorySize, centralDirectoryOffs
   buffer.writeUInt16LE(entryCount, 8);
   buffer.writeUInt16LE(entryCount, 10);
   buffer.writeUInt32LE(centralDirectorySize, 12);
+
   buffer.writeUInt32LE(centralDirectoryOffset, 16);
   buffer.writeUInt16LE(0, 20);
   return buffer;

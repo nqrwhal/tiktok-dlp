@@ -201,8 +201,10 @@ export class Store {
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_jobs_requested_by ON jobs(requested_by);
       CREATE INDEX IF NOT EXISTS idx_jobs_file_id ON jobs(file_id);
+      CREATE INDEX IF NOT EXISTS idx_jobs_updated_at_id ON jobs(updated_at, id);
       CREATE INDEX IF NOT EXISTS idx_files_requested_by ON files(requested_by);
       CREATE INDEX IF NOT EXISTS idx_files_trashed_at ON files(trashed_at);
+      CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
       CREATE INDEX IF NOT EXISTS idx_files_delete_requested_at ON files(delete_requested_at);
       CREATE INDEX IF NOT EXISTS idx_files_username_created_at ON files(username COLLATE NOCASE, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_link_tokens_file_id_expires_at ON link_tokens(file_id, expires_at);
@@ -1109,10 +1111,6 @@ export class Store {
     }
   }
 
-  failIncompleteCreatorImports(now = Date.now()) {
-    return this.resumeIncompleteCreatorImports(now).length;
-  }
-
   #refreshCreatorImportCounts(importId, now = Date.now()) {
     const counts = this.db.prepare(`
       SELECT
@@ -1616,13 +1614,18 @@ export class Store {
 
   listFilePathsReferencedOutside(fileIds = []) {
     const ids = normalizeIds(fileIds);
-    if (!ids.length) return this.db.prepare('SELECT DISTINCT path FROM files').all().map((row) => row.path);
+    if (!ids.length) return [];
     const placeholders = ids.map(() => '?').join(', ');
     return this.db.prepare(`
       SELECT DISTINCT path
       FROM files
       WHERE id NOT IN (${placeholders})
-    `).all(...ids).map((row) => row.path);
+        AND path IN (
+          SELECT path
+          FROM files
+          WHERE id IN (${placeholders})
+        )
+    `).all(...ids, ...ids).map((row) => row.path);
   }
 
   deleteFileRecords(ids = []) {
@@ -2106,7 +2109,7 @@ export class Store {
     `).all(...ids, requestedBy, requestedBy, now, now).map((row) => Number(row.id));
   }
 
-  pruneOldJobs(before = Date.now(), limit = 100) {
+  pruneOldJobs(before = Date.now(), limit = 100, now = Date.now()) {
     const ids = this.db.prepare(`
       SELECT jobs.id
       FROM jobs
@@ -2119,7 +2122,7 @@ export class Store {
         )
       ORDER BY jobs.updated_at ASC, jobs.id ASC
       LIMIT ?
-    `).all(before, Date.now(), Math.max(1, Math.min(1_000, Number(limit) || 100))).map((row) => Number(row.id));
+    `).all(before, now, Math.max(1, Math.min(1_000, Number(limit) || 100))).map((row) => Number(row.id));
     if (!ids.length) return 0;
     const placeholders = ids.map(() => '?').join(', ');
     return this.db.prepare(`DELETE FROM jobs WHERE id IN (${placeholders})`).run(...ids).changes;

@@ -187,7 +187,7 @@ test('runOnce downloads and alerts only unseen videos', async () => {
   assert.equal(alerts.length, 1);
   assert.equal(alerts[0].video.id, 'new-2');
   assert.equal(store.seen.has('new-2'), true);
-  assert.equal(store.seenRecords.length, 2);
+  assert.equal(store.seenRecords.length, 1);
   assert.equal(store.seenRecords.at(-1).record.alertedAt, now);
   assert.equal(store.deletionSchedules.length, 1);
   assert.equal(store.deletionSchedules[0].videoId, 'new-2');
@@ -518,7 +518,7 @@ test('runOnce backoffs failures and skips watches until due', async () => {
   assert.equal(downloader.listCalls.length, 1);
 });
 
-test('runOnce marks successful downloads seen before alerting', async () => {
+test('runOnce retries failed alerts and marks videos seen only after alert success', async () => {
   const now = 1_700_000_300_000;
   let alertAttempts = 0;
   const store = new FakeStore([
@@ -542,7 +542,7 @@ test('runOnce marks successful downloads seen before alerting', async () => {
     downloader,
     alert: async () => {
       alertAttempts += 1;
-      throw new Error('discord failed');
+      if (alertAttempts === 1) throw new Error('discord failed');
     },
     now: () => now,
   });
@@ -552,17 +552,20 @@ test('runOnce marks successful downloads seen before alerting', async () => {
   assert.equal(first.downloadedVideos, 0);
   assert.equal(first.alertedVideos, 0);
   assert.equal(alertAttempts, 1);
-  assert.equal(store.seen.has('new-1'), true);
-  assert.equal(store.seenRecords.length, 1);
-  assert.equal(store.seenRecords[0].record.alertedAt, undefined);
+  assert.equal(store.seen.has('new-1'), false);
+  assert.equal(store.seenRecords.length, 0);
 
   store.watches[0].next_check_at = null;
   const second = await monitor.runOnce({ waitForDownloads: true });
 
-  assert.equal(downloader.downloadCalls.length, 1);
-  assert.equal(alertAttempts, 1);
-  assert.equal(second.seenVideos, 1);
-  assert.equal(second.queuedDownloads, 0);
+  assert.equal(downloader.downloadCalls.length, 2);
+  assert.equal(alertAttempts, 2);
+  assert.equal(second.downloadedVideos, 1);
+  assert.equal(second.alertedVideos, 1);
+  assert.equal(second.seenVideos, 0);
+  assert.equal(store.seen.has('new-1'), true);
+  assert.equal(store.seenRecords.length, 1);
+  assert.equal(store.seenRecords[0].record.alertedAt, now);
 });
 
 test('runOnce serializes overlapping cycles', async () => {
@@ -611,6 +614,47 @@ test('runOnce serializes overlapping cycles', async () => {
   releaseFirst();
   await Promise.all([first, second]);
   assert.equal(listCalls, 2);
+});
+
+test('overlapping targeted polls preserve listWatches and use their own watch overrides', async () => {
+  const now = 1_700_000_450_000;
+  let releaseFirst;
+  let markFirstStarted;
+  const firstStarted = new Promise((resolve) => {
+    markFirstStarted = resolve;
+  });
+  const firstBlocked = new Promise((resolve) => {
+    releaseFirst = resolve;
+  });
+  const store = new FakeStore([
+    { username: 'creator', failure_count: 0, next_check_at: null },
+    { username: 'maker', failure_count: 0, next_check_at: null },
+  ]);
+  const originalListWatches = store.listWatches;
+  const downloader = new FakeDownloader([]);
+  downloader.listProfileVideos = async (profileUrl, options) => {
+    downloader.listCalls.push({ profileUrl, options });
+    if (downloader.listCalls.length === 1) {
+      markFirstStarted();
+      await firstBlocked;
+    }
+    return [];
+  };
+  const monitor = new TikTokMonitor({ store, downloader, now: () => now });
+
+  const first = monitor.pollUsername('creator', { force: true });
+  await firstStarted;
+  const second = monitor.pollUsername('maker', { force: true });
+  assert.equal(store.listWatches, originalListWatches);
+  releaseFirst();
+  await Promise.all([first, second]);
+
+  assert.equal(store.listWatches, originalListWatches);
+  assert.deepEqual(downloader.listCalls.map((call) => call.profileUrl), [
+    'https://www.tiktok.com/@creator',
+    'https://www.tiktok.com/@maker',
+  ]);
+  assert.deepEqual(store.listWatches().map((watch) => watch.username), ['creator', 'maker']);
 });
 
 test('pollUsername reports completed alerts instead of queued failed downloads', async () => {

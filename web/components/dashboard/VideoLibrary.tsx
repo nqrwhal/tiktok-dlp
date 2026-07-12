@@ -42,8 +42,9 @@ export function VideoLibrary({
     fallbackStats: mockStats,
     videoCreatorId: creatorFilter.id === "all" ? "" : creatorFilter.id,
     videoUsername: creatorFilter.username,
-    videoLimit: 5_000,
-    includeStats: false,
+    videoLimit: 100,
+    paginateVideos: true,
+    includeStats: true,
   });
   const liveCreators = archive.creators;
   const resolvedCreatorFilter = useMemo(
@@ -100,6 +101,15 @@ export function VideoLibrary({
       return matchesCreator && matchesQuery;
     });
   }, [liveVideos, query, resolvedCreatorFilter]);
+  const loadedVideoCount = liveVideos.length;
+  const availableVideoCount = resolvedCreatorFilter === "all"
+    ? archive.stats.videoCount
+    : liveCreators.find((creator) => creator.id === resolvedCreatorFilter)?.videoCount ?? loadedVideoCount;
+  const resultCountLabel = query.trim()
+    ? `${filtered.length} ${filtered.length === 1 ? "match" : "matches"} in ${loadedVideoCount} loaded ${loadedVideoCount === 1 ? "video" : "videos"}`
+    : availableVideoCount > loadedVideoCount
+      ? `${loadedVideoCount} of ${availableVideoCount} videos loaded`
+      : `${filtered.length} ${filtered.length === 1 ? "result" : "results"}`;
 
   function selectCreator(id: string) {
     setCreatorFilter({
@@ -228,7 +238,7 @@ export function VideoLibrary({
           />
         </label>
         <CreatorPicker creators={liveCreators} value={resolvedCreatorFilter} onChange={selectCreator} />
-        <span className={styles.resultCount}>{filtered.length} results</span>
+        <span className={styles.resultCount} role="status">{resultCountLabel}</span>
       </div> : null}
 
       {actionMessage ? <p className={styles.actionMessage} role="status">{actionMessage}</p> : null}
@@ -327,6 +337,19 @@ export function VideoLibrary({
             </span>
           </div>
         ) : null}
+        <button
+            className={styles.primaryButton}
+            type="button"
+            aria-controls="video-library-active-panel"
+            aria-busy={archive.loadingMoreVideos}
+            aria-disabled={archive.loadingMoreVideos || !archive.hasMoreVideos}
+            onClick={() => void archive.loadMoreVideos()}
+          >
+            {archive.loadingMoreVideos ? <LoaderCircle size={16} aria-hidden="true" /> : null}
+            {archive.loadingMoreVideos
+              ? "Loading more videos…"
+              : archive.hasMoreVideos ? "Load more videos" : "All videos loaded"}
+        </button>
       </section> : (
         <TrashLibrary apiBase={apiBase} onRestored={handleRestoredVideo} />
       )}

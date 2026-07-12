@@ -38,6 +38,7 @@ test('buildMetadataArgs builds a conservative metadata command', () => {
     '/tmp/cookies.txt',
     '--extractor-args',
     'tiktok:foo=bar',
+    '--',
     'https://www.tiktok.com/@user/video/123',
   ]);
 
@@ -45,7 +46,7 @@ test('buildMetadataArgs builds a conservative metadata command', () => {
     flatPlaylist: true,
     limit: 7,
   });
-  assert.deepStrictEqual(playlistArgs.slice(-3), ['--playlist-end', '7', 'https://www.tiktok.com/@user']);
+  assert.deepStrictEqual(playlistArgs.slice(-4), ['--playlist-end', '7', '--', 'https://www.tiktok.com/@user']);
 });
 
 test('buildDownloadArgs points yt-dlp at explicit output dirs', () => {
@@ -91,8 +92,44 @@ test('buildDownloadArgs points yt-dlp at explicit output dirs', () => {
     '/tmp/cookies.txt',
     '--print',
     'after_move:filepath',
+    '--',
     'https://www.tiktok.com/@user/video/123',
   ]);
+});
+
+test('yt-dlp public download entry points reject unsafe URLs before subprocess or fetch work', async () => {
+  let spawnCalls = 0;
+  let fetchCalls = 0;
+  const spawnImpl = () => {
+    spawnCalls += 1;
+    throw new Error('must not spawn');
+  };
+  const fetchImpl = async () => {
+    fetchCalls += 1;
+    throw new Error('must not fetch');
+  };
+
+  await assert.rejects(
+    fetchVideoMetadata('http://www.tiktok.com/@creator/video/123', { spawnImpl, fetchImpl }),
+    /credential-free HTTPS TikTok URL/i,
+  );
+  await assert.rejects(
+    downloadVideo('https://user:pass@www.tiktok.com/@creator/story/123', {
+      metadata: { id: '123', mediaType: 'story', directVideoUrl: 'https://cdn.example.test/story.mp4' },
+      fetchImpl,
+    }),
+    /credential-free HTTPS TikTok URL/i,
+  );
+  await assert.rejects(
+    listProfileVideos('https://example.test/@creator', { spawnImpl }),
+    /credential-free HTTPS TikTok URL/i,
+  );
+  await assert.rejects(
+    listProfileStories('https://example.test/no-profile', { fetchImpl }),
+    /credential-free HTTPS TikTok URL/i,
+  );
+  assert.equal(spawnCalls, 0);
+  assert.equal(fetchCalls, 0);
 });
 
 test('classifyYtdlpError maps common yt-dlp failures', () => {
@@ -320,6 +357,66 @@ test('photo metadata streaming enforces its byte limit before parsing', async ()
           start(controller) {
             controller.enqueue(oversized.subarray(0, 8));
             controller.enqueue(oversized.subarray(8));
+            controller.close();
+          },
+        }),
+      }),
+    }),
+    /size limit/i,
+  );
+});
+
+test('story profile and JSON responses enforce streamed byte limits and timeouts', async () => {
+  const oversized = Buffer.from('<html>oversized story profile metadata</html>');
+  await assert.rejects(
+    listProfileStories('creator', {
+      maxStoryMetadataBytes: 8,
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        url: 'https://www.tiktok.com/@creator',
+        headers: { get: () => null },
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(oversized);
+            controller.close();
+          },
+        }),
+      }),
+    }),
+    /size limit/i,
+  );
+
+  await assert.rejects(
+    listProfileStories('creator', {
+      fetchTimeoutSeconds: 1,
+      username: 'creator',
+      watch: { author_id: '424242424242', sec_uid: TEST_SEC_UID, has_story: 1 },
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        url: 'https://www.tiktok.com/api/story/item_list/',
+        headers: { get: () => null },
+        body: new ReadableStream({ start() {} }),
+      }),
+    }),
+    (error) => error?.kind === 'fetch_timeout',
+  );
+
+  const oversizedJson = Buffer.from(JSON.stringify({ statusCode: 0, itemList: [], padding: 'x'.repeat(64) }));
+  await assert.rejects(
+    listProfileStories('creator', {
+      maxStoryMetadataBytes: 16,
+      username: 'creator',
+      watch: { author_id: '424242424242', sec_uid: TEST_SEC_UID, has_story: 1 },
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        url: 'https://www.tiktok.com/api/story/item_list/',
+        headers: { get: () => null },
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(oversizedJson);
             controller.close();
           },
         }),

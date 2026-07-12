@@ -1,6 +1,6 @@
 "use client";
 
-import { ArrowLeft, Grid3X3, Library, Play } from "lucide-react";
+import { ArrowLeft, Grid3X3, Library, LoaderCircle, Play } from "lucide-react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { useMemo, useState } from "react";
@@ -24,6 +24,8 @@ export function CreatorGallery({ creators, videos }: CreatorGalleryProps) {
     fallbackVideos: videos,
     fallbackStats: mockStats,
     videoCreatorId: creatorId,
+    videoLimit: 60,
+    paginateVideos: true,
     includeVideos: Boolean(creatorId),
     includeStats: false,
   });
@@ -42,6 +44,10 @@ export function CreatorGallery({ creators, videos }: CreatorGalleryProps) {
   const initials = creator?.initials || username.slice(0, 2).toUpperCase();
   const accent = creator?.accent || "#75e6d8";
   const videoCount = creator?.videoCount ?? creatorVideos.length;
+  const loadedCount = creatorVideos.length;
+  const videoCountLabel = videoCount > loadedCount
+    ? `${loadedCount.toLocaleString()} of ${videoCount.toLocaleString()} saved videos loaded`
+    : `${videoCount.toLocaleString()} saved ${videoCount === 1 ? "video" : "videos"}`;
   const feedHref = `/?creator=${encodeURIComponent(resolvedCreatorId)}${returnVideoId ? `&video=${encodeURIComponent(returnVideoId)}` : ""}`;
   const loading = archive.source === "loading" || archive.source === "refreshing";
 
@@ -78,7 +84,7 @@ export function CreatorGallery({ creators, videos }: CreatorGalleryProps) {
         <div className={styles.profileIdentity}>
           <h1 id="creator-name">{displayName}</h1>
           <p>@{username}</p>
-          <span>{videoCount.toLocaleString()} saved {videoCount === 1 ? "video" : "videos"}</span>
+          <span>{videoCountLabel}</span>
         </div>
         {videoCount > 0 ? (
           <Link className={styles.feedButton} href={feedHref}>
@@ -99,7 +105,7 @@ export function CreatorGallery({ creators, videos }: CreatorGalleryProps) {
       ) : null}
 
       {creatorVideos.length ? (
-        <section className={styles.videoGrid} aria-label={`Saved videos by @${username}`}>
+        <section id="creator-video-grid" className={styles.videoGrid} aria-label={`Saved videos by @${username}`}>
           {creatorVideos.map((video, index) => (
             <Link
               className={styles.videoTile}
@@ -131,12 +137,25 @@ export function CreatorGallery({ creators, videos }: CreatorGalleryProps) {
           ))}
         </section>
       ) : (
-        <div className={styles.emptyState}>
+        <div id="creator-video-grid" className={styles.emptyState}>
           {loading
             ? "Loading videos…"
             : archive.error ? "Could not load this creator’s videos." : "No saved videos for this creator."}
         </div>
       )}
+      <button
+          className={styles.feedButton}
+          type="button"
+          aria-controls="creator-video-grid"
+          aria-busy={archive.loadingMoreVideos}
+          aria-disabled={archive.loadingMoreVideos || !archive.hasMoreVideos}
+          onClick={() => void archive.loadMoreVideos()}
+        >
+          {archive.loadingMoreVideos ? <LoaderCircle size={16} aria-hidden="true" /> : null}
+          {archive.loadingMoreVideos
+            ? "Loading more videos…"
+            : archive.hasMoreVideos ? "Load more videos" : "All videos loaded"}
+      </button>
       </>}
     </main>
   );

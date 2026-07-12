@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -97,6 +97,14 @@ test("live bridge paginates active videos and serves an existing .image sidecar"
   assert.deepEqual(secondPage.items.map((video) => video.id), ["2", "1"]);
   assert.equal(secondPage.nextCursor, null);
 
+  const offlineDatabase = `${database}.offline`;
+  await rename(database, offlineDatabase);
+  for (const id of [...firstPage.items, ...secondPage.items].map((video) => video.id)) {
+    const cachedMedia = await fetch(`http://127.0.0.1:${port}/media/${id}`, { method: "HEAD" });
+    assert.equal(cachedMedia.status, 200, `returned ID ${id} triggered an exact SQL lookup\n${childOutput}`);
+  }
+  await rename(offlineDatabase, database);
+
   const exactResponse = await fetch(`http://127.0.0.1:${port}/api/videos?page=1&limit=2&fileId=1`);
   const exactPage = await exactResponse.json();
   assert.equal(exactPage.items[0].id, "1");
@@ -119,7 +127,17 @@ test("live bridge paginates active videos and serves an existing .image sidecar"
   const thumbnailBody = Buffer.from(await thumbnailResponse.arrayBuffer());
   assert.equal(thumbnailResponse.status, 200, `${thumbnailBody.toString()}\n${childOutput}`);
   assert.equal(thumbnailResponse.headers.get("content-type"), "image/jpeg");
+  assert.match(thumbnailResponse.headers.get("cache-control") || "", /max-age=31536000/);
+  assert.match(thumbnailResponse.headers.get("cache-control") || "", /immutable/);
+  const thumbnailEtag = thumbnailResponse.headers.get("etag");
+  assert(thumbnailEtag);
   assert.deepEqual(thumbnailBody, jpeg);
+  const validatedThumbnail = await fetch(`http://127.0.0.1:${port}/thumbnail/1.jpg`, {
+    headers: { "if-none-match": `"unrelated", W/${thumbnailEtag}` },
+  });
+  assert.equal(validatedThumbnail.status, 304);
+  assert.equal((await validatedThumbnail.arrayBuffer()).byteLength, 0);
+
 });
 
 async function availablePort() {

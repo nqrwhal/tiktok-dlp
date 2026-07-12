@@ -12,7 +12,7 @@ export function buildVideoSql({
 } = {}) {
   const boundedLimit = Math.min(MAX_LEGACY_VIDEO_LIMIT, positiveInteger(limit, 500));
   const creatorClause = username
-    ? `AND lower(files.username) = lower(${sqliteString(username)})`
+    ? `AND files.username = ${sqliteString(username)} COLLATE NOCASE`
     : "";
   const fileClause = fileId ? `AND files.id = ${positiveInteger(fileId, 0)}` : "";
   const cursorClause = cursor
@@ -131,6 +131,133 @@ export function matchImportProxyRoute(pathname, method) {
     return { allowed: normalizedMethod === "POST", readsBody: normalizedMethod === "POST" };
   }
   return null;
+}
+
+export function createActiveFileTracker() {
+  const refCounts = new Map();
+  return {
+    acquire(name) {
+      const key = String(name);
+      refCounts.set(key, (refCounts.get(key) || 0) + 1);
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        const remaining = (refCounts.get(key) || 1) - 1;
+        if (remaining > 0) refCounts.set(key, remaining);
+        else refCounts.delete(key);
+      };
+    },
+    protectedNames() {
+      return new Set(refCounts.keys());
+    },
+  };
+}
+
+export function createBoundedRowCache(maxEntries = 10_000) {
+  const limit = positiveInteger(maxEntries, 10_000);
+  const rowsById = new Map();
+  return {
+    get(fileId) {
+      const key = String(fileId);
+      const row = rowsById.get(key);
+      if (!row) return undefined;
+      rowsById.delete(key);
+      rowsById.set(key, row);
+      return row;
+    },
+    add(rows) {
+      for (const row of rows || []) {
+        if (row?.id === undefined || row?.id === null) continue;
+        const key = String(row.id);
+        rowsById.delete(key);
+        rowsById.set(key, row);
+        while (rowsById.size > limit) rowsById.delete(rowsById.keys().next().value);
+      }
+    },
+    delete(fileId) {
+      rowsById.delete(String(fileId));
+    },
+    clear() {
+      rowsById.clear();
+    },
+    get size() {
+      return rowsById.size;
+    },
+  };
+}
+
+export function createExpiringSingleFlight(load, { ttlMs, now = Date.now } = {}) {
+  let cached = { loadedAt: 0, value: undefined };
+  let inflight = null;
+  async function refresh({ force = false } = {}) {
+    const currentTime = now();
+    if (!force && cached.value !== undefined && currentTime - cached.loadedAt < ttlMs) {
+      return cached.value;
+    }
+    if (inflight) return inflight;
+    inflight = Promise.resolve()
+      .then(load)
+      .then((value) => {
+        cached = { loadedAt: now(), value };
+        return value;
+      })
+      .finally(() => {
+        inflight = null;
+      });
+    return inflight;
+  }
+  refresh.invalidate = () => {
+    cached = { loadedAt: 0, value: undefined };
+  };
+  return refresh;
+}
+
+export function selectCacheEntriesForEviction(
+  entries,
+  { maxAgeMs, maxBytes, now = Date.now(), protectedNames = new Set() },
+) {
+  const candidates = [];
+  let retainedBytes = 0;
+  for (const entry of entries) {
+    const name = String(entry.name || "");
+    const size = Math.max(0, Number(entry.size) || 0);
+    if (entry.isFile === false || name.includes(".part-")) continue;
+    if (protectedNames.has(name)) {
+      retainedBytes += size;
+      continue;
+    }
+    if (now - Number(entry.mtimeMs || 0) > maxAgeMs) {
+      candidates.push({ ...entry, name, size, expired: true });
+    } else {
+      retainedBytes += size;
+      candidates.push({ ...entry, name, size, expired: false });
+    }
+  }
+  const evicted = candidates.filter((entry) => entry.expired);
+  const oldestFirst = candidates
+    .filter((entry) => !entry.expired)
+    .sort((left, right) => Number(left.mtimeMs || 0) - Number(right.mtimeMs || 0));
+  for (const entry of oldestFirst) {
+    if (retainedBytes <= maxBytes) break;
+    retainedBytes -= entry.size;
+    evicted.push(entry);
+  }
+  return evicted.map((entry) => entry.name);
+}
+
+export function matchesIfNoneMatch(value, etag) {
+  const requested = String(value || "").trim();
+  if (!requested) return false;
+  const target = weakEtagValue(etag);
+  return requested.split(",").some((candidate) => {
+    const trimmed = candidate.trim();
+    return trimmed === "*" || weakEtagValue(trimmed) === target;
+  });
+}
+
+function weakEtagValue(value) {
+  return String(value || "").trim().replace(/^W\//, "");
 }
 
 function normalizedAbsolutePath(value, label) {

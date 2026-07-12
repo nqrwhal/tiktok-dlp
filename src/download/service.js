@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { readdir } from 'node:fs/promises';
 import { downloadVideo, fetchVideoMetadata } from '../tiktok/ytdlp.js';
-import { extractVideoId, fileSize, makePublicFileUrl, randomToken } from '../util/files.js';
+import { assertTikTokDownloadUrl, extractVideoId, fileSize, makePublicFileUrl, randomToken } from '../util/files.js';
 
 const DEFAULT_MAX_QUEUE_SIZE = 50;
 const DEFAULT_MAX_PER_USER = 3;
@@ -56,12 +56,12 @@ export class DownloadService {
         || providedMetadata?.sourceUrl
         || '',
     ).trim();
-    if (!resolvedSourceUrl) throw new Error('A TikTok source URL is required.');
+    const validatedSourceUrl = assertTikTokDownloadUrl(resolvedSourceUrl);
 
     const reservation = this.#reserveRequest({ type, requestedBy, guildId });
     let jobId = null;
     try {
-      const initialVideoId = String(providedMetadata?.id || extractVideoId(resolvedSourceUrl) || '');
+      const initialVideoId = String(providedMetadata?.id || extractVideoId(validatedSourceUrl) || '');
       jobId = this.store.createJob({
         type,
         status: 'queued',
@@ -69,12 +69,12 @@ export class DownloadService {
         guildId,
         channelId,
         username,
-        sourceUrl: resolvedSourceUrl,
+        sourceUrl: validatedSourceUrl,
         videoId: initialVideoId,
         title: String(providedMetadata?.title ?? ''),
       }, this.now());
       const asset = await this.#getAsset({
-        sourceUrl: resolvedSourceUrl,
+        sourceUrl: validatedSourceUrl,
         username,
         metadata: providedMetadata,
       });

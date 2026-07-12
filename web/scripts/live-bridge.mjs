@@ -1,5 +1,5 @@
 import { createReadStream, createWriteStream } from "node:fs";
-import { copyFile, mkdir, open, realpath, rename, rm, stat } from "node:fs/promises";
+import { copyFile, mkdir, open, readdir, realpath, rename, rm, stat } from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,11 +8,16 @@ import { pipeline } from "node:stream/promises";
 import {
   MAX_PAGINATED_VIDEO_LIMIT,
   buildVideoSql,
+  createActiveFileTracker,
+  createBoundedRowCache,
+  createExpiringSingleFlight,
   decodeVideoCursor,
   encodeVideoCursor,
   isTrashSchemaMigrationError,
   matchImportProxyRoute,
+  matchesIfNoneMatch,
   resolveArchivePath as resolveSafeArchivePath,
+  selectCacheEntriesForEviction,
   thumbnailSidecarCandidates,
 } from "./live-bridge-core.mjs";
 
@@ -31,13 +36,18 @@ const archiveDownloads = process.env.LIVE_DOWNLOADS_PATH || (localMode ? "/app/d
 const backendUrl = (process.env.LIVE_BACKEND_URL || "http://tiktok-discord-downloader:8080").replace(/\/+$/, "");
 const importApiToken = process.env.LIVE_IMPORT_API_TOKEN || "";
 const publicBaseUrl = (process.env.LIVE_PUBLIC_BASE_URL || "").replace(/\/+$/, "");
+const cacheMaxBytes = positiveInteger(process.env.LIVE_CACHE_MAX_MB, 5 * 1024) * 1024 ** 2;
+const cacheMaxAgeMs = positiveInteger(process.env.LIVE_CACHE_MAX_AGE_DAYS, 7) * 86_400_000;
 const inflightCopies = new Map();
 const inflightThumbnails = new Map();
+const activeCacheFiles = createActiveFileTracker();
 const limitVideoCopies = createTaskLimiter(2);
 const limitThumbnailGeneration = createTaskLimiter(2);
 let videoCache = { loadedAt: 0, rows: [] };
 let videoCacheLoadPromise = null;
-let metadataCache = { loadedAt: 0, byId: {} };
+const videoRowsById = createBoundedRowCache(10_000);
+const loadMetadataIndex = createExpiringSingleFlight(scanMetadataIndex, { ttlMs: 60_000 });
+let cacheEvictionPromise = null;
 
 const CREATOR_SQL = `
   WITH saved AS (
@@ -117,6 +127,7 @@ const STATS_SQL = `
 `;
 
 await mkdir(cacheDir, { recursive: true });
+await pruneLiveCache();
 
 const server = http.createServer(async (request, response) => {
   const origin = request.headers.origin || "";
@@ -195,11 +206,13 @@ const server = http.createServer(async (request, response) => {
           }));
         }
       }
+      videoRowsById.add(baseRows);
       const rows = [...baseRows];
       if (fileId && !cursor) {
         const exactIndex = rows.findIndex((row) => Number(row.id) === fileId);
         if (exactIndex < 0) {
           const exactRows = await remoteSql(buildVideoSql({ fileId, limit: 1, bookmarkedOnly }));
+          videoRowsById.add(exactRows);
           rows.unshift(...exactRows);
         } else if (exactIndex >= limit) {
           rows.unshift(...rows.splice(exactIndex, 1));
@@ -286,7 +299,8 @@ const server = http.createServer(async (request, response) => {
       const upstream = await remoteAdminRequest("POST", `${url.pathname}${url.search}`, body);
       if (upstream.status >= 200 && upstream.status < 300) {
         videoCache = { loadedAt: 0, rows: [] };
-        metadataCache = { loadedAt: 0, byId: {} };
+        videoRowsById.clear();
+        loadMetadataIndex.invalidate();
       }
       sendUpstream(response, upstream);
       return;
@@ -298,7 +312,8 @@ const server = http.createServer(async (request, response) => {
       const upstream = await remoteAdminRequest(request.method, `${url.pathname}${url.search}`, body);
       if (upstream.status >= 200 && upstream.status < 300) {
         videoCache = { loadedAt: 0, rows: [] };
-        metadataCache = { loadedAt: 0, byId: {} };
+        videoRowsById.clear();
+        loadMetadataIndex.invalidate();
       }
       response.writeHead(upstream.status, {
         "Cache-Control": "no-store",
@@ -315,7 +330,8 @@ const server = http.createServer(async (request, response) => {
       const upstream = await remoteAdminRequest(request.method, `${url.pathname}${url.search}`, body);
       if (upstream.status >= 200 && upstream.status < 300) {
         videoCache = { loadedAt: 0, rows: [] };
-        metadataCache = { loadedAt: 0, byId: {} };
+        videoRowsById.clear();
+        loadMetadataIndex.invalidate();
       }
       response.writeHead(upstream.status, {
         "Cache-Control": "no-store",
@@ -372,6 +388,7 @@ async function loadVideoRows({ force = false } = {}) {
   videoCacheLoadPromise = remoteSql(buildVideoSql())
     .then((rows) => {
       videoCache = { loadedAt: Date.now(), rows };
+      videoRowsById.add(rows);
       return rows;
     })
     .finally(() => {
@@ -392,9 +409,7 @@ function creatorMatches(username, creatorId) {
   return normalizedUsername === normalizedId || legacyCreatorKey(username) === normalizedId;
 }
 
-async function loadMetadataIndex({ force = false } = {}) {
-  const now = Date.now();
-  if (!force && now - metadataCache.loadedAt < 60_000) return metadataCache.byId;
+async function scanMetadataIndex() {
   const encodedRoot = Buffer.from(archiveDownloads, "utf8").toString("base64");
   const script = [
     "import base64, json, os",
@@ -421,9 +436,7 @@ async function loadMetadataIndex({ force = false } = {}) {
     "        }",
     "print(json.dumps(result, ensure_ascii=False))",
   ].join("\n");
-  const byId = await archivePythonJson(script);
-  metadataCache = { loadedAt: now, byId };
-  return byId;
+  return archivePythonJson(script);
 }
 
 async function serveMedia(request, response, fileId) {
@@ -433,56 +446,62 @@ async function serveMedia(request, response, fileId) {
     return;
   }
 
-  const localPath = await ensureCached(record);
-  const fileStats = await stat(localPath);
-  const range = parseRange(request.headers.range, fileStats.size);
-  const modifiedAt = fileStats.mtime.toUTCString();
-  const requestUrl = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
-  const wantsDownload = requestUrl.searchParams.get("download") === "1";
-  const headers = {
-    "Accept-Ranges": "bytes",
-    "Cache-Control": "private, max-age=604800, immutable, no-transform",
-    "Content-Type": "video/mp4",
-    ETag: `"${fileId}-${fileStats.size}-${Math.trunc(fileStats.mtimeMs)}"`,
-    "Last-Modified": modifiedAt,
-  };
-  if (wantsDownload) {
-    const filename = String(record.filename || `${record.id}.mp4`).replace(/["\\\r\n]/g, "_");
-    headers["Content-Disposition"] = `attachment; filename="${filename}"`;
-  }
+  const expectedPath = localMode ? resolveArchivePath(record.path) : videoCachePath(record);
+  const releaseCacheFile = markActiveCacheFile(expectedPath);
+  try {
+    const localPath = await ensureCached(record);
+    const fileStats = await stat(localPath);
+    const range = parseRange(request.headers.range, fileStats.size);
+    const modifiedAt = fileStats.mtime.toUTCString();
+    const requestUrl = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
+    const wantsDownload = requestUrl.searchParams.get("download") === "1";
+    const headers = {
+      "Accept-Ranges": "bytes",
+      "Cache-Control": "private, max-age=604800, immutable, no-transform",
+      "Content-Type": "video/mp4",
+      ETag: `"${fileId}-${fileStats.size}-${Math.trunc(fileStats.mtimeMs)}"`,
+      "Last-Modified": modifiedAt,
+    };
+    if (wantsDownload) {
+      const filename = String(record.filename || `${record.id}.mp4`).replace(/["\\\r\n]/g, "_");
+      headers["Content-Disposition"] = `attachment; filename="${filename}"`;
+    }
 
-  if (range === null && request.headers.range) {
-    response.writeHead(416, {
-      ...headers,
-      "Content-Range": `bytes */${fileStats.size}`,
-    });
-    response.end();
-    return;
-  }
+    if (range === null && request.headers.range) {
+      response.writeHead(416, {
+        ...headers,
+        "Content-Range": `bytes */${fileStats.size}`,
+      });
+      response.end();
+      return;
+    }
 
-  if (range) {
-    response.writeHead(206, {
+    if (range) {
+      response.writeHead(206, {
+        ...headers,
+        "Content-Length": String(range.end - range.start + 1),
+        "Content-Range": `bytes ${range.start}-${range.end}/${fileStats.size}`,
+      });
+      if (request.method === "HEAD") {
+        response.end();
+        return;
+      }
+      await pipeline(createReadStream(localPath, range), response);
+      return;
+    }
+
+    response.writeHead(200, {
       ...headers,
-      "Content-Length": String(range.end - range.start + 1),
-      "Content-Range": `bytes ${range.start}-${range.end}/${fileStats.size}`,
+      "Content-Length": String(fileStats.size),
     });
     if (request.method === "HEAD") {
       response.end();
       return;
     }
-    await pipeline(createReadStream(localPath, range), response);
-    return;
+    await pipeline(createReadStream(localPath), response);
+  } finally {
+    releaseCacheFile();
   }
-
-  response.writeHead(200, {
-    ...headers,
-    "Content-Length": String(fileStats.size),
-  });
-  if (request.method === "HEAD") {
-    response.end();
-    return;
-  }
-  await pipeline(createReadStream(localPath), response);
 }
 
 async function serveThumbnail(request, response, fileId) {
@@ -492,33 +511,58 @@ async function serveThumbnail(request, response, fileId) {
     return;
   }
 
-  const thumbnailPath = await ensureThumbnail(record);
-  const thumbnailStats = await stat(thumbnailPath);
-  response.writeHead(200, {
-    "Cache-Control": "private, max-age=3600",
-    "Content-Length": String(thumbnailStats.size),
-    "Content-Type": "image/jpeg",
-  });
-  if (request.method === "HEAD") {
-    response.end();
-    return;
+  const expectedPath = path.join(cacheDir, `thumb-${record.id}.jpg`);
+  const releaseCacheFile = markActiveCacheFile(expectedPath);
+  try {
+    const thumbnailPath = await ensureThumbnail(record);
+    const thumbnailStats = await stat(thumbnailPath);
+    const etag = `"${fileId}-${thumbnailStats.size}-${Math.trunc(thumbnailStats.mtimeMs)}"`;
+    const headers = {
+      "Cache-Control": "private, max-age=31536000, immutable, no-transform",
+      "Content-Type": "image/jpeg",
+      ETag: etag,
+      "Last-Modified": thumbnailStats.mtime.toUTCString(),
+    };
+    if (matchesIfNoneMatch(request.headers["if-none-match"], etag)
+      || isNotModifiedSince(request, thumbnailStats.mtimeMs)) {
+      response.writeHead(304, headers);
+      response.end();
+      return;
+    }
+    response.writeHead(200, {
+      ...headers,
+      "Content-Length": String(thumbnailStats.size),
+    });
+    if (request.method === "HEAD") {
+      response.end();
+      return;
+    }
+    await pipeline(createReadStream(thumbnailPath), response);
+  } finally {
+    releaseCacheFile();
   }
-  await pipeline(createReadStream(thumbnailPath), response);
 }
 
 async function findVideoRow(fileId) {
+  const indexed = videoRowsById.get(fileId);
+  if (indexed) return indexed;
   const rows = await loadVideoRows();
   const cached = rows.find((row) => Number(row.id) === Number(fileId));
   if (cached) return cached;
   const [exact] = await remoteSql(buildVideoSql({ fileId, limit: 1 }));
+  if (exact) videoRowsById.add([exact]);
   return exact || null;
+}
+
+function videoCachePath(record) {
+  const safeName = String(record.filename || `${record.id}.mp4`).replace(/[^A-Za-z0-9._-]/g, "_");
+  return path.join(cacheDir, `${record.id}-${safeName}`);
 }
 
 async function ensureCached(record) {
   if (localMode) return resolveArchivePath(record.path);
 
-  const safeName = String(record.filename || `${record.id}.mp4`).replace(/[^A-Za-z0-9._-]/g, "_");
-  const localPath = path.join(cacheDir, `${record.id}-${safeName}`);
+  const localPath = videoCachePath(record);
   const expectedSize = Number(record.size_bytes || 0);
 
   try {
@@ -568,6 +612,7 @@ async function copyFromRemote(record, localPath) {
       throw new Error(`Video copy was incomplete (${copied.size}/${expectedSize} bytes)`);
     }
     await rename(tempPath, localPath);
+    await pruneLiveCache();
     return localPath;
   } catch (error) {
     await rm(tempPath, { force: true });
@@ -624,6 +669,7 @@ async function copyLocalThumbnailSidecar(record, localPath) {
       const copied = await stat(tempPath);
       if (!copied.size) continue;
       await rename(tempPath, localPath);
+      await pruneLiveCache();
       return true;
     } catch (error) {
       if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") continue;
@@ -677,6 +723,7 @@ async function copyRemoteThumbnailSidecar(record, localPath) {
       return false;
     }
     await rename(tempPath, localPath);
+    await pruneLiveCache();
     return true;
   } catch (error) {
     await rm(tempPath, { force: true });
@@ -714,6 +761,7 @@ async function generateRemoteThumbnail(record, localPath) {
     const generated = await stat(tempPath);
     if (!generated.size) throw new Error("Thumbnail generation returned an empty image");
     await rename(tempPath, localPath);
+    await pruneLiveCache();
     return localPath;
   } catch (error) {
     await rm(tempPath, { force: true });
@@ -756,11 +804,59 @@ async function generateLocalThumbnail(record, localPath) {
     const generated = await stat(tempPath);
     if (!generated.size) throw new Error("Thumbnail generation returned an empty image");
     await rename(tempPath, localPath);
+    await pruneLiveCache();
     return localPath;
   } catch (error) {
     await rm(tempPath, { force: true });
     throw new Error(stderr.trim() || (error instanceof Error ? error.message : String(error)));
   }
+}
+
+function markActiveCacheFile(filePath) {
+  if (path.dirname(path.resolve(filePath)) !== path.resolve(cacheDir)) return () => {};
+  return activeCacheFiles.acquire(path.basename(filePath));
+}
+
+function pruneLiveCache() {
+  if (cacheEvictionPromise) return cacheEvictionPromise;
+  cacheEvictionPromise = (async () => {
+    const directoryEntries = await readdir(cacheDir, { withFileTypes: true });
+    const entries = await Promise.all(directoryEntries.map(async (entry) => {
+      if (!entry.isFile()) return { name: entry.name, isFile: false, size: 0, mtimeMs: 0 };
+      try {
+        const fileStats = await stat(path.join(cacheDir, entry.name));
+        return { name: entry.name, isFile: true, size: fileStats.size, mtimeMs: fileStats.mtimeMs };
+      } catch (error) {
+        if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return null;
+        throw error;
+      }
+    }));
+    const protectedNames = activeCacheFiles.protectedNames();
+    for (const entry of entries) {
+      if (!entry) continue;
+      for (const id of inflightCopies.keys()) {
+        if (entry.name.startsWith(`${id}-`)) protectedNames.add(entry.name);
+      }
+      for (const id of inflightThumbnails.keys()) {
+        if (entry.name === `thumb-${id}.jpg`) protectedNames.add(entry.name);
+      }
+    }
+    const evictions = selectCacheEntriesForEviction(entries.filter(Boolean), {
+      maxAgeMs: cacheMaxAgeMs,
+      maxBytes: cacheMaxBytes,
+      protectedNames,
+    });
+    await Promise.all(evictions.map((name) => rm(path.join(cacheDir, name), { force: true })));
+  })().finally(() => {
+    cacheEvictionPromise = null;
+  });
+  return cacheEvictionPromise;
+}
+
+function isNotModifiedSince(request, modifiedAtMs) {
+  if (request.headers["if-none-match"]) return false;
+  const value = Date.parse(String(request.headers["if-modified-since"] || ""));
+  return Number.isFinite(value) && Math.trunc(modifiedAtMs / 1000) * 1000 <= value;
 }
 
 function resolveArchivePath(storedPath) {
