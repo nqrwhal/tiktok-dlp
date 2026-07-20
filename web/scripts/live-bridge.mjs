@@ -14,6 +14,7 @@ import {
   decodeVideoCursor,
   encodeVideoCursor,
   isTrashSchemaMigrationError,
+  matchCreatorMonitoringProxyRoute,
   matchImportProxyRoute,
   matchesIfNoneMatch,
   resolveArchivePath as resolveSafeArchivePath,
@@ -289,6 +290,17 @@ const server = http.createServer(async (request, response) => {
 
     if (request.method === "GET" && url.pathname === "/api/trash") {
       const upstream = await remoteAdminRequest("GET", `${url.pathname}${url.search}`);
+      sendUpstream(response, upstream);
+      return;
+    }
+
+    const creatorMonitoringRoute = matchCreatorMonitoringProxyRoute(url.pathname, request.method);
+    if (creatorMonitoringRoute) {
+      if (!creatorMonitoringRoute.allowed) {
+        sendJson(response, 405, { error: "Method not allowed" });
+        return;
+      }
+      const upstream = await remoteAdminRequest(request.method, `${url.pathname}${url.search}`);
       sendUpstream(response, upstream);
       return;
     }

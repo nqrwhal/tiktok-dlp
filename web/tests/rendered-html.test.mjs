@@ -49,8 +49,9 @@ for (const [pathname, expectedContent] of routes) {
     }
     if (pathname.startsWith("/creator")) {
       assert.match(html, /href="\/\?creator=mina-makes(?:&amp;|&)video=v-1042"/i);
-      assert.match(html, /aria-controls="creator-video-grid"/i);
-      assert.match(html, />All videos loaded<\/button>/i);
+      assert.match(html, /id="creator-video-grid"/i);
+      assert.match(html, /role="status">(?:All \d+ saved videos are loaded|No more videos are available to load\. Showing \d+ of \d+ saved videos\.)<\/p>/i);
+      assert.doesNotMatch(html, />All videos loaded<\/button>/i);
     }
     if (pathname === "/dashboard" || pathname === "/dashboard/videos") {
       assert.match(html, /href="\/\?creator=[^"&]+(?:&amp;|&)video=v-/i);
@@ -71,6 +72,7 @@ for (const [pathname, expectedContent] of routes) {
 
 test("feed exposes confirmed server trash and bounded delivery", async () => {
   const source = await readFile(new URL("../components/feed/MobileFeed.tsx", import.meta.url), "utf8");
+  const bookmarkSource = await readFile(new URL("../lib/bookmark-state.mjs", import.meta.url), "utf8");
   assert.match(source, /Move to trash/i);
   assert.match(source, /method:\s*"DELETE"/);
   assert.match(source, /confirmFileId:\s*deleteVideo\.id/);
@@ -80,8 +82,9 @@ test("feed exposes confirmed server trash and bounded delivery", async () => {
   assert.match(source, /const PRELOAD_AHEAD = 2/);
   assert.match(source, /const PLAYABLE_READY_STATE = 2/);
   assert.match(source, /onLoadedData=/);
-  assert.match(source, /\/api\/bookmarks/);
-  assert.match(source, /BOOKMARK_MIGRATION_STORAGE_KEY/);
+  assert.match(source, /useBookmarks/);
+  assert.match(bookmarkSource, /\/api\/bookmarks/);
+  assert.match(bookmarkSource, /BOOKMARK_MIGRATION_STORAGE_KEY/);
   assert.match(source, /Tap for controls · swipe to browse/);
   assert.match(source, /type="range"/);
   assert.match(source, /aria-keyshortcuts="Space ArrowUp ArrowDown ArrowLeft ArrowRight M B"/);
@@ -118,6 +121,15 @@ test("creator imports remain durable and actionable outside the open panel", asy
   assert.match(types, /cancelRequestedAt: number \| null/);
   assert.match(types, /retryCount: number/);
   assert.match(types, /resumeCount: number/);
+});
+
+test("creator dashboard can stop monitoring without deleting its archive", async () => {
+  const source = await readFile(new URL("../components/dashboard/CreatorManager.tsx", import.meta.url), "utf8");
+  assert.match(source, /Turn off monitoring/);
+  assert.match(source, /\/api\/creators\/\$\{encodeURIComponent\(monitorCreator\.username\)\}\/monitoring/);
+  assert.match(source, /method:\s*"DELETE"/);
+  assert.match(source, /Saved videos were kept/);
+  assert.match(source, /every configured destination/);
 });
 
 test("failed feed pages use a retry backoff instead of an immediate render loop", async () => {

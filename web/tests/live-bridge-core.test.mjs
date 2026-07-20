@@ -9,6 +9,7 @@ import {
   decodeVideoCursor,
   encodeVideoCursor,
   isTrashSchemaMigrationError,
+  matchCreatorMonitoringProxyRoute,
   matchImportProxyRoute,
   matchesIfNoneMatch,
   resolveArchivePath,
@@ -164,4 +165,17 @@ test("import proxy routes allow only the backend contract methods", () => {
   assert.deepEqual(matchImportProxyRoute("/api/imports/42/retry", "POST"), { allowed: true, readsBody: true });
   assert.deepEqual(matchImportProxyRoute("/api/imports/42/retry", "GET"), { allowed: false, readsBody: false });
   assert.equal(matchImportProxyRoute("/api/imports/not-an-id/cancel", "POST"), null);
+});
+
+test("creator monitoring proxy route allows only DELETE", () => {
+  assert.deepEqual(
+    matchCreatorMonitoringProxyRoute("/api/creators/alice.archive/monitoring", "DELETE"),
+    { allowed: true },
+  );
+  assert.deepEqual(
+    matchCreatorMonitoringProxyRoute("/api/creators/alice.archive/monitoring", "POST"),
+    { allowed: false },
+  );
+  assert.equal(matchCreatorMonitoringProxyRoute("/api/creators/alice.archive/videos", "DELETE"), null);
+  assert.equal(matchCreatorMonitoringProxyRoute("/api/creators/alice/archive/monitoring", "DELETE"), null);
 });

@@ -1,22 +1,25 @@
 .picker {
   position: relative;
-  z-index: 50;
   min-width: 176px;
+}
+
+.picker[data-open] {
+  z-index: var(--z-dropdown);
 }
 
 .trigger {
   display: flex;
   width: 100%;
-  min-height: 44px;
+  min-height: var(--control-height);
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  border: 1px solid rgba(244, 247, 239, 0.14);
-  border-radius: 9px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
   padding: 0 12px;
-  background: #121512;
-  color: #f4f7ef;
-  font-size: 12px;
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-size: 13px;
   font-weight: 620;
 }
 
@@ -25,6 +28,16 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.trigger > svg {
+  flex: 0 0 auto;
+  color: var(--color-text-subtle);
+  transition: transform 160ms ease;
+}
+
+.picker[data-open] .trigger > svg {
+  transform: rotate(180deg);
 }
 
 .menu {
@@ -36,11 +49,11 @@
   max-height: min(430px, 64vh);
   overflow-y: auto;
   overscroll-behavior: contain;
-  border: 1px solid rgba(244, 247, 239, 0.15);
-  border-radius: 10px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
   padding: 6px;
-  background: #121512;
-  box-shadow: 0 22px 70px rgba(0, 0, 0, 0.55);
+  background: var(--color-surface-raised);
+  box-shadow: var(--shadow-popover);
   color-scheme: dark;
 }
 
@@ -48,27 +61,27 @@
 .optionSelected {
   display: flex;
   width: 100%;
-  min-height: 44px;
+  min-height: var(--control-height);
   align-items: center;
   justify-content: space-between;
   gap: 12px;
   border: 0;
-  border-radius: 7px;
+  border-radius: var(--radius-sm);
   padding: 0 10px;
   background: transparent;
-  color: #a4aba2;
-  font-size: 12px;
+  color: var(--color-text-muted);
+  font-size: 13px;
   text-align: left;
 }
 
 .option:hover,
 .optionSelected {
-  background: #202420;
-  color: #f4f7ef;
+  background: var(--color-surface-hover);
+  color: var(--color-text);
 }
 
-.optionSelected {
-  color: #c9ff4a;
+.optionSelected > svg {
+  color: var(--color-accent);
 }
 
 .optionIdentity {
@@ -93,7 +106,7 @@
 }
 
 .compact .trigger {
-  min-height: 44px;
+  min-height: var(--control-height);
   border-color: rgba(255, 255, 255, 0.2);
   border-radius: 999px;
   background: rgba(8, 10, 9, 0.58);
@@ -112,5 +125,6 @@
   .picker:not(.compact) .menu {
     right: auto;
     left: 0;
+    width: 100%;
   }
 }

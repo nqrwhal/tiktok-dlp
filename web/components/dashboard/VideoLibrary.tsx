@@ -255,75 +255,104 @@ export function VideoLibrary({
         role="tabpanel"
         aria-labelledby="video-library-active-tab"
       >
-        <div className={styles.tableHeader}>
+        <div className={styles.tableHeader} aria-hidden="true">
           <span>Video</span>
-          <span>Creator</span>
-          <span>Saved</span>
-          <span>Size</span>
+          <span className={styles.tableMetadataHeader}>
+            <span>Creator</span>
+            <span>Saved</span>
+            <span>Size</span>
+          </span>
           <span />
         </div>
-        {filtered.map((video) => (
-          <article className={styles.videoRow} key={video.id}>
-            <Link
-              className={styles.videoRowLink}
-              href={`/?creator=${encodeURIComponent(video.creatorId)}&video=${encodeURIComponent(video.id)}`}
-              aria-label={`Play ${video.title}`}
-            />
-            <div className={styles.videoIdentity}>
-              <div
-                className={styles.libraryThumb}
-                style={{ "--thumb": video.accent } as React.CSSProperties}
-              >
-                {video.thumbnailUrl ? (
-                  // Live preview thumbnails come from a configurable local bridge URL.
-                  // eslint-disable-next-line @next/next/no-img-element
-                  <img src={video.thumbnailUrl} alt="" loading="lazy" />
-                ) : null}
-                <span className={styles.thumbPlay}><Play size={14} fill="currentColor" /></span>
-                <small>{video.duration}</small>
-              </div>
-              <div>
-                <strong>{video.title}</strong>
-                <small>@{video.username} · saved {video.savedAtLabel} · {video.sizeLabel}</small>
-              </div>
-            </div>
-            <span className={styles.tableCreator}>@{video.username}</span>
-            <span className={styles.tableMuted}>{video.savedAtLabel}</span>
-            <span className={styles.tableMuted}>{video.sizeLabel}</span>
-            <div className={styles.rowActions}>
-              <a href={video.sourceUrl} target="_blank" rel="noreferrer" aria-label="Open original">
-                <ExternalLink size={16} />
-              </a>
-              <div className={styles.videoActions} data-video-actions>
-                <button
-                  id={`video-actions-${video.id}`}
-                  type="button"
-                  aria-label={`More actions for ${video.title} by @${video.username}, video ${video.id}`}
-                  aria-controls={`video-menu-${video.id}`}
-                  aria-expanded={actionVideoId === video.id}
-                  onClick={() => setActionVideoId((current) => current === video.id ? "" : video.id)}
+        <div className={styles.videoList} role="list" aria-label="Saved videos">
+          {filtered.map((video) => (
+            <article
+              className={`${styles.videoRow} ${actionVideoId === video.id ? styles.videoRowMenuOpen : ""}`}
+              role="listitem"
+              key={video.id}
+            >
+              <Link
+                className={styles.videoRowLink}
+                href={`/?creator=${encodeURIComponent(video.creatorId)}&video=${encodeURIComponent(video.id)}`}
+                aria-label={`Play ${video.title}`}
+              />
+              <div className={styles.videoIdentity}>
+                <div
+                  className={styles.libraryThumb}
+                  style={{ "--thumb": video.accent } as React.CSSProperties}
                 >
-                  <MoreHorizontal size={18} />
-                </button>
-                {actionVideoId === video.id ? (
-                  <div className={styles.videoActionMenu} id={`video-menu-${video.id}`}>
-                    <a
-                      href={`${video.videoUrl}${video.videoUrl.includes("?") ? "&" : "?"}download=1`}
-                      download
-                    >
-                      <Download size={15} />
-                      Download video
-                    </a>
-                    <button type="button" onClick={() => openDeleteVideo(video)}>
-                      <Trash2 size={15} />
-                      Move to trash
-                    </button>
-                  </div>
-                ) : null}
+                  {video.thumbnailUrl ? (
+                    // Live preview thumbnails come from a configurable local bridge URL.
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img src={video.thumbnailUrl} alt="" loading="lazy" />
+                  ) : null}
+                  <span className={styles.thumbPlay}><Play size={14} fill="currentColor" /></span>
+                  <small>{video.duration}</small>
+                </div>
+                <div>
+                  <strong>{video.title}</strong>
+                </div>
               </div>
-            </div>
-          </article>
-        ))}
+              <dl className={styles.videoMetadata}>
+                <div>
+                  <dt>Creator</dt>
+                  <dd>@{video.username}</dd>
+                </div>
+                <div>
+                  <dt>Saved</dt>
+                  <dd>{video.savedAtLabel}</dd>
+                </div>
+                <div>
+                  <dt>Size</dt>
+                  <dd>{video.sizeLabel}</dd>
+                </div>
+              </dl>
+              <div className={styles.rowActions}>
+                <a href={video.sourceUrl} target="_blank" rel="noreferrer" aria-label={`Open original post for ${video.title}`}>
+                  <ExternalLink size={16} />
+                </a>
+                <div
+                  className={styles.videoActions}
+                  data-video-actions
+                  onBlur={(event) => {
+                    if (!event.currentTarget.contains(event.relatedTarget)) setActionVideoId("");
+                  }}
+                >
+                  <button
+                    id={`video-actions-${video.id}`}
+                    type="button"
+                    aria-label={`More actions for ${video.title} by @${video.username}, video ${video.id}`}
+                    aria-controls={`video-menu-${video.id}`}
+                    aria-expanded={actionVideoId === video.id}
+                    onClick={() => setActionVideoId((current) => current === video.id ? "" : video.id)}
+                  >
+                    <MoreHorizontal size={18} />
+                  </button>
+                  {actionVideoId === video.id ? (
+                    <div
+                      className={styles.videoActionMenu}
+                      id={`video-menu-${video.id}`}
+                      role="group"
+                      aria-label={`Actions for ${video.title}`}
+                    >
+                      <a
+                        href={`${video.videoUrl}${video.videoUrl.includes("?") ? "&" : "?"}download=1`}
+                        download
+                      >
+                        <Download size={15} />
+                        Download video
+                      </a>
+                      <button type="button" onClick={() => openDeleteVideo(video)}>
+                        <Trash2 size={15} />
+                        Move to trash
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+            </article>
+          ))}
+        </div>
         {filtered.length === 0 ? (
           <div className={styles.tableEmpty}>
             <Search size={25} />
@@ -342,10 +371,10 @@ export function VideoLibrary({
             type="button"
             aria-controls="video-library-active-panel"
             aria-busy={archive.loadingMoreVideos}
-            aria-disabled={archive.loadingMoreVideos || !archive.hasMoreVideos}
+            disabled={archive.loadingMoreVideos || !archive.hasMoreVideos}
             onClick={() => void archive.loadMoreVideos()}
           >
-            {archive.loadingMoreVideos ? <LoaderCircle size={16} aria-hidden="true" /> : null}
+            {archive.loadingMoreVideos ? <LoaderCircle className={styles.spinning} size={16} aria-hidden="true" /> : null}
             {archive.loadingMoreVideos
               ? "Loading more videos…"
               : archive.hasMoreVideos ? "Load more videos" : "All videos loaded"}

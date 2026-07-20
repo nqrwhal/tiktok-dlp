@@ -250,6 +250,80 @@ test('creator import API requires a bearer token outside loopback', () => {
   ), false);
 });
 
+test('creator monitoring deletion removes every subscription and preserves archived files', async (t) => {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-monitoring-delete-'));
+  const downloadDir = path.join(rootDir, 'downloads');
+  const dbPath = path.join(rootDir, 'state.db');
+  await mkdir(downloadDir, { recursive: true });
+
+  const config = loadConfig({
+    DATA_DIR: rootDir,
+    DOWNLOAD_DIR: downloadDir,
+    STATE_DB: dbPath,
+    HTTP_PORT: '0',
+  }, rootDir);
+  const store = new Store(dbPath);
+  store.addWatch('Creator.Case', {
+    guildId: 'guild-1',
+    channelId: 'channel-1',
+    createdBy: 'manager-1',
+  });
+  store.addWatch('Creator.Case', {
+    guildId: 'guild-2',
+    channelId: 'channel-2',
+    createdBy: 'manager-2',
+  });
+  const archivedPath = path.join(downloadDir, 'saved.mp4');
+  await writeFile(archivedPath, 'saved video');
+  const fileId = store.createFileRecord({
+    videoId: 'saved-1',
+    username: 'Creator.Case',
+    sourceUrl: 'https://www.tiktok.com/@Creator.Case/video/saved-1',
+    filePath: archivedPath,
+    filename: 'saved.mp4',
+    sizeBytes: 11,
+  });
+
+  const { server, address } = await startHttpServer({
+    config,
+    store,
+    host: '127.0.0.1',
+    port: 0,
+  });
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const wrongMethod = await fetch(`${baseUrl}/api/creators/creator.case/monitoring`, { method: 'POST' });
+  assert.equal(wrongMethod.status, 405);
+  assert.equal(store.listWatchSubscriptions('Creator.Case').length, 2);
+
+  const stopped = await fetch(`${baseUrl}/api/creators/creator.case/monitoring`, { method: 'DELETE' });
+  assert.equal(stopped.status, 200);
+  assert.deepEqual(await stopped.json(), {
+    username: 'Creator.Case',
+    monitoring: false,
+    removed: true,
+    removedSubscriptions: 2,
+  });
+  assert.equal(store.getWatch('Creator.Case'), null);
+  assert.equal(store.listWatchSubscriptions('Creator.Case').length, 0);
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM files WHERE id = ?').get(fileId).count, 1);
+  await access(archivedPath);
+
+  const repeated = await fetch(`${baseUrl}/api/creators/creator.case/monitoring`, { method: 'DELETE' });
+  assert.equal(repeated.status, 200);
+  assert.deepEqual(await repeated.json(), {
+    username: 'creator.case',
+    monitoring: false,
+    removed: false,
+    removedSubscriptions: 0,
+  });
+});
+
 test('creator video deletion requires typed confirmation and trashes only that creator media', async (t) => {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-creator-delete-'));
   const downloadDir = path.join(rootDir, 'downloads');

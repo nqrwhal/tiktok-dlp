@@ -133,6 +133,11 @@ export function matchImportProxyRoute(pathname, method) {
   return null;
 }
 
+export function matchCreatorMonitoringProxyRoute(pathname, method) {
+  if (!/^\/api\/creators\/[^/]+\/monitoring$/.test(String(pathname || ""))) return null;
+  return { allowed: String(method || "").toUpperCase() === "DELETE" };
+}
+
 export function createActiveFileTracker() {
   const refCounts = new Map();
   return {

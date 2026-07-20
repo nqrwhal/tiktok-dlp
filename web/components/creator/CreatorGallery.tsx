@@ -48,6 +48,11 @@ export function CreatorGallery({ creators, videos }: CreatorGalleryProps) {
   const videoCountLabel = videoCount > loadedCount
     ? `${loadedCount.toLocaleString()} of ${videoCount.toLocaleString()} saved videos loaded`
     : `${videoCount.toLocaleString()} saved ${videoCount === 1 ? "video" : "videos"}`;
+  const terminalVideoLabel = videoCount > loadedCount
+    ? `No more videos are available to load. Showing ${loadedCount.toLocaleString()} of ${videoCount.toLocaleString()} saved videos.`
+    : loadedCount === 1
+      ? "The saved video is loaded"
+      : `All ${loadedCount.toLocaleString()} saved videos are loaded`;
   const feedHref = `/?creator=${encodeURIComponent(resolvedCreatorId)}${returnVideoId ? `&video=${encodeURIComponent(returnVideoId)}` : ""}`;
   const loading = archive.source === "loading" || archive.source === "refreshing";
 
@@ -55,11 +60,11 @@ export function CreatorGallery({ creators, videos }: CreatorGalleryProps) {
     <main className={styles.page}>
       <header className={styles.topBar}>
         <Link className={styles.iconButton} href={creator ? feedHref : "/"} aria-label="Back to feed">
-          <ArrowLeft size={20} />
+          <ArrowLeft aria-hidden="true" size={20} />
         </Link>
         <strong>{creator ? `@${username}` : "Creator videos"}</strong>
         <Link className={styles.iconButton} href="/dashboard/videos" aria-label="Open video library">
-          <Library size={19} />
+          <Library aria-hidden="true" size={19} />
         </Link>
       </header>
 
@@ -88,14 +93,14 @@ export function CreatorGallery({ creators, videos }: CreatorGalleryProps) {
         </div>
         {videoCount > 0 ? (
           <Link className={styles.feedButton} href={feedHref}>
-            <Play size={16} fill="currentColor" /> Open feed
+            <Play aria-hidden="true" size={16} fill="currentColor" /> Open feed
           </Link>
         ) : null}
       </section>
 
-      <div className={styles.gridLabel}>
-        <Grid3X3 size={16} /> Videos
-      </div>
+      <h2 className={styles.gridLabel} id="creator-videos-title">
+        <Grid3X3 aria-hidden="true" size={16} /> Videos
+      </h2>
 
       {archive.error ? (
         <div className={styles.galleryError} role="alert">
@@ -105,7 +110,12 @@ export function CreatorGallery({ creators, videos }: CreatorGalleryProps) {
       ) : null}
 
       {creatorVideos.length ? (
-        <section id="creator-video-grid" className={styles.videoGrid} aria-label={`Saved videos by @${username}`}>
+        <section
+          id="creator-video-grid"
+          className={styles.videoGrid}
+          aria-labelledby="creator-videos-title"
+          aria-busy={archive.loadingMoreVideos}
+        >
           {creatorVideos.map((video, index) => (
             <Link
               className={styles.videoTile}
@@ -126,36 +136,47 @@ export function CreatorGallery({ creators, videos }: CreatorGalleryProps) {
                 />
               ) : (
                 <span className={styles.videoPlaceholder} style={{ background: video.accent }}>
-                  <Play size={25} fill="currentColor" />
+                  <Play aria-hidden="true" size={25} fill="currentColor" />
                 </span>
               )}
-              <span className="sr-only">{video.title}</span>
               {video.duration !== "--:--" ? (
-                <span className={styles.duration}>{video.duration}</span>
+                <span className={styles.duration} aria-hidden="true">{video.duration}</span>
               ) : null}
             </Link>
           ))}
         </section>
       ) : (
-        <div id="creator-video-grid" className={styles.emptyState}>
+        <div
+          id="creator-video-grid"
+          className={styles.emptyState}
+          role={loading || !archive.error ? "status" : undefined}
+        >
           {loading
             ? "Loading videos…"
             : archive.error ? "Could not load this creator’s videos." : "No saved videos for this creator."}
         </div>
       )}
-      <button
-          className={styles.feedButton}
-          type="button"
-          aria-controls="creator-video-grid"
-          aria-busy={archive.loadingMoreVideos}
-          aria-disabled={archive.loadingMoreVideos || !archive.hasMoreVideos}
-          onClick={() => void archive.loadMoreVideos()}
-        >
-          {archive.loadingMoreVideos ? <LoaderCircle size={16} aria-hidden="true" /> : null}
-          {archive.loadingMoreVideos
-            ? "Loading more videos…"
-            : archive.hasMoreVideos ? "Load more videos" : "All videos loaded"}
-      </button>
+      <div className={styles.pagination}>
+        {archive.error ? (
+          <p>Loading stopped. Retry above to refresh this creator.</p>
+        ) : archive.hasMoreVideos ? (
+          <button
+            className={styles.loadMoreButton}
+            type="button"
+            aria-controls="creator-video-grid"
+            aria-busy={archive.loadingMoreVideos}
+            disabled={archive.loadingMoreVideos}
+            onClick={() => void archive.loadMoreVideos()}
+          >
+            {archive.loadingMoreVideos ? (
+              <LoaderCircle className={styles.spinning} size={16} aria-hidden="true" />
+            ) : null}
+            {archive.loadingMoreVideos ? "Loading more videos…" : "Load more videos"}
+          </button>
+        ) : creatorVideos.length ? (
+          <p role="status">{terminalVideoLabel}</p>
+        ) : null}
+      </div>
       </>}
     </main>
   );

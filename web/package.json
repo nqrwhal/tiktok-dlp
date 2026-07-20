@@ -12,8 +12,12 @@
     "start:live": "node scripts/start-live.mjs",
     "build": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext build",
     "start": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext start",
+    "start:e2e": "NEXT_PUBLIC_ARCHIVE_API_BASE=http://127.0.0.1:3100 npm run build && NEXT_PUBLIC_ARCHIVE_API_BASE=http://127.0.0.1:3100 WRANGLER_LOG_PATH=.wrangler/wrangler-e2e.log vinext start -p 3100 -H 127.0.0.1",
     "test": "npm run build && node --test tests/*.test.mjs",
-    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next"
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
+    "test:all": "npm run lint && npm test && npm run test:e2e",
+    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern playwright-report --ignore-pattern test-results"
   },
   "dependencies": {
     "lucide-react": "^1.24.0",
@@ -23,8 +27,10 @@
     "vinext": "0.0.50"
   },
   "devDependencies": {
+    "@axe-core/playwright": "^4.12.1",
     "@cloudflare/vite-plugin": "^1.44.0",
     "@cloudflare/workers-types": "^5.20260712.1",
+    "@playwright/test": "^1.61.1",
     "@tailwindcss/postcss": "4.2.1",
     "@types/node": "22.19.19",
     "@types/react": "19.2.14",

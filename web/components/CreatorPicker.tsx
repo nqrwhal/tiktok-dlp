@@ -1,6 +1,7 @@
 "use client";
 
 import { Check, ChevronDown } from "lucide-react";
+import { usePathname } from "next/navigation";
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type { Creator } from "../lib/types";
 import styles from "./creator-picker.module.css";
@@ -17,10 +18,12 @@ export function CreatorPicker({
   compact?: boolean;
 }) {
   const [open, setOpen] = useState(false);
+  const pathname = usePathname();
   const listboxId = useId();
   const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const optionRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const openFocusIndexRef = useRef<number | null>(null);
   const selected = creators.find((creator) => creator.id === value);
   const selectedIndex = Math.max(0, creators.findIndex((creator) => creator.id === value) + 1);
 
@@ -51,31 +54,57 @@ export function CreatorPicker({
   }, [closeAndRestoreFocus, open]);
 
   useEffect(() => {
+    // A persistent picker should never carry an open popup onto the next route.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setOpen(false);
+  }, [pathname]);
+
+  useEffect(() => {
     if (!open) return;
-    window.requestAnimationFrame(() => focusOption(selectedIndex));
+    const focusIndex = openFocusIndexRef.current ?? selectedIndex;
+    openFocusIndexRef.current = null;
+    const frame = window.requestAnimationFrame(() => focusOption(focusIndex));
+    return () => window.cancelAnimationFrame(frame);
   }, [focusOption, open, selectedIndex]);
 
   return (
-    <div className={`${styles.picker} ${compact ? styles.compact : ""}`} ref={rootRef}>
+    <div
+      className={`${styles.picker} ${compact ? styles.compact : ""}`}
+      ref={rootRef}
+      data-open={open || undefined}
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget)) setOpen(false);
+      }}
+    >
       <button
         className={styles.trigger}
         ref={triggerRef}
         type="button"
-        onClick={() => setOpen((current) => !current)}
+        onClick={() => {
+          if (open) {
+            setOpen(false);
+            return;
+          }
+          openFocusIndexRef.current = selectedIndex;
+          setOpen(true);
+        }}
         onKeyDown={(event) => {
           if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
           event.preventDefault();
-          setOpen(true);
-          window.requestAnimationFrame(() => {
-            focusOption(event.key === "ArrowDown" ? selectedIndex : selectedIndex - 1);
-          });
+          const focusIndex = event.key === "ArrowDown" ? selectedIndex : selectedIndex - 1;
+          if (open) focusOption(focusIndex);
+          else {
+            openFocusIndexRef.current = focusIndex;
+            setOpen(true);
+          }
         }}
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-controls={listboxId}
+        aria-label={`Creator filter: ${selected ? `@${selected.username}` : value !== "all" ? `@${value}` : "All creators"}`}
       >
         <span>{selected ? `@${selected.username}` : value !== "all" ? `@${value}` : "All creators"}</span>
-        <ChevronDown size={15} />
+        <ChevronDown aria-hidden="true" size={15} />
       </button>
       {open ? (
         <div

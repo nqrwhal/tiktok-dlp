@@ -21,26 +21,17 @@ export function mergeVideoPage(current, page) {
   };
 }
 
-export function reconcileVersionedIds(
-  serverIds,
-  currentIds,
-  versionsAtRequest,
-  currentVersions,
+export function bookmarkedVideoPageParams(
+  cursor = "",
+  { creatorId = "", username = "", limit = MAX_VIDEO_PAGE_SIZE } = {},
 ) {
-  const server = new Set(serverIds);
-  const reconciled = new Set();
-  for (const id of new Set([...server, ...currentIds])) {
-    const versionAtRequest = versionsAtRequest.get(id) || 0;
-    const currentVersion = currentVersions.get(id) || 0;
-    if (currentVersion === versionAtRequest ? server.has(id) : currentIds.has(id)) {
-      reconciled.add(id);
-    }
-  }
-  return reconciled;
-}
-
-export function bookmarkedVideoPageParams(cursor = "") {
-  const params = new URLSearchParams({ bookmarked: "1", page: "1", limit: String(MAX_VIDEO_PAGE_SIZE) });
+  const params = new URLSearchParams({
+    bookmarked: "1",
+    page: "1",
+    limit: String(boundedVideoPageLimit(limit, true)),
+  });
   if (cursor) params.set("cursor", cursor);
+  if (creatorId) params.set("creatorId", creatorId);
+  if (username) params.set("username", username);
   return params;
 }

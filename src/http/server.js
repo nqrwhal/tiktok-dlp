@@ -51,6 +51,17 @@ export function createHttpHandler({ config, store, creatorImportService = null }
         });
       }
 
+      const creatorMonitoringMatch = url.pathname.match(/^\/api\/creators\/([^/]+)\/monitoring$/);
+      if (creatorMonitoringMatch) {
+        let username = '';
+        try {
+          username = decodeURIComponent(creatorMonitoringMatch[1]);
+        } catch {
+          return sendJson(res, 400, { error: 'Creator username is invalid' });
+        }
+        return handleCreatorMonitoringRequest(req, res, { config, store, username });
+      }
+
       const creatorVideosMatch = url.pathname.match(/^\/api\/creators\/([^/]+)\/videos$/);
       if (creatorVideosMatch) {
         let username = '';
@@ -85,6 +96,40 @@ export function createHttpHandler({ config, store, creatorImportService = null }
       }, { head: req.method === 'HEAD' });
     }
   };
+}
+
+export async function handleCreatorMonitoringRequest(req, res, { config, store, username }) {
+  if (!isImportAuthorized(req, config)) {
+    return sendJson(res, 401, { error: 'Unauthorized' });
+  }
+  if (req.method !== 'DELETE') {
+    return sendJson(res, 405, { error: 'Method not allowed' });
+  }
+
+  try {
+    const normalizedUsername = normalizeUsername(username);
+    const watch = store.getWatch(normalizedUsername)
+      ?? store.listWatches().find((entry) => (
+        String(entry.username).toLowerCase() === normalizedUsername.toLowerCase()
+      ));
+    const watchedUsername = String(watch?.username || normalizedUsername);
+    const subscriptionCount = watch
+      ? (store.listWatchSubscriptions?.(watchedUsername) ?? []).length
+      : 0;
+    const removed = watch ? store.removeWatch(watchedUsername) : false;
+
+    return sendJson(res, 200, {
+      username: watchedUsername,
+      monitoring: false,
+      removed,
+      removedSubscriptions: removed ? subscriptionCount : 0,
+    });
+  } catch (error) {
+    const statusCode = Number(error?.statusCode) || 400;
+    return sendJson(res, statusCode, {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 }
 
 export async function handleVideoRequest(req, res, { config, store, fileId }) {

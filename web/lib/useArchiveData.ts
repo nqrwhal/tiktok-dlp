@@ -42,12 +42,15 @@ export function useArchiveData({
   const liveMode = Boolean(configuredBase);
   const [creators, setCreators] = useState(liveMode ? [] : fallbackCreators);
   const [videos, setVideos] = useState(liveMode ? [] : fallbackVideos);
+  const [bookmarkedVideos, setBookmarkedVideos] = useState(liveMode ? [] : fallbackVideos);
   const [stats, setStats] = useState(liveMode ? emptyStats : fallbackStats);
   const [source, setSource] = useState<ArchiveDataSource>(configuredBase ? "loading" : "mock");
   const [error, setError] = useState("");
   const [revision, setRevision] = useState(0);
   const [nextVideoCursor, setNextVideoCursor] = useState<string | null>(null);
   const [nextBookmarkCursor, setNextBookmarkCursor] = useState<string | null>(null);
+  const [bookmarkedVideosError, setBookmarkedVideosError] = useState("");
+  const [bookmarkedVideosLoaded, setBookmarkedVideosLoaded] = useState(!liveMode);
   const [loadingMoreVideos, setLoadingMoreVideos] = useState(false);
   const [loadingBookmarkedVideos, setLoadingBookmarkedVideos] = useState(false);
   const hasLoadedLiveData = useRef(false);
@@ -58,9 +61,12 @@ export function useArchiveData({
   const loadMoreRetryAfterRef = useRef(0);
   const videoRequestKeyRef = useRef("");
   const videoGenerationRef = useRef(0);
+  const bookmarkGenerationRef = useRef(0);
+  const bookmarkRequestControllerRef = useRef<AbortController | null>(null);
   const refresh = useCallback(() => setRevision((current) => current + 1), []);
   const base = configuredBase?.replace(/\/+$/, "") || "";
   const videoPageLimit = boundedVideoPageLimit(videoLimit, paginateVideos);
+  const bookmarkScopeKey = `${videoCreatorId}\0${videoUsername}`;
 
   const makeVideoParams = useCallback((cursor = "") => {
     const videoParams = new URLSearchParams({ limit: String(videoPageLimit) });
@@ -172,54 +178,94 @@ export function useArchiveData({
     }
   }, [configuredBase, fetchVideoPage, includeVideos, paginateVideos]);
 
-  const fetchBookmarkedPage = useCallback(async (cursor = "") => {
-    const params = bookmarkedVideoPageParams(cursor);
+  useEffect(() => {
+    bookmarkGenerationRef.current += 1;
+    bookmarkRequestControllerRef.current?.abort();
+    bookmarkRequestControllerRef.current = null;
+    nextBookmarkCursorRef.current = null;
+    loadingBookmarkedVideosRef.current = false;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setBookmarkedVideos(configuredBase ? [] : fallbackVideos);
+    setNextBookmarkCursor(null);
+    setLoadingBookmarkedVideos(false);
+    setBookmarkedVideosError("");
+    setBookmarkedVideosLoaded(!configuredBase);
+    return () => bookmarkRequestControllerRef.current?.abort();
+  }, [bookmarkScopeKey, configuredBase, fallbackVideos]);
+
+  const fetchBookmarkedPage = useCallback(async (cursor = "", signal?: AbortSignal) => {
+    const params = bookmarkedVideoPageParams(cursor, {
+      creatorId: videoCreatorId,
+      username: videoUsername,
+      limit: videoPageLimit,
+    });
     const payload = await fetch(`${base}/api/videos?${params}`, {
       cache: "no-store",
+      signal,
     }).then(assertJsonResponse<SavedVideo[] | FeedPage>);
     return normalizeVideoPage(payload);
-  }, [base]);
+  }, [base, videoCreatorId, videoPageLimit, videoUsername]);
 
   const loadBookmarkedVideos = useCallback(async () => {
-    if (!configuredBase || !includeVideos || loadingBookmarkedVideosRef.current) return [] as SavedVideo[];
+    if (!configuredBase || !includeVideos) return [] as SavedVideo[];
+    bookmarkRequestControllerRef.current?.abort();
+    const controller = new AbortController();
+    bookmarkRequestControllerRef.current = controller;
+    const generation = bookmarkGenerationRef.current + 1;
+    bookmarkGenerationRef.current = generation;
     loadingBookmarkedVideosRef.current = true;
     setLoadingBookmarkedVideos(true);
+    setBookmarkedVideosError("");
     try {
-      const page = await fetchBookmarkedPage();
-      setVideos((current) => mergeVideoPage(current, page).videos);
+      const page = await fetchBookmarkedPage("", controller.signal);
+      if (controller.signal.aborted || generation !== bookmarkGenerationRef.current) return [] as SavedVideo[];
+      setBookmarkedVideos(page.items);
+      setBookmarkedVideosLoaded(true);
       nextBookmarkCursorRef.current = page.nextCursor;
       setNextBookmarkCursor(page.nextCursor);
       return page.items;
     } catch (nextError) {
-      setError(errorMessage("bookmarked videos", nextError));
+      if (controller.signal.aborted || generation !== bookmarkGenerationRef.current) return [] as SavedVideo[];
+      setBookmarkedVideosError(errorMessage("bookmarked videos", nextError));
       return [] as SavedVideo[];
     } finally {
-      loadingBookmarkedVideosRef.current = false;
-      setLoadingBookmarkedVideos(false);
+      if (generation === bookmarkGenerationRef.current) {
+        loadingBookmarkedVideosRef.current = false;
+        setLoadingBookmarkedVideos(false);
+      }
     }
   }, [configuredBase, fetchBookmarkedPage, includeVideos]);
 
   const loadMoreBookmarkedVideos = useCallback(async () => {
     const cursor = nextBookmarkCursorRef.current;
     if (!configuredBase || !includeVideos || !cursor || loadingBookmarkedVideosRef.current) return;
+    const generation = bookmarkGenerationRef.current;
+    const controller = new AbortController();
+    bookmarkRequestControllerRef.current = controller;
     loadingBookmarkedVideosRef.current = true;
     setLoadingBookmarkedVideos(true);
+    setBookmarkedVideosError("");
     try {
-      const page = await fetchBookmarkedPage(cursor);
-      setVideos((current) => mergeVideoPage(current, page).videos);
+      const page = await fetchBookmarkedPage(cursor, controller.signal);
+      if (controller.signal.aborted || generation !== bookmarkGenerationRef.current) return;
+      setBookmarkedVideos((current) => mergeVideoPage(current, page).videos);
       nextBookmarkCursorRef.current = page.nextCursor;
       setNextBookmarkCursor(page.nextCursor);
     } catch (nextError) {
-      setError(errorMessage("more bookmarked videos", nextError));
+      if (controller.signal.aborted || generation !== bookmarkGenerationRef.current) return;
+      setBookmarkedVideosError(errorMessage("more bookmarked videos", nextError));
     } finally {
-      loadingBookmarkedVideosRef.current = false;
-      setLoadingBookmarkedVideos(false);
+      if (generation === bookmarkGenerationRef.current) {
+        loadingBookmarkedVideosRef.current = false;
+        setLoadingBookmarkedVideos(false);
+      }
     }
   }, [configuredBase, fetchBookmarkedPage, includeVideos]);
 
   return {
     creators,
     videos,
+    bookmarkedVideos,
     stats,
     source,
     error,
@@ -228,6 +274,8 @@ export function useArchiveData({
     hasMoreBookmarkedVideos: Boolean(nextBookmarkCursor),
     loadingMoreVideos,
     loadingBookmarkedVideos,
+    bookmarkedVideosError,
+    bookmarkedVideosLoaded,
     loadMoreVideos,
     loadBookmarkedVideos,
     loadMoreBookmarkedVideos,

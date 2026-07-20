@@ -32,8 +32,8 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
     const menuButton = menuButtonRef.current;
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
-    const firstLink = sidebarRef.current?.querySelector<HTMLElement>("nav a");
-    window.requestAnimationFrame(() => firstLink?.focus());
+    const initialControl = sidebarRef.current?.querySelector<HTMLElement>("[data-drawer-initial]");
+    window.requestAnimationFrame(() => initialControl?.focus());
 
     function handleKeyDown(event: KeyboardEvent) {
       if (event.key === "Escape") {
@@ -52,13 +52,24 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
         first?.focus();
       }
     }
+    function handlePointerDown(event: PointerEvent) {
+      if (!sidebarRef.current?.contains(event.target as Node)) setMenuOpen(false);
+    }
     document.addEventListener("keydown", handleKeyDown);
+    document.addEventListener("pointerdown", handlePointerDown);
     return () => {
       document.removeEventListener("keydown", handleKeyDown);
+      document.removeEventListener("pointerdown", handlePointerDown);
       document.body.style.overflow = previousOverflow;
       window.requestAnimationFrame(() => menuButton?.focus());
     };
   }, [menuOpen]);
+
+  useEffect(() => {
+    // Client-side history changes can happen without activating a drawer link.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setMenuOpen(false);
+  }, [pathname]);
 
   useEffect(() => {
     const desktop = window.matchMedia("(min-width: 980px)");
@@ -71,7 +82,9 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
 
   return (
     <div className={styles.dashboardShell}>
-      <header className={styles.mobileHeader}>
+      <a className={styles.skipLink} href="#dashboard-content" inert={menuOpen || undefined}>Skip to content</a>
+
+      <header className={styles.mobileHeader} inert={menuOpen || undefined}>
         <Link className={styles.brand} href="/">
           <span>R</span> rewind
         </Link>
@@ -82,9 +95,9 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
           type="button"
           aria-expanded={menuOpen}
           aria-controls="dashboard-navigation"
-          aria-label={menuOpen ? "Close navigation" : "Open navigation"}
+          aria-label="Open navigation"
         >
-          {menuOpen ? <X size={21} /> : <Menu size={21} />}
+          <Menu size={21} />
         </button>
       </header>
 
@@ -93,13 +106,26 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
         id="dashboard-navigation"
         ref={sidebarRef}
         aria-label="Dashboard navigation"
+        role={menuOpen ? "dialog" : undefined}
+        aria-modal={menuOpen || undefined}
       >
-        <Link className={styles.brand} href="/">
-          <span>R</span> rewind
-        </Link>
+        <div className={styles.sidebarHeader}>
+          <Link className={styles.brand} href="/" onClick={() => setMenuOpen(false)}>
+            <span>R</span> rewind
+          </Link>
+          <button
+            className={styles.sidebarCloseButton}
+            data-drawer-initial
+            type="button"
+            aria-label="Close navigation"
+            onClick={() => setMenuOpen(false)}
+          >
+            <X size={21} />
+          </button>
+        </div>
 
         <div className={styles.sidebarLabel}>Manage archive</div>
-        <nav className={styles.sidebarNav}>
+        <nav className={styles.sidebarNav} aria-label="Dashboard navigation">
           {navigation.map(({ href, label, icon: Icon }) => {
             const isActive =
               href === "/dashboard" ? pathname === href : pathname.startsWith(href);
@@ -109,6 +135,7 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
                 href={href}
                 key={href}
                 onClick={() => setMenuOpen(false)}
+                aria-current={isActive ? "page" : undefined}
               >
                 <Icon size={19} />
                 <span>{label}</span>
@@ -126,15 +153,17 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
       </aside>
 
       {menuOpen ? (
-        <button
-          className={styles.menuScrim}
-          onClick={() => setMenuOpen(false)}
-          type="button"
-          aria-label="Close navigation"
-        />
+        <div className={styles.menuScrim} aria-hidden="true" />
       ) : null}
 
-      <main className={styles.dashboardMain}>{children}</main>
+      <main
+        className={styles.dashboardMain}
+        id="dashboard-content"
+        inert={menuOpen || undefined}
+        tabIndex={-1}
+      >
+        {children}
+      </main>
     </div>
   );
 }

@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  BellOff,
   CircleAlert,
   DownloadCloud,
   Grid3X3,
@@ -44,6 +45,9 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
   const [expandedFailures, setExpandedFailures] = useState<Set<number>>(() => new Set());
   const [submittingImport, setSubmittingImport] = useState(false);
   const [actionCreatorId, setActionCreatorId] = useState("");
+  const [monitorCreator, setMonitorCreator] = useState<Creator | null>(null);
+  const [monitorError, setMonitorError] = useState("");
+  const [stoppingMonitoring, setStoppingMonitoring] = useState(false);
   const [deleteCreator, setDeleteCreator] = useState<Creator | null>(null);
   const [deleteConfirmation, setDeleteConfirmation] = useState("");
   const [deleteError, setDeleteError] = useState("");
@@ -53,6 +57,10 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
   const liveCreators = archive.creators;
   const refreshArchive = archive.refresh;
   const { dialogRef, returnFocusRef } = useModalDialog(Boolean(deleteCreator), closeDeleteConfirmation);
+  const {
+    dialogRef: monitorDialogRef,
+    returnFocusRef: monitorReturnFocusRef,
+  } = useModalDialog(Boolean(monitorCreator), closeMonitorConfirmation);
 
   const loadImports = useCallback(async () => {
     if (!apiBase) return;
@@ -262,6 +270,52 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
         delete next[entry.id];
         return next;
       });
+    }
+  }
+
+  function openMonitorConfirmation(creator: Creator) {
+    monitorReturnFocusRef.current = document.getElementById(`creator-actions-${creator.id}`);
+    setActionCreatorId("");
+    setMonitorCreator(creator);
+    setMonitorError("");
+    setActionMessage("");
+  }
+
+  function closeMonitorConfirmation() {
+    if (stoppingMonitoring) return;
+    setMonitorCreator(null);
+    setMonitorError("");
+  }
+
+  async function stopCreatorMonitoring() {
+    if (!monitorCreator || stoppingMonitoring) return;
+    if (!apiBase) {
+      setMonitorError("The live backend connection is required to turn off monitoring.");
+      return;
+    }
+
+    setStoppingMonitoring(true);
+    setMonitorError("");
+    try {
+      const response = await fetch(
+        `${apiBase}/api/creators/${encodeURIComponent(monitorCreator.username)}/monitoring`,
+        { method: "DELETE" },
+      );
+      const payload = await response.json().catch(() => ({})) as { error?: string };
+      if (!response.ok) {
+        throw new Error(payload.error || `Monitoring update failed (${response.status})`);
+      }
+
+      setActionMessage(`Monitoring turned off for @${monitorCreator.username}. Saved videos were kept.`);
+      if (monitorCreator.videoCount === 0) {
+        monitorReturnFocusRef.current = document.getElementById("creator-import-button");
+      }
+      closeMonitorConfirmation();
+      archive.refresh();
+    } catch (error) {
+      setMonitorError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setStoppingMonitoring(false);
     }
   }
 
@@ -487,7 +541,7 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
             placeholder="Search creators"
           />
         </label>
-        <span className={styles.resultCount}>{filtered.length} creators</span>
+        <span className={styles.resultCount} role="status">{filtered.length} creators</span>
       </div>
 
       {actionMessage ? <p className={styles.actionMessage} role="status">{actionMessage}</p> : null}
@@ -508,7 +562,13 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
               >
                 {creator.initials}
               </span>
-              <div className={styles.creatorActions} data-creator-actions>
+              <div
+                className={styles.creatorActions}
+                data-creator-actions
+                onBlur={(event) => {
+                  if (!event.currentTarget.contains(event.relatedTarget)) setActionCreatorId("");
+                }}
+              >
                 <button
                   className={styles.creatorMenuTrigger}
                   id={`creator-actions-${creator.id}`}
@@ -521,19 +581,36 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
                   <MoreHorizontal size={20} />
                 </button>
                 {actionCreatorId === creator.id ? (
-                  <div className={styles.creatorActionMenu} id={`creator-menu-${creator.id}`}>
+                  <div
+                    className={styles.creatorActionMenu}
+                    id={`creator-menu-${creator.id}`}
+                    role="group"
+                    aria-label={`Actions for @${creator.username}`}
+                  >
                     <Link
                       href={`/creator?creator=${encodeURIComponent(creator.id)}`}
+                      onClick={() => setActionCreatorId("")}
                     >
                       <Grid3X3 size={15} />
                       Open profile
                     </Link>
                     <Link
                       href={`/dashboard/videos?creator=${encodeURIComponent(creator.id)}&username=${encodeURIComponent(creator.username)}`}
+                      onClick={() => setActionCreatorId("")}
                     >
                       <Library size={15} />
                       View videos
                     </Link>
+                    {creator.enabled ? (
+                      <button
+                        className={styles.creatorActionWarning}
+                        type="button"
+                        onClick={() => openMonitorConfirmation(creator)}
+                      >
+                        <BellOff size={15} />
+                        Turn off monitoring
+                      </button>
+                    ) : null}
                     <button
                       className={styles.creatorActionDanger}
                       type="button"
@@ -581,6 +658,46 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
               : archive.source === "error" ? "Could not load creators" : "No matching creators"}
           </strong>
           <span>{archive.source === "error" ? "Retry the live archive connection." : "Try a different search term."}</span>
+        </div>
+      ) : null}
+
+      {monitorCreator ? (
+        <div
+          className={styles.confirmScrim}
+          onPointerDown={(event) => {
+            if (event.target === event.currentTarget && !stoppingMonitoring) closeMonitorConfirmation();
+          }}
+        >
+          <section
+            className={styles.confirmDialog}
+            ref={monitorDialogRef}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="monitor-creator-title"
+          >
+            <div className={`${styles.confirmIcon} ${styles.monitorConfirmIcon}`}><BellOff size={19} /></div>
+            <div>
+              <h2 id="monitor-creator-title">Turn off monitoring for @{monitorCreator.username}?</h2>
+              <p>
+                This stops future TikTok checks and Discord alerts for every configured destination. {monitorCreator.videoCount > 0
+                  ? `${monitorCreator.videoCount} saved ${monitorCreator.videoCount === 1 ? "video stays" : "videos stay"} in the archive.`
+                  : "There are no saved videos, so this creator will disappear from the dashboard."}
+              </p>
+            </div>
+            {monitorError ? <p className={styles.importError} role="alert">{monitorError}</p> : null}
+            <div className={styles.confirmActions}>
+              <button data-dialog-initial type="button" onClick={closeMonitorConfirmation} disabled={stoppingMonitoring}>Cancel</button>
+              <button
+                className={styles.confirmWarningButton}
+                type="button"
+                disabled={stoppingMonitoring}
+                onClick={() => void stopCreatorMonitoring()}
+              >
+                {stoppingMonitoring ? <LoaderCircle className={styles.spinning} size={15} /> : <BellOff size={15} />}
+                {stoppingMonitoring ? "Turning off" : "Turn off monitoring"}
+              </button>
+            </div>
+          </section>
         </div>
       ) : null}
 

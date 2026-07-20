@@ -1,16 +1,42 @@
 @import "tailwindcss";
 
 :root {
-  --ink: #080a09;
-  --panel: #111411;
-  --panel-raised: #181c18;
-  --line: rgba(244, 247, 239, 0.11);
-  --muted: #9ca49a;
-  --paper: #f4f7ef;
-  --acid: #c9ff4a;
-  --coral: #ff6b5d;
-  --cyan: #75e6d8;
-  --shadow: 0 24px 80px rgba(0, 0, 0, 0.42);
+  --color-bg: #090b0a;
+  --color-surface: #111411;
+  --color-surface-raised: #171a18;
+  --color-surface-hover: #1c201d;
+  --color-border: #2a2f2b;
+  --color-border-strong: #3a423b;
+  --color-text: #f2f5ef;
+  --color-text-muted: #a3aba1;
+  --color-text-subtle: #7f887e;
+  --color-accent: #c9ff4a;
+  --color-danger: #ff786d;
+  --color-warning: #f4b85e;
+  --color-info: #75e6d8;
+  --radius-sm: 6px;
+  --radius-md: 9px;
+  --radius-lg: 12px;
+  --control-height: 44px;
+  --shadow-popover: 0 18px 48px rgba(0, 0, 0, 0.5);
+  --shadow-dialog: 0 28px 80px rgba(0, 0, 0, 0.6);
+  --z-header: 20;
+  --z-dropdown: 40;
+  --z-scrim: 60;
+  --z-drawer: 70;
+  --z-dialog: 100;
+
+  /* Compatibility aliases for the feed and creator surfaces. */
+  --ink: var(--color-bg);
+  --panel: var(--color-surface);
+  --panel-raised: var(--color-surface-raised);
+  --line: var(--color-border);
+  --muted: var(--color-text-muted);
+  --paper: var(--color-text);
+  --acid: var(--color-accent);
+  --coral: var(--color-danger);
+  --cyan: var(--color-info);
+  --shadow: var(--shadow-dialog);
 }
 
 * {
@@ -29,6 +55,10 @@ body {
   color: var(--paper);
   font-family: var(--font-geist-sans), system-ui, sans-serif;
   text-rendering: optimizeLegibility;
+}
+
+:where(button, a, input, select, textarea) {
+  accent-color: var(--color-accent);
 }
 
 button,
@@ -75,8 +105,8 @@ a:focus-visible,
 input:focus-visible,
 select:focus-visible,
 textarea:focus-visible {
-  outline: 2px solid var(--acid);
-  outline-offset: 3px;
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
 }
 
 @media (prefers-reduced-motion: reduce) {

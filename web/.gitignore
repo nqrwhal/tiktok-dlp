@@ -43,3 +43,6 @@ next-env.d.ts
 /outputs/
 /work/
 /.live-cache/
+/playwright-report/
+/test-results/
+/blob-report/

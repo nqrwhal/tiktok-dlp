@@ -67,7 +67,9 @@ export function SettingsForm() {
       </section>
 
       <div className={styles.settingsFooter}>
-        <span>{saved ? <><Check size={15} /> Settings saved</> : "These preferences apply to this browser."}</span>
+        <span role="status" aria-live="polite" aria-atomic="true">
+          {saved ? <><Check aria-hidden="true" size={15} /> Settings saved</> : "These preferences apply to this browser."}
+        </span>
         <button className={styles.primaryButton} type="submit">
           <Save size={16} /> Save changes
         </button>

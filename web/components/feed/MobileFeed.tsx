@@ -28,8 +28,8 @@ import {
   writeMutedPreference,
 } from "../../lib/playback-preferences";
 import type { Creator, SavedVideo } from "../../lib/types";
-import { reconcileVersionedIds } from "../../lib/archive-data-state.mjs";
 import { useArchiveData } from "../../lib/useArchiveData";
+import { useBookmarks } from "../../lib/useBookmarks";
 import { useModalDialog } from "../../lib/useModalDialog";
 import styles from "./mobile-feed.module.css";
 
@@ -38,8 +38,6 @@ interface MobileFeedProps {
   videos: SavedVideo[];
 }
 
-const BOOKMARK_STORAGE_KEY = "rewind-bookmarks";
-const BOOKMARK_MIGRATION_STORAGE_KEY = "rewind-bookmarks-server-migrated-v1";
 const FEED_HINT_STORAGE_KEY = "rewind-feed-hint-seen";
 const VIDEO_PAGE_SIZE = 36;
 const CARD_WINDOW_SIZE = 7;
@@ -65,6 +63,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
     paginateVideos: true,
     includeStats: false,
   });
+  const bookmarks = useBookmarks(apiBase);
   const liveCreators = archive.creators;
   const archiveVideos = archive.videos;
   const {
@@ -90,8 +89,8 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
   const [controlsVisible, setControlsVisible] = useState(false);
   const [menuVideoId, setMenuVideoId] = useState("");
   const [feedView, setFeedView] = useState<"all" | "bookmarks">("all");
-  const [saved, setSaved] = useState<Set<string>>(() => new Set());
-  const [bookmarksReady, setBookmarksReady] = useState(false);
+  const saved = bookmarks.visibleIds;
+  const bookmarksReady = bookmarks.ready;
   const [shareStatus, setShareStatus] = useState("");
   const [deleteVideo, setDeleteVideo] = useState<SavedVideo | null>(null);
   const [deleteError, setDeleteError] = useState("");
@@ -106,36 +105,60 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
   const feedScrollerRef = useRef<HTMLDivElement>(null);
   const progressRef = useRef<HTMLSpanElement>(null);
   const seekRef = useRef<HTMLInputElement>(null);
+  const actionMenuRef = useRef<HTMLDivElement>(null);
+  const pendingBookmarkFocusRef = useRef<string | null>(null);
   const wasPausedBeforeDeleteRef = useRef(false);
-  const bookmarkMutationVersionsRef = useRef(new Map<string, number>());
   const { dialogRef, returnFocusRef } = useModalDialog(Boolean(deleteVideo), closeDeleteVideo);
 
-  const liveVideos = useMemo(
+  const allLiveVideos = useMemo(
     () => archiveVideos.filter((video) => !removedVideoIds.has(video.id)),
     [archiveVideos, removedVideoIds],
   );
+  const liveBookmarkedVideos = useMemo(() => {
+    const byId = new Map(
+      archive.bookmarkedVideos
+        .filter((video) => !removedVideoIds.has(video.id))
+        .map((video) => [video.id, video]),
+    );
+    for (const video of allLiveVideos) {
+      if (saved.has(video.id) && !byId.has(video.id)) byId.set(video.id, video);
+    }
+    return [...byId.values()];
+  }, [allLiveVideos, archive.bookmarkedVideos, removedVideoIds, saved]);
 
   const resolvedCreatorId = useMemo(
     () => resolveCreatorId(creatorId, liveCreators),
     [creatorId, liveCreators],
   );
-  const orderedVideos = useMemo(
-    () => shuffleVideoPages(liveVideos, shuffleSeed, VIDEO_PAGE_SIZE),
-    [liveVideos, shuffleSeed],
+  const orderedAllVideos = useMemo(
+    () => shuffleVideoPages(allLiveVideos, shuffleSeed, VIDEO_PAGE_SIZE),
+    [allLiveVideos, shuffleSeed],
   );
-  const creatorVideos = useMemo(
+  const orderedBookmarkedVideos = useMemo(
+    () => shuffleVideoPages(liveBookmarkedVideos, shuffleSeed, VIDEO_PAGE_SIZE),
+    [liveBookmarkedVideos, shuffleSeed],
+  );
+  const allCreatorVideos = useMemo(
     () =>
       resolvedCreatorId === "all"
-        ? orderedVideos
-        : orderedVideos.filter((video) => video.creatorId === resolvedCreatorId),
-    [orderedVideos, resolvedCreatorId],
+        ? orderedAllVideos
+        : orderedAllVideos.filter((video) => video.creatorId === resolvedCreatorId),
+    [orderedAllVideos, resolvedCreatorId],
   );
-  const filteredVideos = useMemo(
-    () => feedView === "bookmarks"
-      ? creatorVideos.filter((video) => saved.has(video.id))
-      : creatorVideos,
-    [creatorVideos, feedView, saved],
+  const bookmarkedCreatorVideos = useMemo(
+    () => {
+      const videosForCreator = resolvedCreatorId === "all"
+        ? orderedBookmarkedVideos
+        : orderedBookmarkedVideos.filter((video) => video.creatorId === resolvedCreatorId);
+      return videosForCreator.filter((video) => saved.has(video.id));
+    },
+    [orderedBookmarkedVideos, resolvedCreatorId, saved],
   );
+  const filteredVideos = feedView === "bookmarks" ? bookmarkedCreatorVideos : allCreatorVideos;
+  const bookmarkError = bookmarks.error || archive.bookmarkedVideosError;
+  const bookmarkPagePending = feedView === "bookmarks"
+    && !bookmarkError
+    && (!bookmarksReady || !archive.bookmarkedVideosLoaded || loadingBookmarkedVideos);
   const controlsAvailable = filteredVideos.length > 0;
   const hasActiveVideo = filteredVideos.some((video) => video.id === activeId);
   const requestedVideoPending = Boolean(requestedVideoId)
@@ -147,6 +170,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
       ? ""
       : filteredVideos[0]?.id ?? "";
   const activeIndex = filteredVideos.findIndex((video) => video.id === currentActiveId);
+  const activeVideo = activeIndex >= 0 ? filteredVideos[activeIndex] : undefined;
   const windowAnchor = Math.max(activeIndex, 0);
   const unclampedWindowStart = Math.max(0, windowAnchor - CARD_WINDOW_BEHIND);
   const windowStart = Math.max(
@@ -236,75 +260,82 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
   }, [mutePreferenceReady, muted]);
 
   useEffect(() => {
-    const controller = new AbortController();
-    let localBookmarks = new Set<string>();
-    try {
-      const stored = JSON.parse(window.localStorage.getItem(BOOKMARK_STORAGE_KEY) || "[]");
-      if (Array.isArray(stored)) {
-        localBookmarks = new Set(stored.filter((id): id is string => typeof id === "string"));
-        // Keep the existing device state visible while the server responds.
-        // eslint-disable-next-line react-hooks/set-state-in-effect
-        setSaved(localBookmarks);
-      }
-    } catch {
-      window.localStorage.removeItem(BOOKMARK_STORAGE_KEY);
-    }
-
-    if (!apiBase) {
-      setBookmarksReady(true);
-      return () => controller.abort();
-    }
-
-    const shouldMigrate = localBookmarks.size > 0
-      && window.localStorage.getItem(BOOKMARK_MIGRATION_STORAGE_KEY) !== "1";
-    const bookmarkVersionsAtRequest = new Map(bookmarkMutationVersionsRef.current);
-    fetch(`${apiBase}/api/bookmarks`, {
-      method: shouldMigrate ? "POST" : "GET",
-      headers: shouldMigrate ? { "content-type": "application/json" } : undefined,
-      body: shouldMigrate ? JSON.stringify({ fileIds: [...localBookmarks] }) : undefined,
-      cache: "no-store",
-      signal: controller.signal,
-    })
-      .then(async (response) => {
-        const payload = await response.json().catch(() => ({})) as { fileIds?: unknown; error?: string };
-        if (!response.ok) throw new Error(payload.error || `Bookmark sync failed (${response.status})`);
-        return Array.isArray(payload.fileIds)
-          ? payload.fileIds.filter((id): id is number | string => typeof id === "number" || typeof id === "string")
-          : [];
-      })
-      .then((fileIds) => {
-        if (controller.signal.aborted) return;
-        setSaved((current) => reconcileVersionedIds(
-          fileIds.map(String),
-          current,
-          bookmarkVersionsAtRequest,
-          bookmarkMutationVersionsRef.current,
-        ));
-        window.localStorage.setItem(BOOKMARK_MIGRATION_STORAGE_KEY, "1");
-      })
-      .catch((error: unknown) => {
-        if (controller.signal.aborted) return;
-        setFeedStatus(error instanceof Error ? error.message : "Bookmarks could not sync.");
-      })
-      .finally(() => {
-        if (!controller.signal.aborted) setBookmarksReady(true);
-      });
-    return () => controller.abort();
-  }, [apiBase]);
-
-  useEffect(() => {
-    if (!bookmarksReady) return;
-    window.localStorage.setItem(BOOKMARK_STORAGE_KEY, JSON.stringify([...saved]));
-  }, [bookmarksReady, saved]);
-
-  useEffect(() => {
     if (feedView !== "bookmarks" || !bookmarksReady) return;
     void loadBookmarkedVideos();
-  }, [bookmarksReady, feedView, loadBookmarkedVideos]);
+  }, [bookmarks.serverRevision, bookmarksReady, feedView, loadBookmarkedVideos]);
 
   useEffect(() => {
     activeIdRef.current = currentActiveId;
+    const focusedCard = document.activeElement instanceof Element
+      ? document.activeElement.closest<HTMLElement>("[data-feed-card]")
+      : null;
+    if (focusedCard && focusedCard.dataset.videoId !== currentActiveId) {
+      document.getElementById("feed-stage")?.focus({ preventScroll: true });
+    }
   }, [currentActiveId]);
+
+  useEffect(() => {
+    const targetId = pendingBookmarkFocusRef.current;
+    if (targetId === null || (targetId && targetId !== currentActiveId)) return;
+    const frame = window.requestAnimationFrame(() => {
+      pendingBookmarkFocusRef.current = null;
+      if (!targetId) {
+        document.getElementById("feed-bookmarks-tab")?.focus({ preventScroll: true });
+        return;
+      }
+      const target = Array.from(
+        feedScrollerRef.current?.querySelectorAll<HTMLElement>("[data-video-id]") || [],
+      ).find((node) => node.dataset.videoId === targetId);
+      target?.scrollIntoView({ block: "start", behavior: "auto" });
+      const bookmarkButton = target?.querySelector<HTMLButtonElement>("[data-bookmark-control]");
+      (bookmarkButton || document.getElementById("feed-stage"))?.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [currentActiveId, renderedVideos]);
+
+  useEffect(() => {
+    if (!menuVideoId) return;
+    const trigger = document.getElementById(`feed-more-${menuVideoId}`);
+    const focusFrame = window.requestAnimationFrame(() => {
+      actionMenuRef.current?.querySelector<HTMLElement>('a[href], button:not(:disabled)')?.focus();
+    });
+
+    function isInsideMenu(target: EventTarget | null) {
+      return target instanceof Node
+        && (actionMenuRef.current?.contains(target) || trigger?.contains(target));
+    }
+
+    function closeMenu(restoreFocus: boolean) {
+      setMenuVideoId("");
+      if (restoreFocus) {
+        window.requestAnimationFrame(() => trigger?.focus());
+      }
+    }
+
+    function handlePointerDown(event: PointerEvent) {
+      if (!isInsideMenu(event.target)) closeMenu(false);
+    }
+
+    function handleFocusIn(event: FocusEvent) {
+      if (!isInsideMenu(event.target)) closeMenu(false);
+    }
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      closeMenu(true);
+    }
+
+    document.addEventListener("pointerdown", handlePointerDown, true);
+    document.addEventListener("focusin", handleFocusIn);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      document.removeEventListener("pointerdown", handlePointerDown, true);
+      document.removeEventListener("focusin", handleFocusIn);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [menuVideoId]);
 
   useEffect(() => {
     if (!shuffleReady || requestedJumpHandled.current) return;
@@ -336,7 +367,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
           const failed = failedVideoIdsRef.current.has(id);
           setActiveId(id);
           setPreloadReadyVideoId(
-            !failed && nextVideo?.readyState >= PLAYABLE_READY_STATE ? id : "",
+            !failed && (nextVideo?.readyState ?? 0) >= PLAYABLE_READY_STATE ? id : "",
           );
           setPaused(failed || !autoplayEnabled);
           setBuffering(!failed);
@@ -393,60 +424,42 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
     [],
   );
 
-  const resetFeedPosition = useCallback((nextActiveId: string) => {
-    feedScrollerRef.current?.scrollTo({ top: 0, behavior: "auto" });
+  const resetFeedPosition = useCallback((
+    nextActiveId: string,
+    { scrollToTop = true, showControls = false }: { scrollToTop?: boolean; showControls?: boolean } = {},
+  ) => {
+    if (scrollToTop) feedScrollerRef.current?.scrollTo({ top: 0, behavior: "auto" });
     activeIdRef.current = nextActiveId;
     setActiveId(nextActiveId);
     if (nextActiveId !== currentActiveId) {
       const failed = failedVideoIdsRef.current.has(nextActiveId);
       const nextElement = videoRefs.current.get(nextActiveId);
-      setPaused(failed || !autoplayEnabled);
+      setPaused(!nextActiveId || failed || !autoplayEnabled);
       setBuffering(Boolean(nextActiveId) && !failed);
       setPlaybackError(failed ? "This archived file could not be played." : "");
       setPresentedVideoId("");
       setPreloadReadyVideoId(
-        !failed && nextElement?.readyState >= PLAYABLE_READY_STATE ? nextActiveId : "",
+        !failed && (nextElement?.readyState ?? 0) >= PLAYABLE_READY_STATE ? nextActiveId : "",
       );
       if (progressRef.current) progressRef.current.style.width = "0%";
       if (seekRef.current) seekRef.current.value = "0";
     }
-    setControlsVisible(false);
+    setControlsVisible(showControls);
     setMenuVideoId("");
   }, [autoplayEnabled, currentActiveId]);
 
   const toggleSaved = useCallback((id: string) => {
     const wasSaved = saved.has(id);
-    const willSave = !wasSaved;
     if (feedView === "bookmarks" && wasSaved) {
-      const nextVideos = creatorVideos.filter((video) => video.id !== id && saved.has(video.id));
-      resetFeedPosition(nextVideos[0]?.id || "");
+      const currentIndex = bookmarkedCreatorVideos.findIndex((video) => video.id === id);
+      const adjacentVideo = bookmarkedCreatorVideos[currentIndex + 1]
+        || bookmarkedCreatorVideos[currentIndex - 1];
+      const nextId = adjacentVideo?.id || "";
+      pendingBookmarkFocusRef.current = nextId;
+      resetFeedPosition(nextId, { scrollToTop: false, showControls: Boolean(nextId) });
     }
-    setSaved((current) => {
-      const next = new Set(current);
-      if (willSave) next.add(id);
-      else next.delete(id);
-      return next;
-    });
-
-    if (!apiBase) return;
-    const version = (bookmarkMutationVersionsRef.current.get(id) || 0) + 1;
-    bookmarkMutationVersionsRef.current.set(id, version);
-    void fetch(`${apiBase}/api/bookmarks/${encodeURIComponent(id)}`, {
-      method: willSave ? "PUT" : "DELETE",
-    }).then(async (response) => {
-      const payload = await response.json().catch(() => ({})) as { error?: string };
-      if (!response.ok) throw new Error(payload.error || `Bookmark update failed (${response.status})`);
-    }).catch((error: unknown) => {
-      if (bookmarkMutationVersionsRef.current.get(id) !== version) return;
-      setSaved((current) => {
-        const next = new Set(current);
-        if (wasSaved) next.add(id);
-        else next.delete(id);
-        return next;
-      });
-      setFeedStatus(error instanceof Error ? error.message : "Bookmark update failed.");
-    });
-  }, [apiBase, creatorVideos, feedView, resetFeedPosition, saved]);
+    bookmarks.toggle(id);
+  }, [bookmarkedCreatorVideos, bookmarks, feedView, resetFeedPosition, saved]);
 
   async function shareVideo(video: SavedVideo) {
     if (navigator.share) {
@@ -506,18 +519,13 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
       activeIdRef.current = nextId;
       setActiveId(nextId);
       setPreloadReadyVideoId(
-        !nextFailed && nextElement?.readyState >= PLAYABLE_READY_STATE ? nextId : "",
+        !nextFailed && (nextElement?.readyState ?? 0) >= PLAYABLE_READY_STATE ? nextId : "",
       );
       setPaused(!autoplayEnabled || !nextId || nextFailed);
       setBuffering(Boolean(nextId) && !nextFailed);
       setPlaybackError(nextFailed ? "This archived file could not be played." : "");
       setPresentedVideoId("");
       setControlsVisible(false);
-      setSaved((current) => {
-        const next = new Set(current);
-        next.delete(deleteVideo.id);
-        return next;
-      });
       setRemovedVideoIds((current) => new Set(current).add(deleteVideo.id));
       returnFocusRef.current = document.getElementById("feed-stage");
       setDeleteVideo(null);
@@ -541,29 +549,25 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
 
   function selectCreator(id: string) {
     if (id === resolvedCreatorId) return;
-    const nextCreatorVideos = id === "all"
-      ? orderedVideos
-      : orderedVideos.filter((video) => video.creatorId === id);
-    const nextVideos = feedView === "bookmarks"
-      ? nextCreatorVideos.filter((video) => saved.has(video.id))
-      : nextCreatorVideos;
+    const sourceVideos = feedView === "bookmarks" ? orderedBookmarkedVideos : orderedAllVideos;
+    const nextVideos = id === "all"
+      ? sourceVideos
+      : sourceVideos.filter((video) => video.creatorId === id);
     setCreatorId(id);
     resetFeedPosition(nextVideos[0]?.id || "");
   }
 
   function selectFeedView(view: "all" | "bookmarks") {
     if (view === feedView) return;
-    if (view === "bookmarks") void loadBookmarkedVideos();
-    const nextVideos = view === "bookmarks"
-      ? creatorVideos.filter((video) => saved.has(video.id))
-      : creatorVideos;
+    const nextVideos = view === "bookmarks" ? bookmarkedCreatorVideos : allCreatorVideos;
     setFeedView(view);
     resetFeedPosition(nextVideos[0]?.id || "");
   }
 
   function shuffleFeed() {
     const nextSeed = randomFeedSeed();
-    const nextOrdered = shuffleVideos(liveVideos, nextSeed);
+    const sourceVideos = feedView === "bookmarks" ? liveBookmarkedVideos : allLiveVideos;
+    const nextOrdered = shuffleVideos(sourceVideos, nextSeed);
     const nextCreatorVideos = resolvedCreatorId === "all"
       ? nextOrdered
       : nextOrdered.filter((video) => video.creatorId === resolvedCreatorId);
@@ -632,7 +636,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
         }
         const target = Array.from(feedScrollerRef.current?.querySelectorAll<HTMLElement>("[data-video-id]") || [])
           .find((node) => node.dataset.videoId === nextVideo.id);
-        target?.scrollIntoView({ block: "start", behavior: "smooth" });
+        target?.scrollIntoView({ block: "start", behavior: preferredFeedScrollBehavior() });
         return;
       }
 
@@ -683,7 +687,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
           aria-hidden={!showControlBar}
           inert={!showControlBar ? true : undefined}
         >
-          <div className={styles.feedTabs} aria-label="Feed view">
+          <div className={styles.feedTabs} role="group" aria-label="Feed view">
             <button
               className={feedView === "all" ? styles.feedTabActive : styles.feedTab}
               type="button"
@@ -694,6 +698,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
             </button>
             <button
               className={feedView === "bookmarks" ? styles.feedTabActive : styles.feedTab}
+              id="feed-bookmarks-tab"
               type="button"
               aria-pressed={feedView === "bookmarks"}
               onClick={() => selectFeedView("bookmarks")}
@@ -753,6 +758,12 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
           <p className={styles.feedHint} role="status">Tap for controls · swipe to browse</p>
         ) : null}
 
+        {activeVideo ? (
+          <p className="sr-only" role="status" aria-atomic="true">
+            {`Now viewing ${activeVideo.title} by @${activeVideo.username}, video ${activeIndex + 1}.`}
+          </p>
+        ) : null}
+
         <div id="feed-video-list" className={styles.feedScroller} ref={feedScrollerRef}>
           {windowStart > 0 ? (
             <div
@@ -782,6 +793,9 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
                 data-video-id={video.id}
                 key={video.id}
                 style={{ "--wash": video.accent } as React.CSSProperties}
+                aria-label={isActive ? `${video.title} by @${video.username}` : undefined}
+                aria-hidden={!isActive}
+                inert={!isActive ? true : undefined}
               >
                 {shouldPreload ? (
                   <video
@@ -792,7 +806,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
                     loop
                     playsInline
                     preload="auto"
-                    aria-label={`${video.title} by ${video.displayName}`}
+                    aria-hidden="true"
                     onTimeUpdate={(event) => {
                       if (activeIdRef.current !== video.id) return;
                       const element = event.currentTarget;
@@ -848,7 +862,10 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
                     decoding="async"
                   />
                 ) : null}
-                <div className={`${styles.videoTint} ${showControls ? styles.videoTintVisible : ""}`} />
+                <div
+                  className={`${styles.videoTint} ${showControls ? styles.videoTintVisible : ""}`}
+                  aria-hidden="true"
+                />
                 <button
                   className={styles.videoTapTarget}
                   type="button"
@@ -899,10 +916,12 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
                 {showControls ? <div className={`${styles.minimalActions} ${styles.minimalActionsVisible}`}>
                   <button
                     className={isSaved ? styles.bookmarkActive : undefined}
+                    data-bookmark-control
                     type="button"
                     onClick={() => toggleSaved(video.id)}
                     aria-label={isSaved ? `Remove bookmark for ${video.title}` : `Bookmark ${video.title}`}
                     aria-pressed={isSaved}
+                    aria-busy={bookmarks.pendingIds.has(video.id)}
                   >
                     <Bookmark size={21} fill={isSaved ? "currentColor" : "none"} />
                   </button>
@@ -923,14 +942,9 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
                     <div
                       className={styles.moreMenu}
                       id={`feed-menu-${video.id}`}
-                      onKeyDown={(event) => {
-                        if (event.key !== "Escape") return;
-                        event.preventDefault();
-                        setMenuVideoId("");
-                        window.requestAnimationFrame(() => {
-                          document.getElementById(`feed-more-${video.id}`)?.focus();
-                        });
-                      }}
+                      ref={actionMenuRef}
+                      role="group"
+                      aria-label={`Actions for ${video.title}`}
                     >
                       <a href={video.sourceUrl} target="_blank" rel="noreferrer">
                         <ExternalLink size={17} /> Original post
@@ -950,7 +964,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
                 </div> : null}
 
                 <div className={styles.progressTrack}>
-                  <span ref={isActive ? progressRef : undefined} />
+                  <span ref={isActive ? progressRef : undefined} aria-hidden="true" />
                   <input
                     ref={isActive ? seekRef : undefined}
                     type="range"
@@ -984,16 +998,22 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
           {filteredVideos.length === 0 ? (
             <div className={styles.emptyFeed}>
               <h2>
-                {archive.source === "loading" || archive.source === "refreshing" || (feedView === "bookmarks" && !bookmarksReady)
+                {feedView === "bookmarks" && bookmarkError
+                  ? "Could not load bookmarks"
+                  : bookmarkPagePending
+                    ? "Loading bookmarks…"
+                  : archive.source === "loading" || archive.source === "refreshing"
                   ? "Loading videos…"
                   : archive.source === "error"
                     ? "Could not load the archive"
                     : feedView === "bookmarks" ? "No bookmarks" : "No saved videos"}
               </h2>
               <p>
-                {archive.source === "error"
+                {feedView === "bookmarks" && bookmarkError
+                  ? bookmarkError
+                  : archive.source === "error"
                   ? archive.error
-                  : feedView === "bookmarks" && loadingBookmarkedVideos
+                  : bookmarkPagePending
                     ? "Loading your server bookmarks."
                   : feedView === "bookmarks"
                   ? "Bookmark a video and it will appear here."
@@ -1006,43 +1026,73 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
                 {resolvedCreatorId !== "all" ? (
                   <button type="button" onClick={() => selectCreator("all")}>All creators</button>
                 ) : null}
-                {feedView === "bookmarks" && bookmarksReady ? (
+                {feedView === "bookmarks" && bookmarkError ? (
                   <button
                     type="button"
-                    aria-controls="feed-video-list"
-                    aria-busy={loadingBookmarkedVideos}
-                    aria-disabled={loadingBookmarkedVideos || !hasMoreBookmarkedVideos}
-                    onClick={() => void loadMoreBookmarkedVideos()}
+                    onClick={() => {
+                      if (archive.bookmarkedVideosError) void loadBookmarkedVideos();
+                      bookmarks.retry();
+                    }}
                   >
-                    {loadingBookmarkedVideos
-                      ? "Loading more bookmarks…"
-                      : hasMoreBookmarkedVideos ? "Load more bookmarks" : "All bookmarks loaded"}
+                    Retry bookmarks
                   </button>
+                ) : feedView === "bookmarks" && bookmarksReady && archive.bookmarkedVideosLoaded ? (
+                  hasMoreBookmarkedVideos || loadingBookmarkedVideos ? (
+                    <button
+                      type="button"
+                      aria-controls="feed-video-list"
+                      aria-busy={loadingBookmarkedVideos}
+                      disabled={loadingBookmarkedVideos}
+                      onClick={() => void loadMoreBookmarkedVideos()}
+                    >
+                      {loadingBookmarkedVideos ? "Loading more bookmarks…" : "Load more bookmarks"}
+                    </button>
+                  ) : null
                 ) : null}
                 <Link href="/dashboard/videos">Open library</Link>
               </div>
             </div>
           ) : null}
-          {feedView === "bookmarks" && bookmarksReady && filteredVideos.length > 0 ? (
+          {feedView === "bookmarks"
+          && bookmarksReady
+          && archive.bookmarkedVideosLoaded
+          && !bookmarkError
+          && filteredVideos.length > 0 ? (
             <div className={styles.emptyActions}>
-              <button
-                type="button"
-                aria-controls="feed-video-list"
-                aria-busy={loadingBookmarkedVideos}
-                aria-disabled={loadingBookmarkedVideos || !hasMoreBookmarkedVideos}
-                onClick={() => void loadMoreBookmarkedVideos()}
-              >
-                {loadingBookmarkedVideos
-                  ? "Loading more bookmarks…"
-                  : hasMoreBookmarkedVideos ? "Load more bookmarks" : "All bookmarks loaded"}
-              </button>
+              {hasMoreBookmarkedVideos || loadingBookmarkedVideos ? (
+                <button
+                  type="button"
+                  aria-controls="feed-video-list"
+                  aria-busy={loadingBookmarkedVideos}
+                  disabled={loadingBookmarkedVideos}
+                  onClick={() => void loadMoreBookmarkedVideos()}
+                >
+                  {loadingBookmarkedVideos ? "Loading more bookmarks…" : "Load more bookmarks"}
+                </button>
+              ) : (
+                <p role="status">All bookmarks loaded</p>
+              )}
             </div>
           ) : null}
         </div>
         {loadingMoreVideos ? (
           <p className="sr-only" role="status">Loading more videos…</p>
         ) : null}
-        {feedStatus ? <p className={styles.feedToast} role="status">{feedStatus}</p> : null}
+        {bookmarkError && filteredVideos.length > 0 ? (
+          <div className={styles.feedToast} role="alert">
+            <span id="bookmark-error-status">{bookmarkError}</span>
+            <button
+              type="button"
+              aria-describedby="bookmark-error-status"
+              onClick={() => {
+                if (archive.bookmarkedVideosError) void loadBookmarkedVideos();
+                bookmarks.retry();
+              }}
+            >
+              Retry
+            </button>
+          </div>
+        ) : feedStatus ? <p className={styles.feedToast} role="status">{feedStatus}</p> : null}
       </section>
 
       {deleteVideo ? (
@@ -1098,6 +1148,14 @@ function randomFeedSeed(): number {
     return value[0] || Date.now();
   } catch {
     return Date.now();
+  }
+}
+
+function preferredFeedScrollBehavior(): ScrollBehavior {
+  try {
+    return window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
+  } catch {
+    return "auto";
   }
 }
 

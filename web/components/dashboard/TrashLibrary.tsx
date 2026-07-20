@@ -84,8 +84,12 @@ export function TrashLibrary({
       const payload = await response.json().catch(() => ({})) as { error?: string };
       if (!response.ok) throw new Error(payload.error || `Restore failed (${response.status})`);
       const restored = restoreVideo;
+      const restoredIndex = videos.findIndex((video) => video.fileId === restored.fileId);
+      const nextVideo = videos[restoredIndex + 1] || videos[restoredIndex - 1];
+      returnFocusRef.current = nextVideo
+        ? document.getElementById(`restore-video-${nextVideo.fileId}`)
+        : document.getElementById("video-library-trash-tab");
       setVideos((current) => current.filter((video) => video.fileId !== restored.fileId));
-      returnFocusRef.current = document.getElementById("video-library-active-tab");
       setRestoreVideo(null);
       onRestored(restored);
     } catch (nextError) {
@@ -116,40 +120,57 @@ export function TrashLibrary({
         ) : null}
 
         {!error && videos.length ? (
-          <div className={styles.trashList}>
+          <div>
             <div className={styles.trashHeader} aria-hidden="true">
-              <span>File</span><span>Creator</span><span>Moved</span><span>Purges</span><span />
+              <span>File</span>
+              <span className={styles.trashMetadataHeader}>
+                <span>Creator</span><span>Moved</span><span>Purges</span>
+              </span>
+              <span />
             </div>
-            {videos.map((video) => (
-              <article className={styles.trashRow} key={video.fileId}>
-                <div className={styles.trashFile}>
-                  <Trash2 size={16} />
-                  <div>
-                    <strong>{video.filename || `Video ${video.videoId || video.fileId}`}</strong>
-                    <small>{formatBytes(video.sizeBytes)} · saved {formatDate(video.createdAt)} · file {video.fileId}</small>
+            <div className={styles.trashList} role="list" aria-label="Trashed videos">
+              {videos.map((video) => (
+                <article className={styles.trashRow} role="listitem" key={video.fileId}>
+                  <div className={styles.trashFile}>
+                    <Trash2 size={16} aria-hidden="true" />
+                    <div>
+                      <strong>{video.filename || `Video ${video.videoId || video.fileId}`}</strong>
+                      <small>{formatBytes(video.sizeBytes)} · saved {formatDate(video.createdAt)} · file {video.fileId}</small>
+                    </div>
                   </div>
-                </div>
-                <span className={styles.trashCreator} data-label="Creator">@{video.username || "unknown"}</span>
-                <time data-label="Moved" dateTime={toDateTime(video.trashedAt)}>{formatDate(video.trashedAt)}</time>
-                <span className={styles.trashPurge} data-label="Purges" title={video.purgeAt ? formatExactDate(video.purgeAt) : undefined}>
-                  {formatPurgeTime(video.purgeAt)}
-                </span>
-                <div className={styles.trashActions}>
-                  {video.sourceUrl ? (
-                    <a href={video.sourceUrl} target="_blank" rel="noreferrer" aria-label={`Open original post by @${video.username}`}>
-                      <ExternalLink size={15} />
-                    </a>
-                  ) : null}
-                  <button
-                    id={`restore-video-${video.fileId}`}
-                    type="button"
-                    onClick={() => openRestore(video)}
-                  >
-                    <RotateCcw size={15} /> Restore
-                  </button>
-                </div>
-              </article>
-            ))}
+                  <dl className={styles.trashMetadata}>
+                    <div>
+                      <dt>Creator</dt>
+                      <dd>@{video.username || "unknown"}</dd>
+                    </div>
+                    <div>
+                      <dt>Moved</dt>
+                      <dd><time dateTime={toDateTime(video.trashedAt)}>{formatDate(video.trashedAt)}</time></dd>
+                    </div>
+                    <div>
+                      <dt>Purges</dt>
+                      <dd className={styles.trashPurge} title={video.purgeAt ? formatExactDate(video.purgeAt) : undefined}>
+                        {formatPurgeTime(video.purgeAt)}
+                      </dd>
+                    </div>
+                  </dl>
+                  <div className={styles.trashActions}>
+                    {video.sourceUrl ? (
+                      <a href={video.sourceUrl} target="_blank" rel="noreferrer" aria-label={`Open original post by @${video.username}`}>
+                        <ExternalLink size={15} />
+                      </a>
+                    ) : null}
+                    <button
+                      id={`restore-video-${video.fileId}`}
+                      type="button"
+                      onClick={() => openRestore(video)}
+                    >
+                      <RotateCcw size={15} /> Restore
+                    </button>
+                  </div>
+                </article>
+              ))}
+            </div>
           </div>
         ) : null}
 

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import { mkdtemp, mkdir, rename, rm, writeFile } from "node:fs/promises";
+import http from "node:http";
 import { createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -14,6 +15,40 @@ test("live bridge paginates active videos and serves an existing .image sidecar"
   const creatorDir = path.join(downloads, "alice");
   const database = path.join(fixture, "state.db");
   const port = await availablePort();
+  const adminRequests = [];
+  const backend = http.createServer((request, response) => {
+    adminRequests.push({
+      method: request.method,
+      url: request.url,
+      authorization: request.headers.authorization || "",
+    });
+    if (request.method === "DELETE" && request.url === "/api/creators/alice.archive/monitoring") {
+      const body = JSON.stringify({
+        username: "alice.archive",
+        monitoring: false,
+        removed: true,
+        removedSubscriptions: 2,
+      });
+      response.writeHead(200, {
+        "content-length": Buffer.byteLength(body),
+        "content-type": "application/json; charset=utf-8",
+      });
+      response.end(body);
+      return;
+    }
+    response.writeHead(404, { "content-type": "application/json; charset=utf-8" });
+    response.end(JSON.stringify({ error: "Not found" }));
+  });
+  backend.listen(0, "127.0.0.1");
+  await once(backend, "listening");
+  const backendAddress = backend.address();
+  assert(backendAddress && typeof backendAddress === "object");
+  context.after(async () => {
+    if (backend.listening) {
+      backend.close();
+      await once(backend, "close");
+    }
+  });
   await mkdir(creatorDir, { recursive: true });
   const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46]);
   for (let id = 1; id <= 5; id += 1) {
@@ -65,6 +100,8 @@ test("live bridge paginates active videos and serves an existing .image sidecar"
       LIVE_DB_PATH: database,
       LIVE_DOWNLOADS_PATH: downloads,
       LIVE_CACHE_PATH: path.join(fixture, "cache"),
+      LIVE_BACKEND_URL: `http://127.0.0.1:${backendAddress.port}`,
+      LIVE_IMPORT_API_TOKEN: "bridge-secret",
       LIVE_PUBLIC_BASE_URL: `http://127.0.0.1:${port}`,
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -83,6 +120,30 @@ test("live bridge paginates active videos and serves an existing .image sidecar"
   });
 
   await waitForBridge(port, child, () => childOutput);
+  const wrongMonitoringMethod = await fetch(
+    `http://127.0.0.1:${port}/api/creators/alice.archive/monitoring`,
+    { method: "POST" },
+  );
+  assert.equal(wrongMonitoringMethod.status, 405);
+  assert.equal(adminRequests.length, 0);
+
+  const stopMonitoringResponse = await fetch(
+    `http://127.0.0.1:${port}/api/creators/alice.archive/monitoring`,
+    { method: "DELETE" },
+  );
+  assert.equal(stopMonitoringResponse.status, 200);
+  assert.deepEqual(await stopMonitoringResponse.json(), {
+    username: "alice.archive",
+    monitoring: false,
+    removed: true,
+    removedSubscriptions: 2,
+  });
+  assert.deepEqual(adminRequests, [{
+    method: "DELETE",
+    url: "/api/creators/alice.archive/monitoring",
+    authorization: "Bearer bridge-secret",
+  }]);
+
   const firstResponse = await fetch(`http://127.0.0.1:${port}/api/videos?page=1&limit=2`);
   assert.equal(firstResponse.status, 200);
   const firstPage = await firstResponse.json();

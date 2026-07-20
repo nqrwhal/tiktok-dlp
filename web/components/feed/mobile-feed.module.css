@@ -1,6 +1,6 @@
 .appShell {
   min-height: 100dvh;
-  background: #020302;
+  background: var(--color-bg);
 }
 
 .stage {
@@ -11,56 +11,62 @@
   margin: 0 auto;
   overflow: hidden;
   background: #000;
+  color: var(--color-text);
 }
 
 .controlBar {
   position: absolute;
-  z-index: 20;
+  z-index: var(--z-header);
   top: 0;
   right: 0;
   left: 0;
   display: grid;
   gap: 10px;
-  padding: max(14px, env(safe-area-inset-top)) 14px 22px;
-  background: linear-gradient(180deg, rgba(0, 0, 0, 0.62), transparent);
+  padding: max(14px, env(safe-area-inset-top)) 14px 24px;
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0.82) 0%, rgba(0, 0, 0, 0.52) 68%, transparent 100%);
   opacity: 0;
   pointer-events: none;
-  transform: translateY(-10px);
+  transform: translateY(-8px);
   transition: opacity 150ms ease, transform 150ms ease;
+}
+
+.controlBarVisible {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0);
 }
 
 .feedTabs {
   display: flex;
   align-items: center;
   justify-self: center;
-  gap: 18px;
+  gap: 3px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: var(--radius-md);
+  padding: 3px;
+  background: rgba(9, 11, 10, 0.7);
+  backdrop-filter: blur(12px);
 }
 
 .feedTab,
 .feedTabActive {
-  position: relative;
+  min-height: var(--control-height);
   border: 0;
-  min-height: 44px;
-  padding: 12px 0 9px;
+  border-radius: var(--radius-sm);
+  padding: 0 14px;
   background: transparent;
-  color: rgba(255, 255, 255, 0.58);
+  color: var(--color-text-muted);
   font-size: 13px;
-  font-weight: 650;
+  font-weight: 680;
+}
+
+.feedTab:hover {
+  color: var(--color-text);
 }
 
 .feedTabActive {
-  color: white;
-}
-
-.feedTabActive::after {
-  position: absolute;
-  right: 0;
-  bottom: 0;
-  left: 0;
-  height: 2px;
-  border-radius: 999px;
-  background: white;
-  content: "";
+  background: var(--color-surface-raised);
+  color: var(--color-text);
 }
 
 .controlRow {
@@ -71,14 +77,15 @@
   gap: 12px;
 }
 
-.controlBarVisible {
-  opacity: 1;
-  pointer-events: auto;
-  transform: translateY(0);
+.controlRow > :first-child {
+  min-width: 0;
+  max-width: 220px;
+  flex: 1 1 auto;
 }
 
 .controlActions {
   display: flex;
+  flex: 0 0 auto;
   align-items: center;
   gap: 7px;
 }
@@ -86,28 +93,34 @@
 .iconButton,
 .minimalActions > button {
   display: grid;
-  width: 44px;
-  height: 44px;
+  width: var(--control-height);
+  height: var(--control-height);
   place-items: center;
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  border-radius: 50%;
-  background: rgba(6, 8, 7, 0.52);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: var(--radius-md);
+  background: rgba(9, 11, 10, 0.72);
   color: white;
   backdrop-filter: blur(12px);
 }
 
-.iconButton:disabled {
+.iconButton:hover:not(:disabled),
+.minimalActions > button:hover:not(:disabled) {
+  background: rgba(28, 32, 29, 0.92);
+}
+
+.iconButton:disabled,
+.minimalActions > button:disabled {
   cursor: not-allowed;
-  opacity: 0.38;
+  opacity: 0.42;
 }
 
 .feedScroller {
   height: 100%;
   overflow-y: auto;
+  overflow-anchor: none;
+  overscroll-behavior-y: contain;
   scroll-snap-type: y mandatory;
   scrollbar-width: none;
-  overscroll-behavior-y: contain;
-  overflow-anchor: none;
 }
 
 .feedScroller::-webkit-scrollbar {
@@ -115,15 +128,15 @@
 }
 
 .feedCard {
-  --wash: #161916;
+  --wash: var(--color-surface);
   position: relative;
   height: 100%;
   min-height: 100%;
   overflow: hidden;
-  scroll-snap-align: start;
-  scroll-snap-stop: always;
   background: var(--wash);
   isolation: isolate;
+  scroll-snap-align: start;
+  scroll-snap-stop: always;
 }
 
 .feedSpacer {
@@ -164,7 +177,7 @@
 
 .videoTint {
   z-index: -1;
-  background: linear-gradient(180deg, rgba(0, 0, 0, 0.18) 38%, rgba(0, 0, 0, 0.78) 100%);
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0.2) 32%, rgba(0, 0, 0, 0.84) 100%);
   opacity: 0;
   pointer-events: none;
   transition: opacity 150ms ease;
@@ -180,6 +193,11 @@
   background: transparent;
 }
 
+.videoTapTarget:focus-visible {
+  outline: 3px solid var(--color-accent);
+  outline-offset: -6px;
+}
+
 .playOverlay {
   position: absolute;
   z-index: 8;
@@ -189,9 +207,9 @@
   width: 64px;
   height: 64px;
   place-items: center;
-  border: 1px solid rgba(255, 255, 255, 0.22);
-  border-radius: 50%;
-  background: rgba(0, 0, 0, 0.46);
+  border: 1px solid rgba(255, 255, 255, 0.24);
+  border-radius: var(--radius-lg);
+  background: rgba(9, 11, 10, 0.72);
   color: white;
   backdrop-filter: blur(12px);
   transform: translate(-50%, -50%);
@@ -201,11 +219,11 @@
   position: absolute;
   z-index: 5;
   right: 76px;
-  bottom: max(30px, calc(env(safe-area-inset-bottom) + 18px));
+  bottom: max(58px, calc(env(safe-area-inset-bottom) + 50px));
   left: 16px;
   opacity: 0;
   pointer-events: none;
-  text-shadow: 0 2px 16px rgba(0, 0, 0, 0.72);
+  text-shadow: 0 2px 16px rgba(0, 0, 0, 0.78);
   transform: translateY(8px);
   transition: opacity 150ms ease, transform 150ms ease;
 }
@@ -218,11 +236,16 @@
 .creatorName {
   display: block;
   width: max-content;
+  max-width: 100%;
   margin-bottom: 7px;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  color: white;
   font-size: 13px;
-  font-weight: 700;
+  font-weight: 720;
   pointer-events: none;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .videoMetaVisible .creatorName {
@@ -239,10 +262,11 @@
   max-width: 42ch;
   margin: 0;
   overflow: hidden;
+  color: white;
   font-size: clamp(16px, 4.5vw, 21px);
-  font-weight: 610;
+  font-weight: 640;
   letter-spacing: -0.025em;
-  line-height: 1.18;
+  line-height: 1.2;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 3;
 }
@@ -252,16 +276,16 @@
   max-width: 50ch;
   margin: 7px 0 0;
   overflow: hidden;
-  color: rgba(255, 255, 255, 0.74);
+  color: rgba(255, 255, 255, 0.82);
   font-size: 12px;
-  line-height: 1.4;
+  line-height: 1.45;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
 }
 
 .videoMeta .playbackStatus {
   margin-top: 8px;
-  color: rgba(255, 255, 255, 0.88);
+  color: white;
   font-size: 11px;
 }
 
@@ -270,7 +294,7 @@
   flex-wrap: wrap;
   gap: 7px;
   margin-top: 8px;
-  color: rgba(255, 255, 255, 0.74);
+  color: rgba(255, 255, 255, 0.82);
   font-size: 11px;
 }
 
@@ -278,7 +302,7 @@
   position: absolute;
   z-index: 9;
   right: 13px;
-  bottom: max(30px, calc(env(safe-area-inset-bottom) + 18px));
+  bottom: max(58px, calc(env(safe-area-inset-bottom) + 50px));
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -295,78 +319,101 @@
 }
 
 .bookmarkActive {
-  color: var(--acid) !important;
+  border-color: color-mix(in srgb, var(--color-accent) 54%, transparent) !important;
+  color: var(--color-accent) !important;
 }
 
 .moreMenu {
   position: absolute;
   right: 0;
-  bottom: 46px;
+  bottom: 52px;
   display: grid;
-  width: 194px;
-  overflow: hidden;
-  border: 1px solid rgba(255, 255, 255, 0.15);
-  border-radius: 10px;
+  width: min(210px, calc(100vw - 32px));
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
   padding: 5px;
-  background: #121512;
-  box-shadow: 0 18px 54px rgba(0, 0, 0, 0.55);
+  background: var(--color-surface-raised);
+  box-shadow: var(--shadow-popover);
 }
 
 .moreMenu button,
 .moreMenu a {
   display: flex;
-  min-height: 44px;
+  min-height: var(--control-height);
   align-items: center;
   gap: 9px;
   border: 0;
-  border-radius: 7px;
+  border-radius: var(--radius-sm);
   padding: 0 10px;
   background: transparent;
-  color: #d4d9d2;
+  color: var(--color-text-muted);
   font-size: 12px;
   text-align: left;
 }
 
 .moreMenu button:hover,
 .moreMenu a:hover {
-  background: #202420;
+  background: var(--color-surface-hover);
+  color: var(--color-text);
+}
+
+.moreMenu button:focus-visible,
+.moreMenu a:focus-visible {
+  outline-offset: -2px;
 }
 
 .moreMenu .deleteMenuAction {
-  color: #ff9187;
+  color: color-mix(in srgb, var(--color-danger) 68%, white);
 }
 
 .feedToast {
   position: absolute;
-  z-index: 35;
+  z-index: var(--z-dropdown);
   right: 18px;
-  bottom: max(22px, calc(env(safe-area-inset-bottom) + 12px));
+  bottom: max(54px, calc(env(safe-area-inset-bottom) + 46px));
   left: 18px;
+  display: flex;
   width: max-content;
   max-width: calc(100% - 36px);
+  min-height: var(--control-height);
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
   margin: 0 auto;
-  border: 1px solid rgba(201, 255, 74, 0.24);
-  border-radius: 10px;
-  padding: 11px 14px;
-  background: rgba(17, 21, 18, 0.94);
-  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.48);
-  color: #eef3ea;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+  padding: 8px 10px 8px 14px;
+  background: color-mix(in srgb, var(--color-surface-raised) 96%, transparent);
+  box-shadow: var(--shadow-popover);
+  color: var(--color-text);
   font-size: 12px;
   line-height: 1.4;
-  text-align: center;
+  text-align: left;
+}
+
+.feedToast button {
+  min-width: 64px;
+  min-height: var(--control-height);
+  flex: 0 0 auto;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-sm);
+  padding: 0 12px;
+  background: var(--color-surface-hover);
+  color: var(--color-text);
+  font-weight: 680;
 }
 
 .feedHint {
   position: absolute;
   z-index: 18;
-  bottom: max(38px, calc(env(safe-area-inset-bottom) + 26px));
+  bottom: max(62px, calc(env(safe-area-inset-bottom) + 54px));
   left: 50%;
   margin: 0;
-  border: 1px solid rgba(255, 255, 255, 0.13);
-  border-radius: 999px;
-  padding: 8px 12px;
-  background: rgba(8, 10, 9, 0.7);
-  color: rgba(255, 255, 255, 0.82);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: var(--radius-md);
+  padding: 9px 12px;
+  background: rgba(9, 11, 10, 0.78);
+  color: rgba(255, 255, 255, 0.88);
   font-size: 11px;
   line-height: 1;
   pointer-events: none;
@@ -377,12 +424,12 @@
 
 .confirmScrim {
   position: fixed;
-  z-index: 100;
+  z-index: var(--z-dialog);
   inset: 0;
   display: grid;
   place-items: center;
   padding: max(18px, env(safe-area-inset-top)) 18px max(18px, env(safe-area-inset-bottom));
-  background: rgba(3, 5, 4, 0.82);
+  background: rgba(3, 5, 4, 0.84);
   backdrop-filter: blur(7px);
 }
 
@@ -392,21 +439,21 @@
   max-height: 100%;
   gap: 18px;
   overflow-y: auto;
-  border: 1px solid rgba(244, 247, 239, 0.18);
-  border-radius: 15px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-lg);
   padding: 22px;
-  background: #111512;
-  box-shadow: 0 28px 90px rgba(0, 0, 0, 0.64);
+  background: var(--color-surface-raised);
+  box-shadow: var(--shadow-dialog);
 }
 
 .confirmIcon {
   display: grid;
-  width: 42px;
-  height: 42px;
+  width: var(--control-height);
+  height: var(--control-height);
   place-items: center;
-  border-radius: 11px;
-  background: rgba(255, 112, 100, 0.12);
-  color: #ff9187;
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--color-danger) 12%, transparent);
+  color: var(--color-danger);
 }
 
 .confirmDialog h2 {
@@ -417,7 +464,7 @@
 
 .confirmDialog p {
   margin: 0;
-  color: #9ca49a;
+  color: var(--color-text-muted);
   font-size: 13px;
   line-height: 1.55;
 }
@@ -429,17 +476,17 @@
 
 .confirmDialog p strong {
   margin-bottom: 3px;
-  color: #edf1eb;
+  color: var(--color-text);
 }
 
 .confirmDialog p span {
   margin-bottom: 13px;
-  color: #b2b9af;
+  color: var(--color-text-muted);
   font-size: 12px;
 }
 
 .confirmDialog .deleteError {
-  color: #ff9b92;
+  color: color-mix(in srgb, var(--color-danger) 68%, white);
 }
 
 .confirmActions {
@@ -450,28 +497,28 @@
 
 .confirmActions button {
   display: inline-flex;
-  min-height: 44px;
+  min-height: var(--control-height);
   align-items: center;
   justify-content: center;
   gap: 7px;
-  border: 1px solid rgba(244, 247, 239, 0.16);
-  border-radius: 9px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
   padding: 0 14px;
-  background: #191d1a;
-  color: #e4e8e2;
+  background: var(--color-surface-hover);
+  color: var(--color-text);
   font-size: 13px;
   font-weight: 700;
 }
 
 .confirmActions .confirmDeleteButton {
-  border-color: #a8463e;
-  background: #b94c43;
+  border-color: color-mix(in srgb, var(--color-danger) 68%, black);
+  background: color-mix(in srgb, var(--color-danger) 72%, black);
   color: white;
 }
 
 .confirmActions button:disabled {
   cursor: not-allowed;
-  opacity: 0.48;
+  opacity: 0.5;
 }
 
 .spinning {
@@ -488,8 +535,9 @@
   right: 0;
   bottom: 0;
   left: 0;
-  height: 22px;
-  background: linear-gradient(180deg, transparent 19px, rgba(255, 255, 255, 0.18) 19px);
+  height: var(--control-height);
+  pointer-events: none;
+  background: linear-gradient(180deg, transparent calc(100% - 3px), rgba(255, 255, 255, 0.24) calc(100% - 3px));
 }
 
 .progressTrack span {
@@ -499,7 +547,7 @@
   display: block;
   width: 0;
   height: 3px;
-  background: rgba(255, 255, 255, 0.92);
+  background: rgba(255, 255, 255, 0.96);
   transition: width 100ms linear;
 }
 
@@ -507,25 +555,30 @@
   position: absolute;
   inset: 0;
   width: 100%;
-  height: 22px;
+  height: var(--control-height);
   margin: 0;
   cursor: pointer;
   opacity: 0;
+  pointer-events: auto;
+  touch-action: pan-x;
 }
 
 .progressTrack:has(input:focus-visible) {
-  outline: 2px solid rgba(255, 255, 255, 0.9);
-  outline-offset: -4px;
+  outline: 2px solid var(--color-accent);
+  outline-offset: -5px;
 }
 
 .emptyFeed {
   display: flex;
   height: 100%;
+  min-height: 100%;
   align-items: center;
   justify-content: center;
   flex-direction: column;
-  padding: 30px;
+  padding: 130px 24px 60px;
+  background: var(--color-bg);
   text-align: center;
+  scroll-snap-align: start;
 }
 
 .emptyFeed h2 {
@@ -533,10 +586,12 @@
   font-size: 17px;
 }
 
-.emptyFeed p {
+.emptyFeed p,
+.feedScroller > .emptyActions p {
   margin: 0;
-  color: #858c83;
+  color: var(--color-text-muted);
   font-size: 13px;
+  line-height: 1.5;
 }
 
 .emptyActions {
@@ -547,20 +602,36 @@
   margin-top: 18px;
 }
 
+.feedScroller > .emptyActions {
+  min-height: 100%;
+  align-content: center;
+  align-items: center;
+  flex-direction: column;
+  margin: 0;
+  padding: 100px 24px 60px;
+  background: var(--color-bg);
+  scroll-snap-align: start;
+}
+
 .emptyActions button,
 .emptyActions a,
 .feedNotice button {
   display: inline-flex;
-  min-height: 44px;
+  min-height: var(--control-height);
   align-items: center;
   justify-content: center;
-  border: 1px solid rgba(255, 255, 255, 0.18);
-  border-radius: 9px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
   padding: 0 14px;
-  background: #171b18;
-  color: #f4f7ef;
+  background: var(--color-surface-raised);
+  color: var(--color-text);
   font-size: 12px;
   font-weight: 680;
+}
+
+.emptyActions button:disabled {
+  cursor: wait;
+  opacity: 0.64;
 }
 
 .feedNotice {
@@ -568,13 +639,13 @@
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  border: 1px solid rgba(255, 145, 135, 0.24);
-  border-radius: 9px;
+  border: 1px solid color-mix(in srgb, var(--color-danger) 42%, var(--color-border));
+  border-radius: var(--radius-md);
   padding: 8px 10px;
-  background: rgba(26, 13, 12, 0.88);
-  color: #ffd3cf;
+  background: color-mix(in srgb, var(--color-danger) 9%, rgba(9, 11, 10, 0.94));
+  color: color-mix(in srgb, var(--color-danger) 48%, white);
   font-size: 11px;
-  line-height: 1.35;
+  line-height: 1.4;
 }
 
 .feedNotice span {
@@ -584,9 +655,66 @@
 }
 
 .feedNotice button {
-  min-height: 34px;
+  min-height: var(--control-height);
   flex: 0 0 auto;
-  padding: 0 10px;
+  padding: 0 11px;
+}
+
+@media (max-width: 390px) {
+  .controlBar {
+    padding-right: 10px;
+    padding-left: 10px;
+  }
+
+  .controlRow {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+  }
+
+  .controlRow > :first-child {
+    width: 100%;
+    max-width: none;
+  }
+
+  .controlActions {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .videoMeta {
+    right: 70px;
+    left: 12px;
+  }
+
+  .minimalActions {
+    right: 10px;
+  }
+}
+
+@media (max-width: 339px) {
+  .controlActions {
+    gap: 4px;
+  }
+
+  .feedTab,
+  .feedTabActive {
+    padding-right: 12px;
+    padding-left: 12px;
+  }
+
+  .confirmDialog {
+    gap: 15px;
+    padding: 18px;
+  }
+
+  .confirmActions {
+    flex-direction: column-reverse;
+  }
+
+  .confirmActions button {
+    width: 100%;
+  }
 }
 
 @media (min-width: 760px) {
@@ -595,15 +723,30 @@
   }
 
   .stage {
-    border-right: 1px solid rgba(255, 255, 255, 0.09);
-    border-left: 1px solid rgba(255, 255, 255, 0.09);
+    border-right: 1px solid var(--color-border);
+    border-left: 1px solid var(--color-border);
     box-shadow: 0 24px 90px rgba(0, 0, 0, 0.5);
   }
 }
 
 @media (max-height: 620px) {
+  .controlBar {
+    gap: 6px;
+    padding-bottom: 18px;
+  }
+
   .videoMeta p,
   .tags {
     display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .feedCard {
+    scroll-snap-stop: normal;
+  }
+
+  .progressTrack span {
+    transition: none;
   }
 }
