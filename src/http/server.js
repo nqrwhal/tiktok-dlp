@@ -5,6 +5,7 @@ import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { createReadStream } from 'node:fs';
 import { normalizeUsername } from '../util/files.js';
+import { removeStoredFiles } from '../cleanup/downloads.js';
 
 export function createHttpHandler({ config, store, creatorImportService = null }) {
   assertServerDeps(config, store);
@@ -27,6 +28,15 @@ export function createHttpHandler({ config, store, creatorImportService = null }
 
       if (url.pathname === '/api/trash') {
         return handleTrashRequest(req, res, { config, store, url });
+      }
+
+      const trashVideoMatch = url.pathname.match(/^\/api\/trash\/(\d+)$/);
+      if (trashVideoMatch) {
+        return handleTrashVideoRequest(req, res, {
+          config,
+          store,
+          fileId: Number(trashVideoMatch[1]),
+        });
       }
 
       if (url.pathname === '/api/bookmarks') {
@@ -254,8 +264,51 @@ export async function handleTrashRequest(req, res, { config, store, url }) {
   if (!isImportAuthorized(req, config)) {
     return sendJson(res, 401, { error: 'Unauthorized' });
   }
-  if (req.method !== 'GET') {
+  if (req.method !== 'GET' && req.method !== 'DELETE') {
     return sendJson(res, 405, { error: 'Method not allowed' });
+  }
+
+  if (req.method === 'DELETE') {
+    try {
+      const body = await readJsonBody(req);
+      if (body.confirmDeleteAll !== true) {
+        return sendJson(res, 400, { error: 'Confirm all trashed videos before deleting them permanently' });
+      }
+
+      const files = store.claimAllTrashedFilesForDeletion?.() ?? [];
+      if (!files.length) {
+        return sendJson(res, 200, {
+          permanentlyDeletedVideos: 0,
+          deletedStoredFiles: 0,
+          failedVideos: 0,
+        });
+      }
+
+      const protectedPaths = new Set(
+        (store.listFilePathsReferencedOutside?.(files.map((file) => file.id)) ?? [])
+          .map((filePath) => resolveDownloadPath(config.downloadDir, filePath))
+          .filter(Boolean),
+      );
+      const removal = await removeStoredFiles(files, config, { protectedPaths });
+      for (const failure of removal.failed) {
+        store.markFileDeletionFailed?.(failure.file.id, failure.error);
+      }
+      const failedIds = new Set(removal.failed.map((failure) => Number(failure.file.id)));
+      const removableIds = files
+        .map((file) => Number(file.id))
+        .filter((fileId) => !failedIds.has(fileId));
+      const deletedRecords = store.deleteFileRecords?.(removableIds) ?? 0;
+      return sendJson(res, 200, {
+        permanentlyDeletedVideos: deletedRecords,
+        deletedStoredFiles: removal.deleted,
+        failedVideos: failedIds.size,
+      });
+    } catch (error) {
+      const statusCode = Number(error?.statusCode) || 400;
+      return sendJson(res, statusCode, {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   const limit = Math.max(1, Math.min(1_000, Number(url.searchParams.get('limit')) || 100));
@@ -264,6 +317,59 @@ export async function handleTrashRequest(req, res, { config, store, url }) {
     videos,
     retentionDays: Math.max(0, Number(config.archiveTrashRetentionDays) || 0),
   });
+}
+
+export async function handleTrashVideoRequest(req, res, { config, store, fileId }) {
+  if (!isImportAuthorized(req, config)) {
+    return sendJson(res, 401, { error: 'Unauthorized' });
+  }
+  if (req.method !== 'DELETE') {
+    return sendJson(res, 405, { error: 'Method not allowed' });
+  }
+
+  try {
+    const body = await readJsonBody(req);
+    if (Number(body.confirmFileId) !== Number(fileId)) {
+      return sendJson(res, 400, { error: 'Confirm the trashed video before deleting it permanently' });
+    }
+
+    const file = store.claimTrashedFileForDeletion?.(fileId);
+    if (!file) {
+      const existing = store.getTrashedFile?.(fileId);
+      return sendJson(res, existing ? 409 : 404, {
+        error: existing ? 'The archived video is currently being purged' : 'Trashed video not found',
+      });
+    }
+
+    const protectedPaths = new Set(
+      (store.listFilePathsReferencedOutside?.([file.id]) ?? [])
+        .map((filePath) => resolveDownloadPath(config.downloadDir, filePath))
+        .filter(Boolean),
+    );
+    const removal = await removeStoredFiles([file], config, { protectedPaths });
+    if (removal.failed.length) {
+      const failure = removal.failed[0];
+      store.markFileDeletionFailed?.(file.id, failure.error);
+      return sendJson(res, 500, { error: 'The video file could not be deleted. You can retry from trash.' });
+    }
+
+    const deletedRecords = store.deleteFileRecords?.([file.id]) ?? 0;
+    if (!deletedRecords) {
+      return sendJson(res, 404, { error: 'Trashed video not found' });
+    }
+    return sendJson(res, 200, {
+      fileId: Number(file.id),
+      videoId: String(file.video_id ?? ''),
+      username: String(file.username ?? ''),
+      permanentlyDeleted: true,
+      deletedStoredFiles: removal.deleted,
+    });
+  } catch (error) {
+    const statusCode = Number(error?.statusCode) || 400;
+    return sendJson(res, statusCode, {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 }
 
 export async function handleVideoRestoreRequest(req, res, { config, store, fileId }) {

@@ -1,6 +1,9 @@
 "use client";
 
 import {
+  ArrowDown,
+  ArrowUp,
+  ChevronsUpDown,
   Download,
   ExternalLink,
   LoaderCircle,
@@ -52,6 +55,7 @@ export function VideoLibrary({
     [creatorFilter.id, liveCreators],
   );
   const [query, setQuery] = useState("");
+  const [sizeSort, setSizeSort] = useState<"asc" | "desc" | null>(null);
   const [libraryView, setLibraryView] = useState<"active" | "trash">("active");
   const [actionVideoId, setActionVideoId] = useState("");
   const [deleteVideo, setDeleteVideo] = useState<SavedVideo | null>(null);
@@ -90,7 +94,7 @@ export function VideoLibrary({
 
   const filtered = useMemo(() => {
     const normalized = query.trim().toLowerCase();
-    return liveVideos.filter((video) => {
+    const matches = liveVideos.filter((video) => {
       const matchesCreator = resolvedCreatorFilter === "all" || video.creatorId === resolvedCreatorFilter;
       const matchesQuery =
         !normalized ||
@@ -100,7 +104,15 @@ export function VideoLibrary({
         video.tags.some((tag) => tag.toLowerCase().includes(normalized));
       return matchesCreator && matchesQuery;
     });
-  }, [liveVideos, query, resolvedCreatorFilter]);
+    if (!sizeSort) return matches;
+    return matches
+      .map((video, index) => ({ video, index }))
+      .sort((left, right) => {
+        const difference = left.video.sizeBytes - right.video.sizeBytes;
+        return (sizeSort === "asc" ? difference : -difference) || left.index - right.index;
+      })
+      .map(({ video }) => video);
+  }, [liveVideos, query, resolvedCreatorFilter, sizeSort]);
   const loadedVideoCount = liveVideos.length;
   const availableVideoCount = resolvedCreatorFilter === "all"
     ? archive.stats.videoCount
@@ -110,12 +122,21 @@ export function VideoLibrary({
     : availableVideoCount > loadedVideoCount
       ? `${loadedVideoCount} of ${availableVideoCount} videos loaded`
       : `${filtered.length} ${filtered.length === 1 ? "result" : "results"}`;
+  const sizeSortLabel = sizeSort === null
+    ? "Sort videos by size, largest first"
+    : sizeSort === "desc"
+      ? "Sort videos by size, smallest first"
+      : "Clear video size sorting";
 
   function selectCreator(id: string) {
     setCreatorFilter({
       id,
       username: id === "all" ? "" : liveCreators.find((creator) => creator.id === id)?.username || "",
     });
+  }
+
+  function toggleSizeSort() {
+    setSizeSort((current) => current === null ? "desc" : current === "desc" ? "asc" : null);
   }
 
   function openDeleteVideo(video: SavedVideo) {
@@ -174,6 +195,20 @@ export function VideoLibrary({
       return next;
     });
     setActionMessage(`Restored “${video.filename}” by @${video.username}.`);
+    archive.refresh();
+  }
+
+  function handlePermanentlyDeletedVideo(video: { filename: string; username: string }) {
+    setActionMessage(`Permanently deleted “${video.filename}” by @${video.username}.`);
+    archive.refresh();
+  }
+
+  function handlePermanentlyDeletedAll(count: number, failed: number) {
+    setActionMessage(
+      failed
+        ? `Permanently deleted ${count} trashed ${count === 1 ? "video" : "videos"}; ${failed} could not be deleted.`
+        : `Permanently deleted all ${count} trashed ${count === 1 ? "video" : "videos"}.`,
+    );
     archive.refresh();
   }
 
@@ -238,6 +273,15 @@ export function VideoLibrary({
           />
         </label>
         <CreatorPicker creators={liveCreators} value={resolvedCreatorFilter} onChange={selectCreator} />
+        <button
+          className={styles.mobileSizeSort}
+          type="button"
+          onClick={toggleSizeSort}
+          aria-label={sizeSortLabel}
+        >
+          Size
+          {sizeSort === "desc" ? <ArrowDown size={14} /> : sizeSort === "asc" ? <ArrowUp size={14} /> : <ChevronsUpDown size={14} />}
+        </button>
         <span className={styles.resultCount} role="status">{resultCountLabel}</span>
       </div> : null}
 
@@ -255,14 +299,24 @@ export function VideoLibrary({
         role="tabpanel"
         aria-labelledby="video-library-active-tab"
       >
-        <div className={styles.tableHeader} aria-hidden="true">
-          <span>Video</span>
-          <span className={styles.tableMetadataHeader}>
-            <span>Creator</span>
-            <span>Saved</span>
-            <span>Size</span>
+        <div className={styles.tableHeader} role="row">
+          <span role="columnheader">Video</span>
+          <span className={styles.tableMetadataHeader} role="presentation">
+            <span role="columnheader">Creator</span>
+            <span role="columnheader">Saved</span>
+            <span role="columnheader" aria-sort={sizeSort === null ? "none" : sizeSort === "asc" ? "ascending" : "descending"}>
+              <button
+                className={styles.sortHeaderButton}
+                type="button"
+                onClick={toggleSizeSort}
+                aria-label={sizeSortLabel}
+              >
+                Size
+                {sizeSort === "desc" ? <ArrowDown size={13} /> : sizeSort === "asc" ? <ArrowUp size={13} /> : <ChevronsUpDown size={13} />}
+              </button>
+            </span>
           </span>
-          <span />
+          <span role="columnheader"><span className="sr-only">Actions</span></span>
         </div>
         <div className={styles.videoList} role="list" aria-label="Saved videos">
           {filtered.map((video) => (
@@ -380,7 +434,12 @@ export function VideoLibrary({
               : archive.hasMoreVideos ? "Load more videos" : "All videos loaded"}
         </button>
       </section> : (
-        <TrashLibrary apiBase={apiBase} onRestored={handleRestoredVideo} />
+        <TrashLibrary
+          apiBase={apiBase}
+          onRestored={handleRestoredVideo}
+          onDeleted={handlePermanentlyDeletedVideo}
+          onDeletedAll={handlePermanentlyDeletedAll}
+        />
       )}
 
       {deleteVideo ? (

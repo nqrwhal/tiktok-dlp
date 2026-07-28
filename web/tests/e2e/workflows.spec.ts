@@ -21,6 +21,56 @@ test("video trash and restore preserve its bookmark", async ({ page, archive }) 
   expect(archive.bookmarks.has("1001")).toBe(true);
 });
 
+test("video size header sorts both directions and trash deletes one video permanently", async ({ page, archive }) => {
+  await page.goto("/dashboard/videos");
+  const sizeSort = page.getByRole("button", { name: "Sort videos by size, largest first" });
+  await sizeSort.click();
+  const rows = page.getByRole("list", { name: "Saved videos" }).getByRole("listitem");
+  await expect(rows.first()).toContainText("18.0 MB");
+  await page.getByRole("button", { name: "Sort videos by size, smallest first" }).click();
+  await expect(rows.first()).toContainText("6.0 MB");
+
+  const actions = page.getByRole("button", { name: /More actions for Alice Archive archive clip 001/ });
+  await actions.click();
+  await page.getByRole("button", { name: "Move to trash", exact: true }).click();
+  await page.getByRole("dialog", { name: "Move this video to trash?" })
+    .getByRole("button", { name: "Move to trash", exact: true })
+    .click();
+  await page.getByRole("tab", { name: "Trash" }).click();
+  await page.getByRole("button", { name: "Delete", exact: true }).click();
+  const deleteDialog = page.getByRole("dialog", { name: "Permanently delete this video?" });
+  await expect(deleteDialog).toContainText("This action can’t be undone.");
+  await deleteDialog.getByRole("button", { name: "Delete permanently" }).click();
+  await expect(page.getByRole("status").filter({ hasText: "Permanently deleted" })).toBeVisible();
+  expect(archive.trash.has("1001")).toBe(false);
+  expect(archive.videos.some((video) => video.id === "1001")).toBe(false);
+});
+
+test("trash can permanently delete every video at once", async ({ page, archive }) => {
+  await page.goto("/dashboard/videos");
+  for (const title of [
+    "Alice Archive archive clip 001",
+    "Alice Archive archive clip 002",
+  ]) {
+    await page.getByRole("button", { name: new RegExp(`More actions for ${title}`) }).click();
+    await page.getByRole("button", { name: "Move to trash", exact: true }).click();
+    await page.getByRole("dialog", { name: "Move this video to trash?" })
+      .getByRole("button", { name: "Move to trash", exact: true })
+      .click();
+  }
+  expect(archive.trash.size).toBe(2);
+
+  await page.getByRole("tab", { name: "Trash" }).click();
+  await page.getByRole("button", { name: "Delete all", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Permanently delete all trash?" });
+  await expect(dialog).toContainText("all 2 trashed videos");
+  await dialog.getByRole("button", { name: "Delete all 2" }).click();
+  await expect(page.getByText("Trash is empty")).toBeVisible();
+  await expect(page.getByRole("status").filter({ hasText: "Permanently deleted all 2" })).toBeVisible();
+  expect(archive.trash.size).toBe(0);
+  expect(archive.videos.some((video) => video.id === "1001" || video.id === "1002")).toBe(false);
+});
+
 test("creator import and browser-local settings persist", async ({ page, archive }) => {
   await page.goto("/dashboard/creators");
   await page.getByRole("button", { name: "Import creator" }).click();

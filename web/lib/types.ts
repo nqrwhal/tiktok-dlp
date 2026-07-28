@@ -29,6 +29,7 @@ export interface SavedVideo {
   savedAt: string;
   savedAtLabel: string;
   duration: string;
+  sizeBytes: number;
   sizeLabel: string;
   sourceUrl: string;
 }

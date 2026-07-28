@@ -91,17 +91,24 @@ test("feed exposes confirmed server trash and bounded delivery", async () => {
   assert.match(source, /shouldIgnoreFeedShortcut/);
 });
 
-test("video dashboard exposes trash listing and confirmed restore", async () => {
+test("video dashboard exposes size sorting, trash listing, confirmed restore, and permanent delete", async () => {
   const librarySource = await readFile(new URL("../components/dashboard/VideoLibrary.tsx", import.meta.url), "utf8");
   const source = await readFile(new URL("../components/dashboard/TrashLibrary.tsx", import.meta.url), "utf8");
   assert.match(librarySource, /id="video-library-trash-tab"/);
-  assert.match(librarySource, /<TrashLibrary apiBase=\{apiBase\} onRestored=\{handleRestoredVideo\}/);
+  assert.match(librarySource, /<TrashLibrary[\s\S]*?onRestored=\{handleRestoredVideo\}[\s\S]*?onDeleted=\{handlePermanentlyDeletedVideo\}/);
   assert.match(librarySource, /archive\.refresh\(\)/);
+  assert.match(librarySource, /Sort videos by size, largest first/);
+  assert.match(librarySource, /left\.video\.sizeBytes - right\.video\.sizeBytes/);
+  assert.match(librarySource, /onDeletedAll=\{handlePermanentlyDeletedAll\}/);
   assert.match(source, /\/api\/trash\?limit=1000/);
+  assert.match(source, /confirmDeleteAll:\s*true/);
+  assert.match(source, /Permanently delete all trash\?/);
+  assert.match(source, /\/api\/trash\/\$\{deleteVideo\.fileId\}/);
   assert.match(source, /\/api\/videos\/\$\{restoreVideo\.fileId\}\/restore/);
   assert.match(source, /method:\s*"POST"/);
   assert.match(source, /confirmFileId:\s*restoreVideo\.fileId/);
   assert.match(source, /Restore this video\?/);
+  assert.match(source, /Permanently delete this video\?/);
 });
 
 test("creator imports remain durable and actionable outside the open panel", async () => {

@@ -1612,6 +1612,72 @@ export class Store {
     }
   }
 
+  claimTrashedFileForDeletion(fileId, now = Date.now()) {
+    const numericId = Number(fileId);
+    if (!Number.isInteger(numericId) || numericId <= 0) return null;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const file = this.db.prepare(`
+        SELECT id, path, filename, video_id, username, trashed_at
+        FROM files
+        WHERE id = ?
+          AND trashed_at IS NOT NULL
+          AND (delete_requested_at IS NULL OR delete_error IS NOT NULL)
+      `).get(numericId);
+      if (!file) {
+        this.db.exec('COMMIT');
+        return null;
+      }
+      const claimed = this.db.prepare(`
+        UPDATE files
+        SET
+          delete_requested_at = ?,
+          delete_attempts = delete_attempts + 1,
+          delete_error = NULL
+        WHERE id = ?
+          AND trashed_at IS NOT NULL
+          AND (delete_requested_at IS NULL OR delete_error IS NOT NULL)
+      `).run(Number(now), numericId);
+      this.db.exec('COMMIT');
+      return claimed.changes > 0 ? file : null;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  claimAllTrashedFilesForDeletion(now = Date.now()) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const files = this.db.prepare(`
+        SELECT id, path, filename, video_id, username, trashed_at
+        FROM files
+        WHERE trashed_at IS NOT NULL
+          AND (delete_requested_at IS NULL OR delete_error IS NOT NULL)
+        ORDER BY trashed_at ASC, id ASC
+      `).all();
+      if (files.length) {
+        const ids = files.map((file) => Number(file.id));
+        const placeholders = ids.map(() => '?').join(', ');
+        this.db.prepare(`
+          UPDATE files
+          SET
+            delete_requested_at = ?,
+            delete_attempts = delete_attempts + 1,
+            delete_error = NULL
+          WHERE id IN (${placeholders})
+            AND trashed_at IS NOT NULL
+            AND (delete_requested_at IS NULL OR delete_error IS NOT NULL)
+        `).run(Number(now), ...ids);
+      }
+      this.db.exec('COMMIT');
+      return files;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
   listFilePathsReferencedOutside(fileIds = []) {
     const ids = normalizeIds(fileIds);
     if (!ids.length) return [];

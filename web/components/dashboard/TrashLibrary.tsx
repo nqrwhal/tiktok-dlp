@@ -9,9 +9,13 @@ import styles from "./dashboard.module.css";
 export function TrashLibrary({
   apiBase,
   onRestored,
+  onDeleted,
+  onDeletedAll,
 }: {
   apiBase: string;
   onRestored: (video: TrashedVideo) => void;
+  onDeleted: (video: TrashedVideo) => void;
+  onDeletedAll: (count: number, failed: number) => void;
 }) {
   const [videos, setVideos] = useState<TrashedVideo[]>([]);
   const [retentionDays, setRetentionDays] = useState<number | null>(null);
@@ -20,7 +24,21 @@ export function TrashLibrary({
   const [restoreVideo, setRestoreVideo] = useState<TrashedVideo | null>(null);
   const [restoring, setRestoring] = useState(false);
   const [restoreError, setRestoreError] = useState("");
+  const [deleteVideo, setDeleteVideo] = useState<TrashedVideo | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState("");
+  const [deleteAllOpen, setDeleteAllOpen] = useState(false);
+  const [deletingAll, setDeletingAll] = useState(false);
+  const [deleteAllError, setDeleteAllError] = useState("");
   const { dialogRef, returnFocusRef } = useModalDialog(Boolean(restoreVideo), closeRestore);
+  const {
+    dialogRef: deleteDialogRef,
+    returnFocusRef: deleteReturnFocusRef,
+  } = useModalDialog(Boolean(deleteVideo), closeDelete);
+  const {
+    dialogRef: deleteAllDialogRef,
+    returnFocusRef: deleteAllReturnFocusRef,
+  } = useModalDialog(deleteAllOpen, closeDeleteAll);
 
   const loadTrash = useCallback(async () => {
     if (!apiBase) {
@@ -99,6 +117,87 @@ export function TrashLibrary({
     }
   }
 
+  function openDelete(video: TrashedVideo) {
+    deleteReturnFocusRef.current = document.getElementById(`delete-trash-video-${video.fileId}`);
+    setDeleteVideo(video);
+    setDeleteError("");
+  }
+
+  function closeDelete() {
+    if (deleting) return;
+    setDeleteVideo(null);
+    setDeleteError("");
+  }
+
+  async function confirmDelete() {
+    if (!deleteVideo || deleting || !apiBase) return;
+    setDeleting(true);
+    setDeleteError("");
+    try {
+      const response = await fetch(`${apiBase}/api/trash/${deleteVideo.fileId}`, {
+        method: "DELETE",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ confirmFileId: deleteVideo.fileId }),
+      });
+      const payload = await response.json().catch(() => ({})) as { error?: string };
+      if (!response.ok) throw new Error(payload.error || `Permanent deletion failed (${response.status})`);
+      const deleted = deleteVideo;
+      const deletedIndex = videos.findIndex((video) => video.fileId === deleted.fileId);
+      const nextVideo = videos[deletedIndex + 1] || videos[deletedIndex - 1];
+      deleteReturnFocusRef.current = nextVideo
+        ? document.getElementById(`delete-trash-video-${nextVideo.fileId}`)
+        : document.getElementById("video-library-trash-tab");
+      setVideos((current) => current.filter((video) => video.fileId !== deleted.fileId));
+      setDeleteVideo(null);
+      onDeleted(deleted);
+    } catch (nextError) {
+      setDeleteError(nextError instanceof Error ? nextError.message : String(nextError));
+    } finally {
+      setDeleting(false);
+    }
+  }
+
+  function openDeleteAll() {
+    deleteAllReturnFocusRef.current = document.getElementById("delete-all-trash");
+    setDeleteAllOpen(true);
+    setDeleteAllError("");
+  }
+
+  function closeDeleteAll() {
+    if (deletingAll) return;
+    setDeleteAllOpen(false);
+    setDeleteAllError("");
+  }
+
+  async function confirmDeleteAll() {
+    if (deletingAll || !apiBase) return;
+    setDeletingAll(true);
+    setDeleteAllError("");
+    try {
+      const response = await fetch(`${apiBase}/api/trash`, {
+        method: "DELETE",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ confirmDeleteAll: true }),
+      });
+      const payload = await response.json().catch(() => ({})) as {
+        permanentlyDeletedVideos?: number;
+        failedVideos?: number;
+        error?: string;
+      };
+      if (!response.ok) throw new Error(payload.error || `Delete all failed (${response.status})`);
+      const deleted = Number(payload.permanentlyDeletedVideos ?? 0);
+      const failed = Number(payload.failedVideos ?? 0);
+      setDeleteAllOpen(false);
+      if (failed) await loadTrash();
+      else setVideos([]);
+      onDeletedAll(deleted, failed);
+    } catch (nextError) {
+      setDeleteAllError(nextError instanceof Error ? nextError.message : String(nextError));
+    } finally {
+      setDeletingAll(false);
+    }
+  }
+
   return (
     <>
       <section className={styles.trashCard} id="video-library-trash-panel" role="tabpanel" aria-labelledby="video-library-trash-tab">
@@ -107,9 +206,22 @@ export function TrashLibrary({
             <strong>{loading ? "Loading trash…" : `${videos.length} ${videos.length === 1 ? "file" : "files"}`}</strong>
             <span>{retentionLabel(retentionDays)}</span>
           </div>
-          <button type="button" onClick={() => void loadTrash()} disabled={loading}>
-            <RefreshCw className={loading ? styles.spinning : undefined} size={15} /> Refresh
-          </button>
+          <div className={styles.trashToolbarActions}>
+            {videos.length ? (
+              <button
+                className={styles.permanentDeleteButton}
+                id="delete-all-trash"
+                type="button"
+                onClick={openDeleteAll}
+                disabled={loading}
+              >
+                <Trash2 size={15} /> Delete all
+              </button>
+            ) : null}
+            <button type="button" onClick={() => void loadTrash()} disabled={loading}>
+              <RefreshCw className={loading ? styles.spinning : undefined} size={15} /> Refresh
+            </button>
+          </div>
         </header>
 
         {error ? (
@@ -167,6 +279,14 @@ export function TrashLibrary({
                     >
                       <RotateCcw size={15} /> Restore
                     </button>
+                    <button
+                      className={styles.permanentDeleteButton}
+                      id={`delete-trash-video-${video.fileId}`}
+                      type="button"
+                      onClick={() => openDelete(video)}
+                    >
+                      <Trash2 size={15} /> Delete
+                    </button>
                   </div>
                 </article>
               ))}
@@ -212,6 +332,85 @@ export function TrashLibrary({
               <button type="button" disabled={restoring} onClick={() => void confirmRestore()}>
                 {restoring ? <LoaderCircle className={styles.spinning} size={15} /> : <RotateCcw size={15} />}
                 {restoring ? "Restoring" : "Restore video"}
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
+
+      {deleteVideo ? (
+        <div
+          className={styles.confirmScrim}
+          onPointerDown={(event) => {
+            if (event.target === event.currentTarget && !deleting) closeDelete();
+          }}
+        >
+          <section
+            className={styles.confirmDialog}
+            ref={deleteDialogRef}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="permanent-delete-video-title"
+          >
+            <div className={styles.confirmIcon}><Trash2 size={19} /></div>
+            <div>
+              <h2 id="permanent-delete-video-title">Permanently delete this video?</h2>
+              <p>
+                <strong className={styles.confirmVideoTitle}>{deleteVideo.filename}</strong>
+                <span className={styles.confirmVideoMeta}>@{deleteVideo.username} · {formatBytes(deleteVideo.sizeBytes)}</span>
+                This removes the stored file and its archive record immediately. This action can’t be undone.
+              </p>
+            </div>
+            {deleteError ? <p className={styles.importError} role="alert">{deleteError}</p> : null}
+            <div className={styles.confirmActions}>
+              <button data-dialog-initial type="button" onClick={closeDelete} disabled={deleting}>Cancel</button>
+              <button
+                className={styles.confirmDeleteButton}
+                type="button"
+                disabled={deleting}
+                onClick={() => void confirmDelete()}
+              >
+                {deleting ? <LoaderCircle className={styles.spinning} size={15} /> : <Trash2 size={15} />}
+                {deleting ? "Deleting" : "Delete permanently"}
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
+
+      {deleteAllOpen ? (
+        <div
+          className={styles.confirmScrim}
+          onPointerDown={(event) => {
+            if (event.target === event.currentTarget && !deletingAll) closeDeleteAll();
+          }}
+        >
+          <section
+            className={styles.confirmDialog}
+            ref={deleteAllDialogRef}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="delete-all-trash-title"
+          >
+            <div className={styles.confirmIcon}><Trash2 size={19} /></div>
+            <div>
+              <h2 id="delete-all-trash-title">Permanently delete all trash?</h2>
+              <p>
+                This removes all {videos.length} trashed {videos.length === 1 ? "video" : "videos"} and their stored files immediately.
+                {" "}This action can’t be undone.
+              </p>
+            </div>
+            {deleteAllError ? <p className={styles.importError} role="alert">{deleteAllError}</p> : null}
+            <div className={styles.confirmActions}>
+              <button data-dialog-initial type="button" onClick={closeDeleteAll} disabled={deletingAll}>Cancel</button>
+              <button
+                className={styles.confirmDeleteButton}
+                type="button"
+                disabled={deletingAll}
+                onClick={() => void confirmDeleteAll()}
+              >
+                {deletingAll ? <LoaderCircle className={styles.spinning} size={15} /> : <Trash2 size={15} />}
+                {deletingAll ? "Deleting all" : `Delete all ${videos.length}`}
               </button>
             </div>
           </section>

@@ -573,6 +573,37 @@ test('individual video deletion trashes, blocks delivery, and supports confirmed
   assert.deepEqual(store.listBookmarkedFileIds(), [deletedFileId]);
   assert.equal((await fetch(`${baseUrl}/files/deleted-token`)).status, 200);
 
+  await fetch(`${baseUrl}/api/videos/${deletedFileId}`, {
+    method: 'DELETE',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ confirmFileId: deletedFileId }),
+  });
+  const unconfirmedPermanentDelete = await fetch(`${baseUrl}/api/trash/${deletedFileId}`, {
+    method: 'DELETE',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ confirmFileId: siblingFileId }),
+  });
+  assert.equal(unconfirmedPermanentDelete.status, 400);
+  await access(deletedPath);
+
+  const permanentDelete = await fetch(`${baseUrl}/api/trash/${deletedFileId}`, {
+    method: 'DELETE',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ confirmFileId: deletedFileId }),
+  });
+  assert.equal(permanentDelete.status, 200);
+  assert.deepEqual(await permanentDelete.json(), {
+    fileId: deletedFileId,
+    videoId: '200',
+    username: 'creator',
+    permanentlyDeleted: true,
+    deletedStoredFiles: 2,
+  });
+  await assert.rejects(access(deletedPath), { code: 'ENOENT' });
+  await assert.rejects(access(deletedSidecarPath), { code: 'ENOENT' });
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM files WHERE id = ?').get(deletedFileId).count, 0);
+  assert.deepEqual(store.listBookmarkedFileIds(), []);
+
   const deletedSharedRecord = await fetch(`${baseUrl}/api/videos/${siblingFileId}`, {
     method: 'DELETE',
     headers: { 'content-type': 'application/json' },
@@ -583,4 +614,52 @@ test('individual video deletion trashes, blocks delivery, and supports confirmed
   await access(siblingPath);
   assert.equal(store.getTrashedFile(siblingFileId)?.id, siblingFileId);
   assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM files WHERE id = ?').get(sharedFileId).count, 1);
+
+  const permanentSharedDelete = await fetch(`${baseUrl}/api/trash/${siblingFileId}`, {
+    method: 'DELETE',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ confirmFileId: siblingFileId }),
+  });
+  assert.equal(permanentSharedDelete.status, 200);
+  assert.equal((await permanentSharedDelete.json()).deletedStoredFiles, 0);
+  await access(siblingPath);
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM files WHERE id = ?').get(siblingFileId).count, 0);
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM files WHERE id = ?').get(sharedFileId).count, 1);
+
+  const bulkPaths = [
+    path.join(creatorDir, 'bulk-1.mp4'),
+    path.join(creatorDir, 'bulk-2.mp4'),
+  ];
+  await Promise.all(bulkPaths.map((filePath, index) => writeFile(filePath, `bulk ${index + 1}`)));
+  const bulkIds = bulkPaths.map((filePath, index) => store.createFileRecord({
+    videoId: `bulk-${index + 1}`,
+    username: 'creator',
+    sourceUrl: `https://www.tiktok.com/@creator/video/bulk-${index + 1}`,
+    filePath,
+    filename: path.basename(filePath),
+    sizeBytes: 6,
+  }));
+  for (const fileId of bulkIds) store.trashFile(fileId);
+
+  const unconfirmedBulkDelete = await fetch(`${baseUrl}/api/trash`, {
+    method: 'DELETE',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ confirmDeleteAll: false }),
+  });
+  assert.equal(unconfirmedBulkDelete.status, 400);
+  for (const filePath of bulkPaths) await access(filePath);
+
+  const bulkDelete = await fetch(`${baseUrl}/api/trash`, {
+    method: 'DELETE',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ confirmDeleteAll: true }),
+  });
+  assert.equal(bulkDelete.status, 200);
+  assert.deepEqual(await bulkDelete.json(), {
+    permanentlyDeletedVideos: 2,
+    deletedStoredFiles: 2,
+    failedVideos: 0,
+  });
+  for (const filePath of bulkPaths) await assert.rejects(access(filePath), { code: 'ENOENT' });
+  assert.deepEqual(store.listTrashedFiles(), []);
 });

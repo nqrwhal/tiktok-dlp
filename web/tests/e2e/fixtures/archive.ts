@@ -42,6 +42,7 @@ export interface FixtureVideo {
   savedAt: string;
   savedAtLabel: string;
   duration: string;
+  sizeBytes: number;
   sizeLabel: string;
   sourceUrl: string;
 }
@@ -310,6 +311,36 @@ export class InMemoryArchive {
 
     if (url.pathname === "/api/trash" && request.method() === "GET") {
       await json(route, 200, { videos: [...this.trash.values()], retentionDays: 7 });
+      return;
+    }
+
+    if (url.pathname === "/api/trash" && request.method() === "DELETE") {
+      const ids = [...this.trash.keys()];
+      for (const id of ids) {
+        this.trash.delete(id);
+        this.bookmarks.delete(id);
+        const videoIndex = this.videos.findIndex((video) => video.id === id);
+        if (videoIndex >= 0) this.videos.splice(videoIndex, 1);
+      }
+      await json(route, 200, {
+        permanentlyDeletedVideos: ids.length,
+        deletedStoredFiles: ids.length,
+        failedVideos: 0,
+      });
+      return;
+    }
+
+    const trashVideoMatch = url.pathname.match(/^\/api\/trash\/([^/]+)$/);
+    if (trashVideoMatch && request.method() === "DELETE") {
+      const id = decodeURIComponent(trashVideoMatch[1]);
+      if (!this.trash.delete(id)) {
+        await json(route, 404, { error: "Trashed video not found" });
+        return;
+      }
+      this.bookmarks.delete(id);
+      const videoIndex = this.videos.findIndex((video) => video.id === id);
+      if (videoIndex >= 0) this.videos.splice(videoIndex, 1);
+      await json(route, 200, { permanentlyDeleted: true, fileId: Number(id) });
       return;
     }
 
@@ -689,6 +720,7 @@ function createVideos(creators: FixtureCreator[]): FixtureVideo[] {
         savedAt: savedAt.toISOString(),
         savedAtLabel: index === 0 ? "5 min ago" : `${index + 1} hr ago`,
         duration: `0:${String(15 + index % 40).padStart(2, "0")}`,
+        sizeBytes: Math.round((6 + index % 13) * 1024 * 1024),
         sizeLabel: `${(6 + index % 13).toFixed(1)} MB`,
         sourceUrl: `https://www.tiktok.com/@${creator.username}/video/${id}`,
       });

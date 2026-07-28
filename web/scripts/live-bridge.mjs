@@ -288,8 +288,27 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    if (request.method === "GET" && url.pathname === "/api/trash") {
-      const upstream = await remoteAdminRequest("GET", `${url.pathname}${url.search}`);
+    if ((request.method === "GET" || request.method === "DELETE") && url.pathname === "/api/trash") {
+      const body = request.method === "DELETE" ? await readBodyText(request) : "";
+      const upstream = await remoteAdminRequest(request.method, `${url.pathname}${url.search}`, body);
+      if (request.method === "DELETE" && upstream.status >= 200 && upstream.status < 300) {
+        videoCache = { loadedAt: 0, rows: [] };
+        videoRowsById.clear();
+        loadMetadataIndex.invalidate();
+      }
+      sendUpstream(response, upstream);
+      return;
+    }
+
+    const trashVideoRoute = /^\/api\/trash\/\d+$/.test(url.pathname);
+    if (trashVideoRoute && request.method === "DELETE") {
+      const body = await readBodyText(request);
+      const upstream = await remoteAdminRequest("DELETE", `${url.pathname}${url.search}`, body);
+      if (upstream.status >= 200 && upstream.status < 300) {
+        videoCache = { loadedAt: 0, rows: [] };
+        videoRowsById.clear();
+        loadMetadataIndex.invalidate();
+      }
       sendUpstream(response, upstream);
       return;
     }
@@ -1079,6 +1098,7 @@ function toVideo(row, request, metadata = {}) {
     savedAt: new Date(createdAt).toISOString(),
     savedAtLabel: relativeTime(createdAt),
     duration: formatDuration(metadata.duration),
+    sizeBytes: Number(row.size_bytes || 0),
     sizeLabel: formatBytes(Number(row.size_bytes || 0)),
     sourceUrl: String(row.source_url || "https://www.tiktok.com/"),
   };
