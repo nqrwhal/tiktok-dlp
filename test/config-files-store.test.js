@@ -816,6 +816,7 @@ test('store schedules and marks deletion checks for seen videos', async () => {
       title: 'title',
       alertedAt: 1000,
     }, 1000);
+    store.addWatch('openai', { guildId: 'guild-1', channelId: 'channel-1' }, 1000);
     store.scheduleVideoDeletionCheck('v1', 2000);
 
     assert.equal(store.listVideosDueForDeletionCheck(1999).length, 0);
@@ -827,8 +828,59 @@ test('store schedules and marks deletion checks for seen videos', async () => {
     assert.equal(store.listVideosDueForDeletionCheck(2000).length, 0);
     assert.equal(store.listVideosDueForDeletionCheck(3000)[0].deletion_check_count, 1);
 
-    const deleted = store.markVideoDeleted('v1', 4000);
-    assert.equal(deleted.deleted_at, 4000);
+    const firstMissing = store.recordVideoMissing('v1', 4000, 'not found', 3000);
+    assert.equal(firstMissing.deletion_missing_count, 1);
+    const restored = store.markVideoStillAvailable('v1', 4000, 3500);
+    assert.equal(restored, undefined);
+    assert.equal(store.listVideosDueForDeletionCheck(4000)[0].deletion_missing_count, 0);
+
+    store.recordVideoMissing('v1', 5000, 'not found', 4000);
+    const secondMissing = store.recordVideoMissing('v1', 6000, 'not found', 5000);
+    assert.equal(secondMissing.deletion_missing_count, 2);
+    const deleted = store.markVideoDeleted('v1', 'not found', 5000);
+    assert.equal(deleted.deleted_at, 5000);
+    assert.equal(deleted.deletion_alerted_at, null);
+    assert.equal(store.listVideosDueForDeletionCheck(5000).length, 1);
+    store.markVideoDeletionAlerted('v1', 6000);
+    assert.equal(store.listVideosDueForDeletionCheck(9999).length, 0);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('store backfills deletion checks only for active saved non-story alerts', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-deletion-backfill-'));
+  const store = createStore(path.join(dir, 'state.db'));
+  try {
+    store.addWatch('creator', { guildId: 'guild-1', channelId: 'channel-1' }, 1000);
+    for (const [videoId, sourceUrl] of [
+      ['video-1', 'https://www.tiktok.com/@creator/video/video-1'],
+      ['story-1', 'https://www.tiktok.com/@creator/story/story-1'],
+    ]) {
+      const fileId = store.createFileRecord({
+        videoId,
+        username: 'creator',
+        sourceUrl,
+        filePath: path.join(dir, `${videoId}.mp4`),
+        filename: `${videoId}.mp4`,
+        sizeBytes: 1,
+      }, 1000);
+      store.createLinkToken({ token: `token-${videoId}`, fileId, expiresAt: 0 }, 1000);
+      store.markVideoSeen({
+        videoId,
+        username: 'creator',
+        sourceUrl,
+        title: videoId,
+        alertedAt: 1000,
+      }, 1000);
+    }
+
+    assert.equal(store.backfillDeletionChecks(2000), 1);
+    assert.equal(store.listVideosDueForDeletionCheck(2000).map((video) => video.video_id).join(','), 'video-1');
+    assert.equal(store.backfillDeletionChecks(3000), 0);
+
+    store.removeWatch('creator');
     assert.equal(store.listVideosDueForDeletionCheck(9999).length, 0);
   } finally {
     store.close();

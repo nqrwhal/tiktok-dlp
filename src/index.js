@@ -31,6 +31,25 @@ export async function deliverMonitorAlerts(targets, deliver, { videoId = 'unknow
   throw error;
 }
 
+export async function checkVideoAvailability(video, config, fetchMetadata = fetchVideoMetadata) {
+  const sourceUrl = video?.source_url || video?.sourceUrl || video?.url || video?.webpage_url || '';
+  if (resolveVideoMediaType(video) === 'story') {
+    return { available: true, reason: 'Story deletion checks are skipped.' };
+  }
+  if (!sourceUrl) {
+    throw Object.assign(new Error('The original post URL is missing.'), { kind: 'invalid_url' });
+  }
+  try {
+    await fetchMetadata(sourceUrl, config);
+    return { available: true };
+  } catch (error) {
+    if (String(error?.kind ?? '') === 'not_found') {
+      return { available: false, reason: error.message ?? String(error) };
+    }
+    throw error;
+  }
+}
+
 if (process.env.NODE_ENV !== 'test') {
   await loadEnvFile();
 
@@ -39,6 +58,10 @@ if (process.env.NODE_ENV !== 'test') {
   await ensureRuntimeDirs(config);
 
   const store = createStore(config.stateDbPath);
+  const backfilledDeletionChecks = store.backfillDeletionChecks?.() ?? 0;
+  if (backfilledDeletionChecks > 0) {
+    console.log(`[monitor] Scheduled deletion checks for ${backfilledDeletionChecks} saved post(s).`);
+  }
   let discordClient = null;
   const cleanupTimer = setInterval(() => {
     cleanupExpiredDownloads({ config, store }).catch((error) => {
@@ -54,19 +77,7 @@ if (process.env.NODE_ENV !== 'test') {
   const downloadOne = downloadService.request.bind(downloadService);
 
   async function checkVideoAvailable(video) {
-    const sourceUrl = video?.source_url || video?.sourceUrl || video?.url || video?.webpage_url || '';
-    if (resolveVideoMediaType(video) === 'story') return { available: true, reason: 'Story deletion checks are skipped.' };
-    if (!sourceUrl) return { available: false, reason: 'The original post URL is missing.' };
-    try {
-      await fetchVideoMetadata(sourceUrl, config);
-      return { available: true };
-    } catch (error) {
-      const kind = String(error?.kind ?? '');
-      if (['access_denied', 'invalid_url', 'no_formats', 'not_found'].includes(kind)) {
-        return { available: false, reason: error.message ?? String(error) };
-      }
-      throw error;
-    }
+    return checkVideoAvailability(video, config);
   }
 
   const monitor = new TikTokMonitor({
@@ -124,10 +135,13 @@ if (process.env.NODE_ENV !== 'test') {
       }, { videoId: video?.id ?? video?.video_id ?? 'unknown' });
     },
     deletionAlert: async ({ video, reason }) => {
-      if (!discordClient) return;
+      if (!discordClient) {
+        throw new Error('Discord is not ready to deliver deletion alerts.');
+      }
       const watch = store.getWatch(video?.username ?? '') ?? null;
       const subscriptions = store.listWatchSubscriptions?.(watch?.username ?? '') ?? [];
-      await Promise.allSettled(subscriptions.map(async (subscription) => {
+      if (!subscriptions.length) return { delivered: false, retry: false };
+      await deliverMonitorAlerts(subscriptions, async (subscription) => {
         const targetScope = await resolveMonitorDeliveryScope(discordClient, subscription);
         const legacyChannelScopeId = monitorScopeId({ channelId: targetScope.channelId });
         const permanentToken = store.getLatestPermanentTokenForVideo?.(video?.video_id, {
@@ -142,7 +156,8 @@ if (process.env.NODE_ENV !== 'test') {
           watch: { ...watch, channel_id: subscription.channel_id },
           reason,
         });
-      }));
+      }, { videoId: video?.video_id ?? 'unknown' });
+      return { delivered: true };
     },
     usernameChangeAlert: async (change) => {
       if (!discordClient) return;

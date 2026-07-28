@@ -8,6 +8,7 @@ const DEFAULT_DOWNLOAD_CONCURRENCY = 1;
 const DEFAULT_DELETION_CHECK_CONCURRENCY = 2;
 const DEFAULT_DELETION_CHECK_BATCH_SIZE = 25;
 const DEFAULT_DELETION_CHECK_LEASE_MS = 10 * 60 * 1000;
+const DELETION_CONFIRMATION_DELAY_MS = 15 * 60 * 1000;
 const DEFAULT_BACKOFF_BASE_MS = 60 * 1000;
 const DEFAULT_BACKOFF_MAX_MS = 60 * 60 * 1000;
 const DELETION_CHECK_DELAYS_MS = [
@@ -773,13 +774,48 @@ export class TikTokMonitor {
         return;
       }
 
+      if (video.deleted_at && !video.deletion_alerted_at) {
+        const delivery = await Promise.resolve(this.deletionAlert({
+          video,
+          reason: video.deletion_reason || 'The post is no longer publicly available.',
+        }));
+        if (delivery?.delivered === false) {
+          await Promise.resolve(this.store.postponeVideoDeletionCheck?.(
+            video.video_id,
+            delivery.retry === false ? null : now + 5 * 60 * 1000,
+            now,
+          ));
+          return;
+        }
+        await Promise.resolve(this.store.markVideoDeletionAlerted?.(video.video_id, now));
+        return;
+      }
+
       const result = await Promise.resolve(this.#checkVideoAvailable(video));
       if (result?.available === false) {
-        const deleted = await Promise.resolve(this.store.markVideoDeleted?.(video.video_id, now)) ?? video;
-        await Promise.resolve(this.deletionAlert({
+        const reason = result.reason || result.message || 'The post is no longer publicly available.';
+        const missing = await Promise.resolve(this.store.recordVideoMissing?.(
+          video.video_id,
+          now + DELETION_CONFIRMATION_DELAY_MS,
+          reason,
+          now,
+        )) ?? { ...video, deletion_missing_count: Number(video.deletion_missing_count ?? 0) + 1 };
+        if (Number(missing.deletion_missing_count ?? 0) < 2) return;
+
+        const deleted = await Promise.resolve(this.store.markVideoDeleted?.(video.video_id, reason, now)) ?? missing;
+        const delivery = await Promise.resolve(this.deletionAlert({
           video: { ...video, ...deleted },
-          reason: result.reason || result.message || 'The post is no longer publicly available.',
+          reason,
         }));
+        if (delivery?.delivered === false) {
+          await Promise.resolve(this.store.postponeVideoDeletionCheck?.(
+            video.video_id,
+            delivery.retry === false ? null : now + 5 * 60 * 1000,
+            now,
+          ));
+          return;
+        }
+        await Promise.resolve(this.store.markVideoDeletionAlerted?.(video.video_id, now));
         return;
       }
 

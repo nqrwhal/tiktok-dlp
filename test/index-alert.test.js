@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 process.env.NODE_ENV = 'test';
-const { deliverMonitorAlerts } = await import('../src/index.js');
+const { checkVideoAvailability, deliverMonitorAlerts } = await import('../src/index.js');
 
 test('deliverMonitorAlerts attempts every target and rejects only after fan-out settles', async (t) => {
   const warnings = [];
@@ -56,4 +56,21 @@ test('deliverMonitorAlerts resolves when every delivery succeeds, including zero
   assert.deepEqual(await deliverMonitorAlerts([], async () => {
     assert.fail('zero-target delivery must not run');
   }), []);
+});
+
+test('deletion availability only treats confirmed not-found responses as missing', async () => {
+  const video = { source_url: 'https://www.tiktok.com/@creator/video/123' };
+  const notFound = Object.assign(new Error('gone'), { kind: 'not_found' });
+  assert.deepEqual(
+    await checkVideoAvailability(video, {}, async () => { throw notFound; }),
+    { available: false, reason: 'gone' },
+  );
+
+  for (const kind of ['access_denied', 'access_blocked', 'auth_required', 'invalid_url', 'no_formats']) {
+    const error = Object.assign(new Error(kind), { kind });
+    await assert.rejects(
+      checkVideoAvailability(video, {}, async () => { throw error; }),
+      (caught) => caught === error,
+    );
+  }
 });

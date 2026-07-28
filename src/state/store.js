@@ -45,6 +45,9 @@ export class Store {
         last_deletion_checked_at INTEGER,
         next_deletion_check_at INTEGER,
         deletion_check_count INTEGER NOT NULL DEFAULT 0,
+        deletion_missing_since INTEGER,
+        deletion_missing_count INTEGER NOT NULL DEFAULT 0,
+        deletion_reason TEXT,
         deleted_at INTEGER,
         deletion_alerted_at INTEGER
       );
@@ -176,6 +179,9 @@ export class Store {
     this.ensureColumn('seen_videos', 'last_deletion_checked_at', 'INTEGER');
     this.ensureColumn('seen_videos', 'next_deletion_check_at', 'INTEGER');
     this.ensureColumn('seen_videos', 'deletion_check_count', 'INTEGER NOT NULL DEFAULT 0');
+    this.ensureColumn('seen_videos', 'deletion_missing_since', 'INTEGER');
+    this.ensureColumn('seen_videos', 'deletion_missing_count', 'INTEGER NOT NULL DEFAULT 0');
+    this.ensureColumn('seen_videos', 'deletion_reason', 'TEXT');
     this.ensureColumn('seen_videos', 'deleted_at', 'INTEGER');
     this.ensureColumn('seen_videos', 'deletion_alerted_at', 'INTEGER');
     this.ensureColumn('jobs', 'requested_by', "TEXT NOT NULL DEFAULT ''");
@@ -321,6 +327,7 @@ export class Store {
       try {
         this.db.prepare('DELETE FROM watch_subscriptions WHERE username = ?').run(username);
         const result = this.db.prepare('DELETE FROM watched_users WHERE username = ?').run(username);
+        this.clearDeletionChecksForUsername(username);
         this.db.exec('COMMIT');
         return result.changes > 0;
       } catch (error) {
@@ -334,7 +341,10 @@ export class Store {
     try {
       const result = this.db.prepare('DELETE FROM watch_subscriptions WHERE username = ? AND guild_id = ?').run(username, guildId);
       const remaining = this.db.prepare('SELECT 1 FROM watch_subscriptions WHERE username = ? LIMIT 1').get(username);
-      if (!remaining) this.db.prepare('DELETE FROM watched_users WHERE username = ?').run(username);
+      if (!remaining) {
+        this.db.prepare('DELETE FROM watched_users WHERE username = ?').run(username);
+        this.clearDeletionChecksForUsername(username);
+      }
       this.db.exec('COMMIT');
       return result.changes > 0;
     } catch (error) {
@@ -569,6 +579,41 @@ export class Store {
     `).run(nextCheckAt, String(videoId));
   }
 
+  clearDeletionChecksForUsername(username) {
+    return this.db.prepare(`
+      UPDATE seen_videos
+      SET next_deletion_check_at = NULL, deletion_check_claimed_at = NULL
+      WHERE username = ? COLLATE NOCASE
+    `).run(String(username)).changes;
+  }
+
+  backfillDeletionChecks(now = Date.now()) {
+    return this.db.prepare(`
+      UPDATE seen_videos
+      SET
+        next_deletion_check_at = ?,
+        deletion_check_claimed_at = NULL,
+        last_available_at = COALESCE(last_available_at, alerted_at, seen_at)
+      WHERE alerted_at IS NOT NULL
+        AND deleted_at IS NULL
+        AND next_deletion_check_at IS NULL
+        AND source_url NOT LIKE '%/story/%'
+        AND EXISTS (
+          SELECT 1
+          FROM watch_subscriptions
+          WHERE watch_subscriptions.username = seen_videos.username COLLATE NOCASE
+        )
+        AND EXISTS (
+          SELECT 1
+          FROM files
+          JOIN link_tokens ON link_tokens.file_id = files.id
+          WHERE files.video_id = seen_videos.video_id
+            AND files.trashed_at IS NULL
+            AND link_tokens.expires_at = 0
+        )
+    `).run(now).changes;
+  }
+
   listVideosDueForDeletionCheck(now = Date.now(), limit = 25, leaseMs = 10 * 60 * 1000) {
     return this.db.prepare(`
       SELECT
@@ -593,9 +638,14 @@ export class Store {
         ) AS filename
       FROM seen_videos
       WHERE alerted_at IS NOT NULL
-        AND deleted_at IS NULL
+        AND (deleted_at IS NULL OR deletion_alerted_at IS NULL)
         AND next_deletion_check_at IS NOT NULL
         AND next_deletion_check_at <= ?
+        AND EXISTS (
+          SELECT 1
+          FROM watch_subscriptions
+          WHERE watch_subscriptions.username = seen_videos.username COLLATE NOCASE
+        )
         AND (deletion_check_claimed_at IS NULL OR deletion_check_claimed_at <= ?)
       ORDER BY next_deletion_check_at ASC
       LIMIT ?
@@ -631,9 +681,29 @@ export class Store {
         last_deletion_checked_at = ?,
         next_deletion_check_at = ?,
         deletion_check_claimed_at = NULL,
-        deletion_check_count = deletion_check_count + 1
+        deletion_check_count = deletion_check_count + 1,
+        deletion_missing_since = NULL,
+        deletion_missing_count = 0,
+        deletion_reason = NULL
       WHERE video_id = ?
     `).run(now, now, nextCheckAt, String(videoId));
+  }
+
+  recordVideoMissing(videoId, nextCheckAt, reason = '', now = Date.now()) {
+    this.db.prepare(`
+      UPDATE seen_videos
+      SET
+        last_deletion_checked_at = ?,
+        next_deletion_check_at = ?,
+        deletion_check_claimed_at = NULL,
+        deletion_check_count = deletion_check_count + 1,
+        deletion_missing_since = COALESCE(deletion_missing_since, ?),
+        deletion_missing_count = deletion_missing_count + 1,
+        deletion_reason = ?
+      WHERE video_id = ?
+        AND deleted_at IS NULL
+    `).run(now, nextCheckAt, now, String(reason).slice(0, 500), String(videoId));
+    return this.db.prepare('SELECT * FROM seen_videos WHERE video_id = ?').get(String(videoId)) ?? null;
   }
 
   postponeVideoDeletionCheck(videoId, nextCheckAt, now = Date.now()) {
@@ -644,17 +714,27 @@ export class Store {
     `).run(now, nextCheckAt, String(videoId));
   }
 
-  markVideoDeleted(videoId, now = Date.now()) {
+  markVideoDeleted(videoId, reason = '', now = Date.now()) {
     this.db.prepare(`
       UPDATE seen_videos
       SET
         deleted_at = ?,
-        deletion_alerted_at = ?,
+        deletion_reason = ?,
         last_deletion_checked_at = ?,
-        next_deletion_check_at = NULL,
+        next_deletion_check_at = ?,
         deletion_check_claimed_at = NULL
       WHERE video_id = ?
-    `).run(now, now, now, String(videoId));
+    `).run(now, String(reason).slice(0, 500), now, now, String(videoId));
+    return this.db.prepare('SELECT * FROM seen_videos WHERE video_id = ?').get(String(videoId)) ?? null;
+  }
+
+  markVideoDeletionAlerted(videoId, now = Date.now()) {
+    this.db.prepare(`
+      UPDATE seen_videos
+      SET deletion_alerted_at = ?, next_deletion_check_at = NULL, deletion_check_claimed_at = NULL
+      WHERE video_id = ?
+        AND deleted_at IS NOT NULL
+    `).run(now, String(videoId));
     return this.db.prepare('SELECT * FROM seen_videos WHERE video_id = ?').get(String(videoId)) ?? null;
   }
 

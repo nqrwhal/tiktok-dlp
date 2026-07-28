@@ -738,6 +738,9 @@ test('runOnce clears scheduled deletion checks for stories', async () => {
 test('runOnce sends deletion alerts for saved posts that disappear', async () => {
   const now = 1_700_000_000_000;
   const alerts = [];
+  let missingCount = 0;
+  let deleted = null;
+  let alertedAt = null;
   const dueVideo = {
     video_id: 'deleted-1',
     username: 'creator',
@@ -748,8 +751,31 @@ test('runOnce sends deletion alerts for saved posts that disappear', async () =>
   };
   const store = {
     listWatches: () => [],
-    listVideosDueForDeletionCheck: () => [dueVideo],
-    markVideoDeleted: (videoId, deletedAt) => ({ ...dueVideo, video_id: videoId, deleted_at: deletedAt }),
+    listVideosDueForDeletionCheck: () => [{
+      ...dueVideo,
+      deletion_missing_count: missingCount,
+      deleted_at: deleted,
+      deletion_alerted_at: alertedAt,
+    }],
+    recordVideoMissing: (videoId, nextCheckAt, reason, checkedAt) => {
+      missingCount += 1;
+      return {
+        ...dueVideo,
+        video_id: videoId,
+        deletion_missing_count: missingCount,
+        next_deletion_check_at: nextCheckAt,
+        deletion_reason: reason,
+        last_deletion_checked_at: checkedAt,
+      };
+    },
+    markVideoDeleted: (videoId, reason, deletedAt) => {
+      deleted = deletedAt;
+      return { ...dueVideo, video_id: videoId, deleted_at: deletedAt, deletion_reason: reason };
+    },
+    markVideoDeletionAlerted: (videoId, deliveredAt) => {
+      alertedAt = deliveredAt;
+      return { ...dueVideo, video_id: videoId, deleted_at: deleted, deletion_alerted_at: deliveredAt };
+    },
   };
   const downloader = {
     listProfileVideos: async () => [],
@@ -764,13 +790,65 @@ test('runOnce sends deletion alerts for saved posts that disappear', async () =>
     now: () => now,
   });
 
+  const firstSummary = await monitor.runOnce({ waitForDeletionChecks: true });
+  assert.equal(alerts.length, 0);
+  assert.equal(missingCount, 1);
+  assert.equal(deleted, null);
+
   const summary = await monitor.runOnce({ waitForDeletionChecks: true });
 
   assert.equal(alerts.length, 1);
   assert.equal(alerts[0].video.video_id, 'deleted-1');
   assert.equal(alerts[0].video.deleted_at, now);
   assert.equal(alerts[0].reason, 'not found');
+  assert.equal(alertedAt, now);
+  assert.equal(firstSummary.watchedUsers, 0);
   assert.equal(summary.watchedUsers, 0);
+});
+
+test('failed deletion alerts remain pending and retry without rechecking TikTok', async () => {
+  const now = 1_700_000_100_000;
+  const postponed = [];
+  let checks = 0;
+  const dueVideo = {
+    video_id: 'deleted-pending',
+    username: 'creator',
+    source_url: 'https://www.tiktok.com/@creator/video/deleted-pending',
+    deleted_at: now - 1000,
+    deletion_alerted_at: null,
+    deletion_reason: 'not found twice',
+  };
+  const monitor = new TikTokMonitor({
+    store: {
+      listWatches: () => [],
+      listVideosDueForDeletionCheck: () => [dueVideo],
+      postponeVideoDeletionCheck: (videoId, nextCheckAt, checkedAt) => {
+        postponed.push({ videoId, nextCheckAt, checkedAt });
+      },
+    },
+    downloader: {
+      listProfileVideos: async () => [],
+      download: async () => ({}),
+      checkVideoAvailable: async () => {
+        checks += 1;
+        return { available: true };
+      },
+    },
+    deletionAlert: async () => {
+      throw new Error('Discord unavailable');
+    },
+    logger: { warn() {}, info() {} },
+    now: () => now,
+  });
+
+  await monitor.runOnce({ waitForDeletionChecks: true });
+
+  assert.equal(checks, 0);
+  assert.deepEqual(postponed, [{
+    videoId: 'deleted-pending',
+    nextCheckAt: now + 5 * 60 * 1000,
+    checkedAt: now,
+  }]);
 });
 
 test('IP-blocked deletion checks wait six hours before retrying', async () => {
