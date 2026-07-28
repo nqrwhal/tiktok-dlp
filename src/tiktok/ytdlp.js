@@ -58,6 +58,7 @@ export function buildMetadataArgs(sourceUrl, options = {}) {
   if ((options.playlist === true || options.flatPlaylist) && playlistEnd) {
     args.push('--playlist-end', String(playlistEnd));
   }
+  if (options.proxy || options.ytdlpProxy) args.push('--proxy', String(options.proxy || options.ytdlpProxy));
   if (options.cookiesFile) args.push('--cookies', String(options.cookiesFile));
   if (options.ytdlpCookiesFile) args.push('--cookies', String(options.ytdlpCookiesFile));
   if (Array.isArray(options.extraArgs)) args.push(...options.extraArgs.map(String));
@@ -76,6 +77,7 @@ export function buildDownloadArgs(sourceUrl, options = {}) {
     '--paths',
     `temp:${outputDir}`,
   ];
+  if (options.proxy || options.ytdlpProxy) args.push('--proxy', String(options.proxy || options.ytdlpProxy));
   if (options.cookiesFile) args.push('--cookies', String(options.cookiesFile));
   if (options.ytdlpCookiesFile) args.push('--cookies', String(options.ytdlpCookiesFile));
   if (options.format) replaceArgValue(args, '--format', String(options.format));
@@ -422,12 +424,16 @@ export function classifyYtdlpError(error) {
     return makeClassification('rate_limited', 'yt-dlp was rate limited.', true, exitCode, signal, stdout, stderr);
   }
 
-  if (/sign in|login|logged in|authentication|cookies?/.test(combined)) {
-    return makeClassification('auth_required', 'yt-dlp needs authentication cookies for this source.', false, exitCode, signal, stdout, stderr);
+  if (/ip address is blocked|blocked from accessing this post/.test(combined)) {
+    return makeClassification('access_blocked', 'TikTok blocked the current network path.', true, exitCode, signal, stdout, stderr);
   }
 
   if (/private|age[- ]restricted|members[- ]only|video is private|not available in your country/.test(combined)) {
     return makeClassification('access_denied', 'The video is not publicly accessible.', false, exitCode, signal, stdout, stderr);
+  }
+
+  if (/sign in|login|logged in|authentication|cookies?/.test(combined)) {
+    return makeClassification('auth_required', 'yt-dlp needs authentication cookies for this source.', false, exitCode, signal, stdout, stderr);
   }
 
   if (/unsupported url|invalid url|no suitable extractor/.test(combined)) {

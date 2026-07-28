@@ -303,7 +303,7 @@ Rewind bridge:
 | Imports | `IMPORT_API_TOKEN`, `IMPORT_MAX_DURATION_SECONDS`, `IMPORT_CONCURRENCY`, `IMPORT_PROFILE_TIMEOUT_SECONDS` |
 | Retention | `DOWNLOAD_LINK_TTL_MINUTES`, `RETENTION_DAYS`, `ARCHIVE_TRASH_RETENTION_DAYS`, `CLEANUP_BATCH_SIZE`, `CLEANUP_ORPHAN_GRACE_MINUTES` |
 | Media bounds | `DISCORD_UPLOAD_LIMIT_MB`, `MAX_MEDIA_DOWNLOAD_MB`, `MAX_SLIDESHOW_IMAGES`, `MAX_SLIDESHOW_ITEM_MB`, `MAX_SLIDESHOW_TOTAL_MB` |
-| Paths/tools | `DATA_DIR`, `STATE_DB`, `DOWNLOAD_DIR`, `YTDLP_PATH`, `YTDLP_COOKIES_FILE`, `YTDLP_RETRIES`, `YTDLP_TIMEOUT_SECONDS` |
+| Paths/tools | `DATA_DIR`, `STATE_DB`, `DOWNLOAD_DIR`, `YTDLP_PATH`, `YTDLP_PROXY`, `YTDLP_COOKIES_FILE`, `YTDLP_RETRIES`, `YTDLP_TIMEOUT_SECONDS` |
 
 If TikTok requires authenticated cookies for public content in your environment,
 place a cookies file at `./cookies/tiktok.txt` and set:
@@ -311,6 +311,20 @@ place a cookies file at `./cookies/tiktok.txt` and set:
 ```env
 YTDLP_COOKIES_FILE=/app/cookies/tiktok.txt
 ```
+
+`YTDLP_PROXY` routes only `yt-dlp` traffic through an HTTP proxy. This is useful
+when TikTok blocks the host IP without forcing Discord or the web service through
+the same proxy. A host-reachable proxy needs no Compose changes. If the proxy is
+another container on an existing Docker network, enable the optional overlay:
+
+```env
+YTDLP_PROXY=http://gluetun:8888
+COMPOSE_FILE=docker-compose.yml:docker-compose.proxy.yml
+YTDLP_PROXY_NETWORK=media_default
+```
+
+The base Compose file stays independent of that external network, so installs
+that do not use a containerized proxy continue to start normally.
 
 ## Retention and storage behavior
 

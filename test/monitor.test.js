@@ -773,6 +773,47 @@ test('runOnce sends deletion alerts for saved posts that disappear', async () =>
   assert.equal(summary.watchedUsers, 0);
 });
 
+test('IP-blocked deletion checks wait six hours before retrying', async () => {
+  const now = 1_700_000_500_000;
+  const postponed = [];
+  const dueVideo = {
+    video_id: 'blocked-1',
+    username: 'creator',
+    source_url: 'https://www.tiktok.com/@creator/video/blocked-1',
+    deletion_check_count: 0,
+  };
+  const store = {
+    listWatches: () => [],
+    listVideosDueForDeletionCheck: () => [dueVideo],
+    postponeVideoDeletionCheck: (videoId, nextCheckAt, checkedAt) => {
+      postponed.push({ videoId, nextCheckAt, checkedAt });
+    },
+  };
+  const blockedError = Object.assign(new Error('TikTok blocked the current network path.'), {
+    kind: 'access_blocked',
+  });
+  const monitor = new TikTokMonitor({
+    store,
+    downloader: {
+      listProfileVideos: async () => [],
+      download: async () => ({}),
+      checkVideoAvailable: async () => {
+        throw blockedError;
+      },
+    },
+    logger: { warn() {}, info() {} },
+    now: () => now,
+  });
+
+  await monitor.runOnce({ waitForDeletionChecks: true });
+
+  assert.deepEqual(postponed, [{
+    videoId: 'blocked-1',
+    nextCheckAt: now + 6 * 60 * 60 * 1000,
+    checkedAt: now,
+  }]);
+});
+
 test('slow deletion checks run in a separate bounded worker and do not stall profile scans', async () => {
   const now = 1_700_000_700_000;
   let releaseDeletion;

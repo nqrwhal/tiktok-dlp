@@ -1,0 +1,10 @@
+services:
+  tiktok-discord-downloader:
+    networks:
+      - default
+      - media_vpn
+
+networks:
+  media_vpn:
+    name: ${YTDLP_PROXY_NETWORK:-media_default}
+    external: true

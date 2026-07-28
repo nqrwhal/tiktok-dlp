@@ -38,6 +38,7 @@ test('loadConfig resolves paths and upload limits', () => {
     DATA_DIR: './x',
     DISCORD_UPLOAD_LIMIT_MB: '2',
     HTTP_PORT: '9999',
+    YTDLP_PROXY: ' http://proxy.test:8888 ',
   }, '/tmp/project');
   assert.equal(config.dataDir, '/tmp/project/x');
   assert.equal(config.discordUploadLimitBytes, 2 * 1024 * 1024);
@@ -57,6 +58,7 @@ test('loadConfig resolves paths and upload limits', () => {
   assert.equal(config.archiveTrashRetentionDays, 30);
   assert.equal(config.deletionCheckConcurrency, 2);
   assert.equal(config.maxSlideshowImages, 35);
+  assert.equal(config.ytdlpProxy, 'http://proxy.test:8888');
   assert.equal(config.ytdlpTimeoutMs, 60_000);
 });
 

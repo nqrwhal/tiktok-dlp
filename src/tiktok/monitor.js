@@ -792,7 +792,10 @@ export class TikTokMonitor {
         ),
       );
     } catch (error) {
-      await Promise.resolve(this.store.postponeVideoDeletionCheck?.(video.video_id, now + 5 * 60 * 1000, now));
+      const retryDelayMs = error?.kind === 'access_blocked'
+        ? 6 * 60 * 60 * 1000
+        : 5 * 60 * 1000;
+      await Promise.resolve(this.store.postponeVideoDeletionCheck?.(video.video_id, now + retryDelayMs, now));
       this.logger?.warn?.(`Deletion check failed for ${video.video_id}: ${error instanceof Error ? error.message : String(error)}`);
       throw error;
     }

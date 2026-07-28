@@ -21,6 +21,7 @@ const TEST_SEC_UID = `MS4wLjABAAAA${'a'.repeat(64)}`;
 test('buildMetadataArgs builds a conservative metadata command', () => {
   const args = buildMetadataArgs('https://www.tiktok.com/@user/video/123', {
     cookiesFile: '/tmp/cookies.txt',
+    ytdlpProxy: 'http://proxy.test:8888',
     extraArgs: ['--extractor-args', 'tiktok:foo=bar'],
   });
 
@@ -34,6 +35,8 @@ test('buildMetadataArgs builds a conservative metadata command', () => {
     '--skip-download',
     '--dump-single-json',
     '--no-playlist',
+    '--proxy',
+    'http://proxy.test:8888',
     '--cookies',
     '/tmp/cookies.txt',
     '--extractor-args',
@@ -53,6 +56,7 @@ test('buildDownloadArgs points yt-dlp at explicit output dirs', () => {
   const args = buildDownloadArgs('https://www.tiktok.com/@user/video/123', {
     outputDir: '/tmp/out',
     cookiesFile: '/tmp/cookies.txt',
+    ytdlpProxy: 'http://proxy.test:8888',
     format: 'bv*+ba/b',
     extraArgs: ['--print', 'after_move:filepath'],
   });
@@ -88,6 +92,8 @@ test('buildDownloadArgs points yt-dlp at explicit output dirs', () => {
     'home:/tmp/out',
     '--paths',
     'temp:/tmp/out',
+    '--proxy',
+    'http://proxy.test:8888',
     '--cookies',
     '/tmp/cookies.txt',
     '--print',
@@ -136,6 +142,11 @@ test('classifyYtdlpError maps common yt-dlp failures', () => {
   assert.equal(classifyYtdlpError({ code: 'ENOENT' }).kind, 'not_installed');
   assert.equal(classifyYtdlpError(new Error('Video unavailable')).kind, 'not_found');
   assert.equal(classifyYtdlpError(new Error('Sign in to confirm your age')).kind, 'auth_required');
+  assert.equal(classifyYtdlpError(new Error('Your IP address is blocked from accessing this post')).kind, 'access_blocked');
+  assert.equal(
+    classifyYtdlpError(new Error('This user’s account is private. Log in or use --cookies.')).kind,
+    'access_denied',
+  );
 });
 
 test('fetchVideoMetadata, listProfileVideos, and downloadVideo work with a fake executable', async () => {

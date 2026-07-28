@@ -43,6 +43,7 @@ services:
       STATE_DB: ${STATE_DB:-./data/state.db}
       DOWNLOAD_DIR: ${DOWNLOAD_DIR:-./data/downloads}
       YTDLP_PATH: ${YTDLP_PATH:-yt-dlp}
+      YTDLP_PROXY: ${YTDLP_PROXY:-}
       YTDLP_COOKIES_FILE: ${YTDLP_COOKIES_FILE:-}
       YTDLP_RETRIES: ${YTDLP_RETRIES:-3}
       YTDLP_TIMEOUT_SECONDS: ${YTDLP_TIMEOUT_SECONDS:-60}

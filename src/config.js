@@ -89,6 +89,7 @@ export function loadConfig(env = process.env, cwd = process.cwd()) {
     pingMode: String(env.PING_MODE ?? 'none').toLowerCase(),
     pingRoleId: env.PING_ROLE_ID ?? '',
     ytdlpPath: env.YTDLP_PATH ?? 'yt-dlp',
+    ytdlpProxy: String(env.YTDLP_PROXY ?? '').trim(),
     ytdlpCookiesFile: env.YTDLP_COOKIES_FILE ? resolvePath(env.YTDLP_COOKIES_FILE, cwd) : '',
     ytdlpRetries: parsePositiveInt(env.YTDLP_RETRIES, 3),
     ytdlpTimeoutMs: parsePositiveInt(env.YTDLP_TIMEOUT_SECONDS, 60) * 1000,
