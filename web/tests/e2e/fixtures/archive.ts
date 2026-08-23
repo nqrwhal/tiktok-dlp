@@ -62,7 +62,7 @@ export interface FixtureTrashVideo {
 export interface FixtureImport {
   id: number;
   username: string;
-  status: "queued" | "running" | "completed" | "failed" | "canceled";
+  status: "queued" | "running" | "canceling" | "completed" | "failed" | "canceled";
   maxDurationSeconds: number;
   discoveredCount: number;
   processedCount: number;

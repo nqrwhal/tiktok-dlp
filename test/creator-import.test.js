@@ -226,8 +226,12 @@ test('running creator imports cancel cooperatively and retry only unfinished ite
     await started;
     const cancellation = service.cancel(startedImport.import.id);
     assert.equal(cancellation.accepted, true);
-    assert.equal(cancellation.import.status, 'running');
+    assert.equal(cancellation.import.status, 'canceling');
     assert.ok(cancellation.import.cancel_requested_at);
+    const reusedWhileCanceling = service.start({ username: 'creator' });
+    assert.equal(reusedWhileCanceling.reused, false);
+    assert.notEqual(reusedWhileCanceling.import.id, startedImport.import.id);
+    service.cancel(reusedWhileCanceling.import.id);
     releaseFirst();
     await service.waitForIdle();
 

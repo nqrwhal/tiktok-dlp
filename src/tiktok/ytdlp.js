@@ -18,6 +18,17 @@ const METADATA_BASE_ARGS = [
   '--dump-single-json',
 ];
 
+// TikTok's HEVC URLs can be video-only even when extractor metadata reports AAC.
+// Prefer the H.264/AVC rendition, which is multiplexed and broadly playable by Discord.
+const DISCORD_COMPATIBLE_FORMAT = [
+  'bv*[vcodec^=h264]+ba',
+  'b[vcodec^=h264]',
+  'bv*[vcodec^=avc]+ba',
+  'b[vcodec^=avc]',
+  'bv*+ba',
+  'b',
+].join('/');
+
 const DOWNLOAD_BASE_ARGS = [
   '--ignore-config',
   '--no-warnings',
@@ -36,7 +47,7 @@ const DOWNLOAD_BASE_ARGS = [
   '20',
   '--no-playlist',
   '--format',
-  'bv*+ba/b',
+  DISCORD_COMPATIBLE_FORMAT,
   '--restrict-filenames',
   '--merge-output-format',
   'mp4',
@@ -210,6 +221,7 @@ export async function downloadVideo(sourceUrl, options = {}) {
     ? path.resolve(options.outputDir)
     : await makeTempDownloadDir(tempParent);
   const ownsTempDir = !options.outputDir;
+  const workDir = { path: tempDir, owned: ownsTempDir, tempParent };
 
   try {
     await ensureTempDir(tempDir);
@@ -233,7 +245,8 @@ export async function downloadVideo(sourceUrl, options = {}) {
       stderr = result.stderr;
     } catch (error) {
       if (!shouldTryPhotoFallback(sourceUrl, error, options)) throw error;
-      return await downloadPhotoPost(sourceUrl, await fetchPhotoPostMetadata(sourceUrl, options), tempDir, options);
+      const slideshowDir = await prepareSlideshowWorkDir(workDir);
+      return await downloadPhotoPost(sourceUrl, await fetchPhotoPostMetadata(sourceUrl, options), slideshowDir, options);
     }
 
     let downloadDir = tempDir;
@@ -267,9 +280,8 @@ export async function downloadVideo(sourceUrl, options = {}) {
           noVideoError.cause = error;
         }
         if (photoMetadata) {
-          await rm(tempDir, { recursive: true, force: true });
-          await ensureTempDir(tempDir);
-          return downloadPhotoPost(sourceUrl, photoMetadata, tempDir, options);
+          const slideshowDir = await prepareSlideshowWorkDir(workDir);
+          return downloadPhotoPost(sourceUrl, photoMetadata, slideshowDir, options);
         }
       }
 
@@ -1084,6 +1096,16 @@ async function ensureTempDir(dir) {
 async function makeTempDownloadDir(parentDir) {
   await ensureTempDir(parentDir);
   return mkdtemp(path.join(parentDir, 'tiktok-ytdlp-'));
+}
+
+async function prepareSlideshowWorkDir(workDir) {
+  if (workDir.owned) {
+    await rm(workDir.path, { recursive: true, force: true });
+    await ensureTempDir(workDir.path);
+    return workDir.path;
+  }
+  // Never wipe a caller-supplied outputDir; stage the slideshow in a fresh child.
+  return makeTempDownloadDir(workDir.tempParent);
 }
 
 function pickPrimaryFile(files) {

@@ -431,7 +431,7 @@ export async function sendUsernameChangeAlert({ client, config, change, watch })
 export async function buildMonitorAlertPayload(result, config, { video = {}, watch = {}, now = Date.now() } = {}) {
   const username = watch?.username || result?.username || video?.username || video?.uploader || 'unknown';
   const sourceUrl = result?.sourceUrl || video?.sourceUrl || video?.url || video?.webpage_url || '';
-  const attachments = buildMonitorAlertAttachments(result, config);
+  const attachments = planAttachments(result, config);
   const fields = [
     {
       name: 'Type',
@@ -457,7 +457,7 @@ export async function buildMonitorAlertPayload(result, config, { video = {}, wat
   if (result?.mediaType === 'slideshow') {
     fields.push({
       name: 'Slideshow',
-      value: formatSlideshowAlertNote(result, attachments.mode),
+      value: formatSlideshowAlertNote(attachments),
       inline: false,
     });
   }
@@ -485,11 +485,17 @@ export async function buildDeliveryPayload(result, config, requestedDelivery = '
   const canUpload = shouldUploadToDiscord(result.sizeBytes, config);
   const wantsFile = requestedDelivery === 'file' || (requestedDelivery === 'auto' && canUpload && !result.reused);
   const attachments = wantsFile
-    ? buildMonitorAlertAttachments(result, config)
-    : { files: [], mode: 'link' };
+    ? planAttachments(result, config)
+    : {
+      kind: 'none',
+      reason: result.reused ? 'reused-auto' : 'link-only',
+      files: [],
+      mode: 'link',
+      imageCount: Number(result.imageCount ?? 0),
+    };
   const embed = buildStandardDownloadEmbed(result, config, {
     video: options.video,
-    attachmentMode: attachments.mode,
+    attachmentPlan: attachments,
     now: options.now ?? Date.now(),
   });
 
@@ -868,10 +874,11 @@ export function buildVideoEmbed(result, video = {}) {
   return embed;
 }
 
-function buildStandardDownloadEmbed(result, config, { video = {}, attachmentMode = 'link', now = Date.now() } = {}) {
+function buildStandardDownloadEmbed(result, config, { video = {}, attachmentPlan = null, attachmentMode = null, now = Date.now() } = {}) {
   const username = result?.username || video?.username || video?.uploader || 'unknown';
   const sourceUrl = result?.sourceUrl || video?.sourceUrl || video?.url || video?.webpage_url || '';
   const link = result?.publicUrl || (result?.token ? makePublicFileUrl(config, result.token) : '');
+  const plan = attachmentPlan ?? { kind: 'none', reason: 'link-only', files: [], mode: attachmentMode || 'link', imageCount: Number(result?.imageCount ?? 0) };
   const fields = [
     {
       name: 'Download',
@@ -893,7 +900,7 @@ function buildStandardDownloadEmbed(result, config, { video = {}, attachmentMode
   if (result?.mediaType === 'slideshow') {
     fields.push({
       name: 'Slideshow',
-      value: formatStandardSlideshowNote(result, attachmentMode),
+      value: formatStandardSlideshowNote(plan),
       inline: true,
     });
   }
@@ -934,8 +941,10 @@ function buildMonitorActionRows(result, config = {}) {
   return components.length ? [new ActionRowBuilder().addComponents(...components)] : [];
 }
 
-function buildMonitorAlertAttachments(result, config = {}) {
-  if (!result?.filePath) return { files: [], mode: 'link' };
+function planAttachments(result, config = {}) {
+  if (!result?.filePath) {
+    return { kind: 'none', reason: 'no-file', files: [], mode: 'link', imageCount: Number(result?.imageCount ?? 0) };
+  }
 
   if (result?.mediaType === 'slideshow') {
     const imageCount = Number(result.imageCount ?? 0);
@@ -945,44 +954,58 @@ function buildMonitorAlertAttachments(result, config = {}) {
     const hasCompleteGallery = imagePaths.length > 0 && (!imageCount || imagePaths.length >= imageCount);
     if (imageCount <= 10 && hasCompleteGallery) {
       return {
-        mode: 'gallery',
+        kind: 'gallery',
         files: imagePaths.map((filePath) => new AttachmentBuilder(filePath, { name: path.basename(filePath) })),
+        imageCount,
+        mode: 'gallery',
       };
     }
     if (shouldUploadToDiscord(result.sizeBytes, config)) {
       return {
-        mode: 'zip',
+        kind: 'upload',
+        as: 'zip',
+        why: imageCount > 10 ? 'over-10' : 'incomplete-gallery',
         files: [new AttachmentBuilder(result.filePath, { name: result.filename || path.basename(result.filePath) })],
+        imageCount,
+        mode: 'zip',
       };
     }
-    return { files: [], mode: 'link' };
+    return { kind: 'none', reason: 'oversize', files: [], imageCount, mode: 'link' };
   }
 
-  if (!shouldUploadToDiscord(result.sizeBytes, config)) return { files: [], mode: 'link' };
+  if (!shouldUploadToDiscord(result.sizeBytes, config)) {
+    return { kind: 'none', reason: 'oversize', files: [], mode: 'link', imageCount: 0 };
+  }
   return {
-    mode: 'video',
+    kind: 'upload',
+    as: 'video',
     files: [new AttachmentBuilder(result.filePath, { name: result.filename || path.basename(result.filePath) })],
+    mode: 'video',
+    imageCount: 0,
   };
 }
 
-function formatSlideshowAlertNote(result, attachmentMode) {
-  const imageCount = Number(result?.imageCount ?? 0);
-  if (imageCount > 10) {
-    return `${imageCount} images. Using the ZIP because Discord galleries support up to 10 attachments.`;
+function formatSlideshowAlertNote(plan) {
+  const imageCount = Number(plan?.imageCount ?? 0);
+  if (plan?.kind === 'gallery') {
+    return `${imageCount || 'Multiple'} images attached below. The ZIP is saved permanently.`;
   }
-  if (attachmentMode === 'gallery') {
-    return `${imageCount || result?.slideshowImagePaths?.length || 'Multiple'} images attached below. The ZIP is saved permanently.`;
-  }
-  if (attachmentMode === 'zip') {
+  if (plan?.kind === 'upload' && plan.as === 'zip') {
+    if (plan.why === 'over-10') {
+      return `${imageCount} images. Using the ZIP because Discord galleries support up to 10 attachments.`;
+    }
     return 'Gallery images were not available, so the ZIP is attached below.';
   }
   return 'Use the Download ZIP button for the saved slideshow.';
 }
 
-function formatStandardSlideshowNote(result, attachmentMode) {
-  const imageCount = Number(result?.imageCount ?? 0);
-  if (attachmentMode === 'gallery') return imageCount ? `${imageCount} images` : 'Gallery';
-  if (imageCount > 10) return `ZIP (${imageCount} images)`;
+function formatStandardSlideshowNote(plan) {
+  const imageCount = Number(plan?.imageCount ?? 0);
+  if (plan?.kind === 'gallery') return imageCount ? `${imageCount} images` : 'Gallery';
+  if (plan?.kind === 'upload' && plan.as === 'zip' && plan.why === 'over-10') {
+    return `ZIP (${imageCount} images)`;
+  }
+  if (plan?.kind === 'none') return imageCount > 10 ? `Link (${imageCount} images)` : 'Link';
   return 'ZIP';
 }
 
@@ -1095,35 +1118,73 @@ function canManageLink(record, interaction, config = {}) {
 function watchScopeFromInteraction(interaction, config = {}) {
   const channelId = String(interaction?.channelId || config.discordChannelId || '');
   if (!channelId) throw new Error('A Discord channel is required to register a watch.');
+  const scope = discordScopeFromInteraction(interaction, config);
   return {
-    guildId: interaction?.guildId ? String(interaction.guildId) : `dm:${channelId}`,
-    channelId,
+    guildId: toWatchGuildId(scope),
+    channelId: scope.channelId,
     createdBy: String(interaction?.user?.id ?? ''),
   };
 }
 
+export function discordScopeFromInteraction(interaction = {}, config = {}) {
+  const channelId = String(interaction?.channelId || config.discordChannelId || '');
+  const rawGuildId = String(interaction?.guildId ?? '');
+  if (rawGuildId && !rawGuildId.startsWith('dm:')) {
+    return { kind: 'guild', guildId: rawGuildId, channelId };
+  }
+  if (!channelId) throw new Error('A Discord channel is required to register a watch.');
+  return { kind: 'dm', channelId };
+}
+
+export function toWatchGuildId(scope) {
+  if (scope?.kind === 'guild') return String(scope.guildId);
+  return `dm:${String(scope?.channelId ?? '')}`;
+}
+
+export function toLinkScopeId(scope) {
+  if (scope?.kind === 'guild') return `guild:${String(scope.guildId)}`;
+  return `channel:${String(scope?.channelId ?? '')}`;
+}
+
+export function matchesLinkScope(storedScopeId, scope) {
+  const stored = String(storedScopeId ?? '');
+  if (!stored) return true;
+  const current = toLinkScopeId(scope);
+  if (stored === current) return true;
+  // Legacy watch subscriptions were migrated without a guild id, so their
+  // monitor deliveries were scoped to the destination channel.
+  return Boolean(scope?.channelId && stored === `channel:${scope.channelId}`);
+}
+
 export function monitorScopeId(interaction = {}) {
-  const guildId = String(interaction?.guildId ?? '');
-  if (guildId && !guildId.startsWith('dm:')) return `guild:${guildId}`;
-  return `channel:${String(interaction?.channelId ?? '')}`;
+  try {
+    return toLinkScopeId(discordScopeFromInteraction(interaction));
+  } catch {
+    return `channel:${String(interaction?.channelId ?? '')}`;
+  }
 }
 
 export function monitorScopeMatches(scopeId, interaction = {}) {
-  const storedScopeId = String(scopeId ?? '');
-  if (!storedScopeId) return true;
-  if (storedScopeId === monitorScopeId(interaction)) return true;
-
-  // Legacy watch subscriptions were migrated without a guild id, so their
-  // monitor deliveries were scoped to the destination channel. A button click
-  // in that same guild now resolves to a guild scope. Keep those existing
-  // buttons usable without allowing the delivery to cross channel boundaries.
-  const channelId = String(interaction?.channelId ?? '');
-  return Boolean(channelId && storedScopeId === `channel:${channelId}`);
+  try {
+    return matchesLinkScope(scopeId, discordScopeFromInteraction(interaction));
+  } catch {
+    const channelId = String(interaction?.channelId ?? '');
+    return Boolean(channelId && String(scopeId ?? '') === `channel:${channelId}`);
+  }
 }
 
 export async function resolveMonitorDeliveryScope(client, target = {}) {
   const channelId = String(target?.channelId ?? target?.channel_id ?? '');
   let guildId = String(target?.guildId ?? target?.guild_id ?? '');
+
+  if (guildId.startsWith('dm:')) {
+    const dmChannelId = channelId || guildId.slice(3);
+    return {
+      guildId,
+      channelId: dmChannelId,
+      scopeId: toLinkScopeId({ kind: 'dm', channelId: dmChannelId }),
+    };
+  }
 
   if (!guildId && channelId) {
     let channel = client?.channels?.cache?.get?.(channelId) ?? null;
@@ -1138,10 +1199,13 @@ export async function resolveMonitorDeliveryScope(client, target = {}) {
     guildId = String(channel?.guildId ?? channel?.guild?.id ?? '');
   }
 
+  const scope = guildId
+    ? { kind: 'guild', guildId, channelId }
+    : { kind: 'dm', channelId };
   return {
     guildId,
     channelId,
-    scopeId: monitorScopeId({ guildId, channelId }),
+    scopeId: toLinkScopeId(scope),
   };
 }
 

@@ -41,7 +41,7 @@ export function loadConfig(env = process.env, cwd = process.cwd()) {
   const downloadDir = resolvePath(env.DOWNLOAD_DIR ?? path.join(dataDir, 'downloads'), cwd);
   const stateDbPath = resolvePath(env.STATE_DB ?? path.join(dataDir, 'state.db'), cwd);
   const publicBaseUrl = String(env.PUBLIC_BASE_URL ?? 'https://example.com').replace(/\/+$/, '');
-  const uploadLimitMb = parsePositiveInt(env.DISCORD_UPLOAD_LIMIT_MB, 10);
+  const uploadLimitMb = parsePositiveInt(env.DISCORD_UPLOAD_LIMIT_MB, 20);
   const httpPort = parsePositiveInt(env.HTTP_PORT, 8080);
   const downloadLinkTtlMinutes = parsePositiveInt(env.DOWNLOAD_LINK_TTL_MINUTES, 30);
   const slideshowItemLimitMb = parsePositiveInt(env.MAX_SLIDESHOW_ITEM_MB, 20);

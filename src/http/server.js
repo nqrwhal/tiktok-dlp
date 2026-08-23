@@ -387,7 +387,7 @@ export async function handleVideoRestoreRequest(req, res, { config, store, fileI
     }
     const trashed = store.getTrashedFile?.(fileId);
     if (!trashed) return sendJson(res, 404, { error: 'Trashed video not found' });
-    if (trashed.delete_requested_at != null && trashed.delete_error == null) {
+    if (trashed.retention_status === 'trash_claimed' || (trashed.delete_requested_at != null && trashed.delete_error == null)) {
       return sendJson(res, 409, { error: 'The archived video is currently being purged' });
     }
 

@@ -109,7 +109,7 @@ test('serves files only for valid tokens with private health, HEAD, and Range su
     cancel(id) {
       const record = imports.find((entry) => entry.id === id);
       if (!record) return { accepted: false, reason: 'not_found', import: null };
-      if (!['queued', 'running'].includes(record.status)) {
+      if (!['queued', 'running', 'canceling'].includes(record.status)) {
         return { accepted: false, reason: 'not_active', import: record };
       }
       record.cancel_requested_at = Date.now();
@@ -117,6 +117,8 @@ test('serves files only for valid tokens with private health, HEAD, and Range su
         record.status = 'canceled';
         record.canceled_at = Date.now();
         record.completed_at = Date.now();
+      } else if (record.status === 'running') {
+        record.status = 'canceling';
       }
       return { accepted: true, reason: null, import: record };
     },
@@ -218,7 +220,7 @@ test('serves files only for valid tokens with private health, HEAD, and Range su
   imports[0].cancel_requested_at = null;
   const runningCancelResponse = await fetch(`${baseUrl}/api/imports/1/cancel`, { method: 'POST' });
   assert.equal(runningCancelResponse.status, 202);
-  assert.equal((await runningCancelResponse.json()).import.status, 'running');
+  assert.equal((await runningCancelResponse.json()).import.status, 'canceling');
   const missingCancelResponse = await fetch(`${baseUrl}/api/imports/999/cancel`, { method: 'POST' });
   assert.equal(missingCancelResponse.status, 404);
 

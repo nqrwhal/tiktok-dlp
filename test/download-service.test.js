@@ -11,6 +11,8 @@ test('DownloadService coalesces concurrent requests into one immutable asset wit
   const store = createStore(path.join(dir, 'state.db'));
   const downloadDir = path.join(dir, 'downloads');
   let downloads = 0;
+  let releaseMetadata;
+  const metadataGate = new Promise((resolve) => { releaseMetadata = resolve; });
   try {
     const service = createDownloadService({
       config: {
@@ -23,12 +25,15 @@ test('DownloadService coalesces concurrent requests into one immutable asset wit
         maxQueuedDownloadsPerGuild: 4,
       },
       store,
-      metadataFetcher: async () => ({
-        id: '1234567890123456789',
-        uploader: 'creator',
-        title: 'Shared post',
-        webpage_url: 'https://www.tiktok.com/@creator/video/1234567890123456789',
-      }),
+      metadataFetcher: async () => {
+        await metadataGate;
+        return {
+          id: '1234567890123456789',
+          uploader: 'creator',
+          title: 'Shared post',
+          webpage_url: 'https://www.tiktok.com/@creator/video/1234567890123456789',
+        };
+      },
       downloader: async () => {
         downloads += 1;
         const filePath = path.join(downloadDir, 'creator', 'shared.mp4');
@@ -46,22 +51,35 @@ test('DownloadService coalesces concurrent requests into one immutable asset wit
       },
     });
 
-    const [first, second] = await Promise.all([
-      service.request('https://www.tiktok.com/@creator/video/1234567890123456789', {
-        requestedBy: 'user-a',
-        guildId: 'guild-a',
-        channelId: 'channel-a',
-      }),
-      service.request('https://www.tiktok.com/@creator/video/1234567890123456789', {
-        requestedBy: 'user-b',
-        guildId: 'guild-b',
-        channelId: 'channel-b',
-      }),
-    ]);
+    const firstPromise = service.request('https://www.tiktok.com/@creator/video/1234567890123456789', {
+      requestedBy: 'user-a',
+      guildId: 'guild-a',
+      channelId: 'channel-a',
+    });
+    const secondPromise = service.request('https://www.tiktok.com/@creator/video/1234567890123456789', {
+      requestedBy: 'user-b',
+      guildId: 'guild-b',
+      channelId: 'channel-b',
+    });
+    const thirdPromise = service.request('https://www.tiktok.com/t/ZMshortlink/', {
+      requestedBy: 'user-c',
+      guildId: 'guild-c',
+      channelId: 'channel-c',
+      metadata: {
+        id: '1234567890123456789',
+        uploader: 'creator',
+        title: 'Shared post',
+        webpage_url: 'https://www.tiktok.com/@creator/video/1234567890123456789',
+      },
+    });
+    releaseMetadata();
+    const [first, second, third] = await Promise.all([firstPromise, secondPromise, thirdPromise]);
 
     assert.equal(downloads, 1);
     assert.equal(first.fileId, second.fileId);
+    assert.equal(first.fileId, third.fileId);
     assert.notEqual(first.token, second.token);
+    assert.notEqual(first.token, third.token);
     assert.equal(store.stats().fileCount, 1);
     assert.equal(store.getToken(first.token).owner_id, 'user-a');
     assert.equal(store.getToken(second.token).owner_id, 'user-b');

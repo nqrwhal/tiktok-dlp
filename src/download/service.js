@@ -6,7 +6,6 @@ import { assertTikTokDownloadUrl, extractVideoId, fileSize, makePublicFileUrl, r
 const DEFAULT_MAX_QUEUE_SIZE = 50;
 const DEFAULT_MAX_PER_USER = 3;
 const DEFAULT_MAX_PER_GUILD = 12;
-const HANDOFF = Symbol('download-handoff');
 
 export class DownloadService {
   constructor({
@@ -33,7 +32,8 @@ export class DownloadService {
 
   #queue = [];
   #active = 0;
-  #inFlightAssets = new Map();
+  #identityInFlight = new Map();
+  #downloadInFlight = new Map();
   #pendingByUser = new Map();
   #pendingByGuild = new Map();
 
@@ -180,14 +180,15 @@ export class DownloadService {
       concurrency: this.concurrency,
       active: this.#active,
       queued: this.#queue.length,
-      inFlightAssets: this.#inFlightAssets.size,
+      inFlightAssets: this.#downloadInFlight.size,
+      identityInFlight: this.#identityInFlight.size,
       pendingUsers: sumCounts(this.#pendingByUser),
       pendingGuilds: sumCounts(this.#pendingByGuild),
     };
   }
 
   async waitForIdle() {
-    while (this.#active || this.#queue.length || this.#inFlightAssets.size) {
+    while (this.#active || this.#queue.length || this.#downloadInFlight.size || this.#identityInFlight.size) {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
   }
@@ -218,29 +219,32 @@ export class DownloadService {
     };
   }
 
-  #getAsset(input) {
-    const initialKey = canonicalDownloadKey(input.sourceUrl, input.metadata);
-    const existing = this.#inFlightAssets.get(initialKey);
+  async #getAsset(input) {
+    const metadata = await this.#resolveMetadata(input);
+    const key = canonicalDownloadKey(input.sourceUrl, metadata);
+    const existing = this.#downloadInFlight.get(key);
     if (existing) return existing;
 
-    const task = { keys: new Set([initialKey]), promise: null };
-    task.promise = this.#enqueue(async () => {
-      const metadata = input.metadata ?? await this.metadataFetcher(input.sourceUrl, this.config);
-      const canonicalKey = canonicalDownloadKey(input.sourceUrl, metadata);
-      const canonicalExisting = this.#inFlightAssets.get(canonicalKey);
-      if (canonicalExisting && canonicalExisting !== task.promise) {
-        return { [HANDOFF]: canonicalExisting };
-      }
-      task.keys.add(canonicalKey);
-      this.#inFlightAssets.set(canonicalKey, task.promise);
-      return this.#materializeAsset(input.sourceUrl, metadata, input.username);
-    }).finally(() => {
-      for (const key of task.keys) {
-        if (this.#inFlightAssets.get(key) === task.promise) this.#inFlightAssets.delete(key);
-      }
-    });
-    this.#inFlightAssets.set(initialKey, task.promise);
-    return task.promise;
+    const promise = this.#enqueue(() => this.#materializeAsset(input.sourceUrl, metadata, input.username))
+      .finally(() => {
+        if (this.#downloadInFlight.get(key) === promise) this.#downloadInFlight.delete(key);
+      });
+    this.#downloadInFlight.set(key, promise);
+    return promise;
+  }
+
+  #resolveMetadata(input) {
+    if (input.metadata) return Promise.resolve(input.metadata);
+    const identityKey = canonicalDownloadKey(input.sourceUrl, null);
+    const existing = this.#identityInFlight.get(identityKey);
+    if (existing) return existing;
+
+    const promise = Promise.resolve(this.metadataFetcher(input.sourceUrl, this.config))
+      .finally(() => {
+        if (this.#identityInFlight.get(identityKey) === promise) this.#identityInFlight.delete(identityKey);
+      });
+    this.#identityInFlight.set(identityKey, promise);
+    return promise;
   }
 
   async #materializeAsset(sourceUrl, metadata, requestedUsername) {
@@ -333,24 +337,12 @@ export class DownloadService {
     while (this.#active < this.concurrency && this.#queue.length) {
       const task = this.#queue.shift();
       this.#active += 1;
-      let handedOff = false;
       void Promise.resolve()
         .then(task.work)
-        .then((result) => {
-          if (result?.[HANDOFF]) {
-            handedOff = true;
-            this.#active -= 1;
-            this.#drainQueue();
-            result[HANDOFF].then(task.resolve, task.reject);
-            return;
-          }
-          task.resolve(result);
-        }, task.reject)
+        .then(task.resolve, task.reject)
         .finally(() => {
-          if (!handedOff) {
-            this.#active -= 1;
-            this.#drainQueue();
-          }
+          this.#active -= 1;
+          this.#drainQueue();
         });
     }
   }

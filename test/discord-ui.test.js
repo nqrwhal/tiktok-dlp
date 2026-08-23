@@ -249,6 +249,36 @@ test('monitor slideshow alerts attach galleries only when Discord can show all i
 
   assert.deepEqual(zipPayload.files.map((file) => file.name), ['large-slideshow.zip']);
   assert.match(zipPayload.embeds[0].data.fields.find((field) => field.name === 'Slideshow').value, /up to 10 attachments/);
+
+  const oversizePayload = await buildMonitorAlertPayload({
+    token: 'oversize-zip-token',
+    publicUrl: 'https://example.com/files/oversize-zip-token',
+    filePath: '/tmp/oversize-slideshow.zip',
+    filename: 'oversize-slideshow.zip',
+    title: 'oversize photo post',
+    sizeBytes: 25 * 1024 * 1024,
+    videoId: 'photo-3',
+    username: 'creator',
+    mediaType: 'slideshow',
+    imageCount: 12,
+    slideshowImagePaths: [],
+  }, {
+    publicBaseUrl: 'https://example.com',
+    discordUploadLimitBytes: 20 * 1024 * 1024,
+  }, {
+    watch: { username: 'creator' },
+    now: 1_700_000_000_000,
+  });
+
+  assert.equal(oversizePayload.files.length, 0);
+  assert.match(
+    oversizePayload.embeds[0].data.fields.find((field) => field.name === 'Slideshow').value,
+    /Download ZIP button/i,
+  );
+  assert.doesNotMatch(
+    oversizePayload.embeds[0].data.fields.find((field) => field.name === 'Slideshow').value,
+    /Using the ZIP/i,
+  );
 });
 
 test('monitor delete button removes saved post records and slideshow sidecars', async () => {

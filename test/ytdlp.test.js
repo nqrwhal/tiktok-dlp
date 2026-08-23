@@ -1,4 +1,4 @@
-import { mkdtemp, chmod, readFile, readdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, chmod, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { strict as assert } from 'node:assert';
@@ -57,7 +57,6 @@ test('buildDownloadArgs points yt-dlp at explicit output dirs', () => {
     outputDir: '/tmp/out',
     cookiesFile: '/tmp/cookies.txt',
     ytdlpProxy: 'http://proxy.test:8888',
-    format: 'bv*+ba/b',
     extraArgs: ['--print', 'after_move:filepath'],
   });
 
@@ -79,7 +78,7 @@ test('buildDownloadArgs points yt-dlp at explicit output dirs', () => {
     '20',
     '--no-playlist',
     '--format',
-    'bv*+ba/b',
+    'bv*[vcodec^=h264]+ba/b[vcodec^=h264]/bv*[vcodec^=avc]+ba/b[vcodec^=avc]/bv*+ba/b',
     '--restrict-filenames',
     '--merge-output-format',
     'mp4',
@@ -101,6 +100,12 @@ test('buildDownloadArgs points yt-dlp at explicit output dirs', () => {
     '--',
     'https://www.tiktok.com/@user/video/123',
   ]);
+
+  const overridden = buildDownloadArgs('https://www.tiktok.com/@user/video/123', {
+    outputDir: '/tmp/out',
+    format: 'bv*+ba/b',
+  });
+  assert.equal(overridden[overridden.indexOf('--format') + 1], 'bv*+ba/b');
 });
 
 test('yt-dlp public download entry points reject unsafe URLs before subprocess or fetch work', async () => {
@@ -306,6 +311,33 @@ test('downloadVideo converts artifact-only photo posts through the slideshow fal
   assert.equal(result.mediaType, 'slideshow');
   assert.equal(path.extname(result.primaryFile), '.zip');
   assert.ok((await readFile(result.primaryFile)).includes(Buffer.from('manifest.json')));
+});
+
+test('photo fallback ignores leftover video artifacts and preserves caller outputDir', async () => {
+  const fake = await createUnsupportedYtDlp();
+  const root = await mkdtemp(path.join(os.tmpdir(), 'tiktok-photo-fallback-clean-'));
+  const outputDir = path.join(root, 'caller-output');
+  const sourceUrl = 'https://www.tiktok.com/t/ZP8GUpGWj/';
+  await mkdir(outputDir, { recursive: true });
+  await writeFile(path.join(outputDir, 'keep-me.txt'), 'caller owned');
+  await writeFile(path.join(outputDir, 'leftover.mp4'), 'stale video');
+
+  const result = await downloadVideo(sourceUrl, {
+    ytdlpPath: fake,
+    fetchImpl: createPhotoFetch(),
+    outputDir,
+    metadata: {
+      id: '7640994586499878174',
+      uploader: 'user400567892112',
+      webpage_url: sourceUrl,
+    },
+  });
+
+  assert.equal(result.mediaType, 'slideshow');
+  assert.equal(path.extname(result.primaryFile), '.zip');
+  assert.equal(await readFile(path.join(outputDir, 'keep-me.txt'), 'utf8'), 'caller owned');
+  assert.equal(await readFile(path.join(outputDir, 'leftover.mp4'), 'utf8'), 'stale video');
+  assert.notEqual(path.dirname(result.primaryFile), outputDir);
 });
 
 test('slideshow fallback streams image bodies and rejects configured size/count limits', async () => {
@@ -541,9 +573,12 @@ process.exit(1);
   return scriptPath;
 }
 
-async function createArtifactOnlyYtDlp() {
+async function createArtifactOnlyYtDlp({ seedVideo = false } = {}) {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'fake-ytdlp-artifacts-'));
   const scriptPath = path.join(dir, 'yt-dlp');
+  const seedVideoLine = seedVideo
+    ? "fs.writeFileSync(path.join(outputDir, 'leftover.mp4'), 'stale video');"
+    : '';
   const script = `#!/usr/bin/env node
 const fs = require('node:fs');
 const path = require('node:path');
@@ -557,6 +592,7 @@ fs.writeFileSync(path.join(outputDir, '9876543210.jpg'), 'thumbnail');
 fs.writeFileSync(path.join(outputDir, '9876543210.m4a'), 'audio');
 fs.writeFileSync(path.join(outputDir, '9876543210.info.json'), '{}');
 fs.writeFileSync(path.join(outputDir, '9876543210.description'), 'description');
+${seedVideoLine}
 process.exit(0);
 `;
 

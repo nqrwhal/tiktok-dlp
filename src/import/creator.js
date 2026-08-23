@@ -87,7 +87,7 @@ export class CreatorImportService {
   cancel(id) {
     const result = this.store.requestCreatorImportCancel?.(id, this.now())
       ?? { accepted: false, reason: 'not_found', import: null };
-    if (result.accepted && result.import?.status === 'canceled') {
+    if (result.accepted && ['canceled', 'canceling'].includes(result.import?.status)) {
       this.#queue = this.#queue.filter((task) => Number(task.id) !== Number(id));
     }
     return result;
@@ -266,7 +266,7 @@ export class CreatorImportService {
 
   #cancelRequested(importId) {
     const record = this.store.getCreatorImport(importId);
-    return record?.status === 'canceled' || record?.cancel_requested_at != null;
+    return record?.status === 'canceled' || record?.status === 'canceling';
   }
 
   #pause(importId) {

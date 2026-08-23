@@ -100,9 +100,18 @@ export function nextDeletionCheckDelayMs(completedChecks = 0) {
   return DELETION_CHECK_DELAYS_MS[Math.min(index, DELETION_CHECK_DELAYS_MS.length - 1)];
 }
 
+export function normalizeProfileListResult(profileResult) {
+  if (Array.isArray(profileResult)) {
+    return { metadata: {}, entries: profileResult };
+  }
+  return {
+    metadata: profileResult?.metadata ?? {},
+    entries: Array.isArray(profileResult?.entries) ? profileResult.entries : [],
+  };
+}
+
 export function resolveProfileUsername(profileResult, fallbackUsername = '') {
-  const metadata = Array.isArray(profileResult) ? {} : profileResult?.metadata ?? {};
-  const entries = Array.isArray(profileResult) ? profileResult : profileResult?.entries ?? [];
+  const { metadata, entries } = normalizeProfileListResult(profileResult);
   const candidates = [
     metadata.uploader,
     metadata.channel,
@@ -126,8 +135,7 @@ export function resolveProfileUsername(profileResult, fallbackUsername = '') {
 }
 
 export function resolveProfileCreatorId(profileResult) {
-  const metadata = Array.isArray(profileResult) ? {} : profileResult?.metadata ?? {};
-  const entries = Array.isArray(profileResult) ? profileResult : profileResult?.entries ?? [];
+  const { metadata, entries } = normalizeProfileListResult(profileResult);
   return resolveProfileAuthorId(profileResult)
     || resolveProfileSecUid(profileResult)
     || String(
@@ -144,8 +152,7 @@ export function resolveProfileCreatorId(profileResult) {
 }
 
 export function resolveProfileSecUid(profileResult) {
-  const metadata = Array.isArray(profileResult) ? {} : profileResult?.metadata ?? {};
-  const entries = Array.isArray(profileResult) ? profileResult : profileResult?.entries ?? [];
+  const { metadata, entries } = normalizeProfileListResult(profileResult);
   const value = String(
     metadata.secUid
       ?? metadata.sec_uid
@@ -157,8 +164,7 @@ export function resolveProfileSecUid(profileResult) {
 }
 
 export function resolveProfileAuthorId(profileResult) {
-  const metadata = Array.isArray(profileResult) ? {} : profileResult?.metadata ?? {};
-  const entries = Array.isArray(profileResult) ? profileResult : profileResult?.entries ?? [];
+  const { metadata, entries } = normalizeProfileListResult(profileResult);
   const value = String(
     metadata.author_id
       ?? metadata.user_id
@@ -184,12 +190,11 @@ export function resolveVideoMediaType(video) {
 }
 
 export function resolveProfileHasStory(profileResult) {
-  const metadata = Array.isArray(profileResult) ? {} : profileResult?.metadata ?? {};
+  const { metadata, entries } = normalizeProfileListResult(profileResult);
   const explicit = normalizeNullableBoolean(metadata.hasStory ?? metadata.has_story);
   if (explicit !== null) return explicit;
 
   const mediaType = String(metadata.mediaType ?? metadata.media_type ?? metadata.type ?? '').toLowerCase();
-  const entries = Array.isArray(profileResult) ? profileResult : profileResult?.entries ?? [];
   if (mediaType.includes('story') && entries.length > 0) return true;
   return null;
 }
@@ -487,7 +492,7 @@ export class TikTokMonitor {
           creator_id: identity.creatorId || watch?.creator_id,
         };
       }
-      const profileEntries = Array.isArray(profileResult) ? profileResult : profileResult?.entries ?? [];
+      const profileEntries = normalizeProfileListResult(profileResult).entries;
       const profileWindow = profileEntries.slice(0, this.scanLimit);
       const profileProcessing = await this.#processVideoEntries(profileWindow, {
         partial,
@@ -508,7 +513,7 @@ export class TikTokMonitor {
           watch,
           burst: true,
         });
-        const burstEntries = Array.isArray(burstProfileResult) ? burstProfileResult : burstProfileResult?.entries ?? [];
+        const burstEntries = normalizeProfileListResult(burstProfileResult).entries;
         await this.#processVideoEntries(burstEntries.slice(this.scanLimit, this.burstScanLimit), {
           partial,
           watch,
@@ -705,8 +710,10 @@ export class TikTokMonitor {
         limit: this.scanLimit,
         watch,
       });
-      const entries = Array.isArray(storyResult) ? storyResult : storyResult?.entries ?? [];
-      const identity = Array.isArray(storyResult) || !shouldRecordStoryIdentity(storyResult, normalized, watch)
+      const { entries } = normalizeProfileListResult(storyResult);
+      // Array-shaped results normalize to empty metadata, so identity recording
+      // stays skipped unless usable metadata fields are present.
+      const identity = !shouldRecordStoryIdentity(storyResult, normalized, watch)
         ? null
         : this.#recordProfileIdentity(normalized.username, storyResult, now);
       return {

@@ -6,8 +6,10 @@ import {
   calculateFailureBackoffMs,
   isVideoNewerThanWatch,
   nextDeletionCheckDelayMs,
+  normalizeProfileListResult,
   normalizeWatchedUser,
   resolveProfileCreatorId,
+  resolveProfileHasStory,
   resolveProfileUsername,
   resolveVideoMediaType,
   resolveVideoTimestampMs,
@@ -348,6 +350,12 @@ test('profile identity helpers resolve usernames and creator ids', () => {
   assert.equal(resolveProfileCreatorId(profile), 'stable-123');
   assert.equal(nextDeletionCheckDelayMs(0), 60 * 1000);
   assert.equal(nextDeletionCheckDelayMs(5), 25 * 60 * 1000);
+
+  const fromArray = normalizeProfileListResult([{ id: '1', uploader: 'array.user' }]);
+  assert.deepEqual(fromArray.metadata, {});
+  assert.equal(fromArray.entries.length, 1);
+  assert.equal(resolveProfileUsername([{ uploader: 'array.user' }], 'fallback'), 'array.user');
+  assert.equal(resolveProfileHasStory([{ id: 'story-1' }]), null);
 });
 
 test('runOnce records username changes when profile metadata changes', async () => {

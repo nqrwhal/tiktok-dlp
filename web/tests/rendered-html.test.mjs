@@ -125,6 +125,7 @@ test("creator imports remain durable and actionable outside the open panel", asy
   assert.match(source, /\.slice\(0, IMPORT_FAILURE_DETAIL_LIMIT\)/);
   assert.match(source, /skippedUnknownDurationCount/);
   assert.match(types, /"completed" \| "failed" \| "canceled"/);
+  assert.match(types, /"canceling"/);
   assert.match(types, /cancelRequestedAt: number \| null/);
   assert.match(types, /retryCount: number/);
   assert.match(types, /resumeCount: number/);

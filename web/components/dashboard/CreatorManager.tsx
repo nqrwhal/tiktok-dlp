@@ -482,7 +482,7 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
                     <div><dt>Failed</dt><dd>{entry.failedCount}</dd></div>
                   </dl>
                   <div className={styles.importRowActions}>
-                    {isActiveImportStatus(entry.status) ? (
+                    {isActiveImportStatus(entry.status) && entry.status !== "canceling" ? (
                       <button
                         type="button"
                         disabled={Boolean(importActions[entry.id]) || Boolean(entry.cancelRequestedAt)}
@@ -490,6 +490,11 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
                       >
                         {importActions[entry.id] === "cancel" ? <LoaderCircle className={styles.spinning} size={13} /> : <X size={13} />}
                         {entry.cancelRequestedAt ? "Canceling" : importActions[entry.id] === "cancel" ? "Canceling" : "Cancel"}
+                      </button>
+                    ) : entry.status === "canceling" ? (
+                      <button type="button" disabled>
+                        <LoaderCircle className={styles.spinning} size={13} />
+                        Canceling
                       </button>
                     ) : null}
                     {entry.status === "failed" || entry.status === "canceled" ? (
@@ -760,7 +765,7 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
 }
 
 function formatImportStatus(entry: CreatorImport) {
-  if (entry.cancelRequestedAt && isActiveImportStatus(entry.status)) return "Cancellation requested";
+  if (entry.status === "canceling" || (entry.cancelRequestedAt && isActiveImportStatus(entry.status))) return "Cancellation requested";
   if (entry.status === "queued") return `Waiting · ${entry.maxDurationSeconds}s limit`;
   if (entry.status === "running") {
     return entry.discoveredCount
@@ -787,11 +792,13 @@ function formatImportHistory(entry: CreatorImport) {
 }
 
 function displayImportStatus(entry: CreatorImport) {
-  return entry.cancelRequestedAt && isActiveImportStatus(entry.status) ? "canceling" : entry.status;
+  return entry.status === "canceling" || (entry.cancelRequestedAt && isActiveImportStatus(entry.status))
+    ? "canceling"
+    : entry.status;
 }
 
 function isActiveImportStatus(status: CreatorImport["status"]) {
-  return status === "queued" || status === "running";
+  return status === "queued" || status === "running" || status === "canceling";
 }
 
 function isTerminalImportStatus(status: CreatorImport["status"]) {

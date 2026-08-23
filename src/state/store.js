@@ -90,7 +90,8 @@ export class Store {
         trashed_at INTEGER,
         delete_requested_at INTEGER,
         delete_attempts INTEGER NOT NULL DEFAULT 0,
-        delete_error TEXT
+        delete_error TEXT,
+        retention_status TEXT NOT NULL DEFAULT 'active'
       );
 
       CREATE TABLE IF NOT EXISTS link_tokens (
@@ -192,6 +193,18 @@ export class Store {
     this.ensureColumn('files', 'delete_requested_at', 'INTEGER');
     this.ensureColumn('files', 'delete_attempts', 'INTEGER NOT NULL DEFAULT 0');
     this.ensureColumn('files', 'delete_error', 'TEXT');
+    this.ensureColumn('files', 'retention_status', "TEXT NOT NULL DEFAULT 'active'");
+    this.db.prepare(`
+      UPDATE files
+      SET retention_status = CASE
+        WHEN trashed_at IS NOT NULL AND delete_requested_at IS NOT NULL AND delete_error IS NULL THEN 'trash_claimed'
+        WHEN trashed_at IS NOT NULL AND delete_requested_at IS NOT NULL AND delete_error IS NOT NULL THEN 'trash_failed'
+        WHEN trashed_at IS NOT NULL THEN 'trashed'
+        WHEN delete_requested_at IS NOT NULL AND delete_error IS NULL THEN 'expiry_claimed'
+        WHEN delete_requested_at IS NOT NULL AND delete_error IS NOT NULL THEN 'expiry_failed'
+        ELSE 'active'
+      END
+    `).run();
     this.ensureColumn('link_tokens', 'job_id', 'INTEGER');
     this.ensureColumn('link_tokens', 'owner_id', "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn('link_tokens', 'scope_id', "TEXT NOT NULL DEFAULT ''");
@@ -204,6 +217,12 @@ export class Store {
     this.ensureColumn('creator_imports', 'retry_count', 'INTEGER NOT NULL DEFAULT 0');
     this.ensureColumn('creator_imports', 'resume_count', 'INTEGER NOT NULL DEFAULT 0');
     this.ensureColumn('creator_imports', 'last_resumed_at', 'INTEGER');
+    this.db.prepare(`
+      UPDATE creator_imports
+      SET status = 'canceling'
+      WHERE cancel_requested_at IS NOT NULL
+        AND status IN ('queued', 'running')
+    `).run();
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_jobs_requested_by ON jobs(requested_by);
       CREATE INDEX IF NOT EXISTS idx_jobs_file_id ON jobs(file_id);
@@ -212,6 +231,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_files_trashed_at ON files(trashed_at);
       CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
       CREATE INDEX IF NOT EXISTS idx_files_delete_requested_at ON files(delete_requested_at);
+      CREATE INDEX IF NOT EXISTS idx_files_retention_status ON files(retention_status);
       CREATE INDEX IF NOT EXISTS idx_files_username_created_at ON files(username COLLATE NOCASE, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_link_tokens_file_id_expires_at ON link_tokens(file_id, expires_at);
       CREATE INDEX IF NOT EXISTS idx_link_tokens_owner_id_created_at ON link_tokens(owner_id, created_at DESC);
@@ -859,7 +879,6 @@ export class Store {
         updated_at = ?
       WHERE id = ?
         AND status = 'queued'
-        AND cancel_requested_at IS NULL
     `).run(now, now, Number(id));
     return result.changes > 0 ? this.getCreatorImport(id) : null;
   }
@@ -946,7 +965,6 @@ export class Store {
         FROM creator_imports
         WHERE id = ?
           AND status = 'running'
-          AND cancel_requested_at IS NULL
       `).get(numericId);
       if (!active) {
         this.db.exec('COMMIT');
@@ -1040,9 +1058,13 @@ export class Store {
         this.db.exec('COMMIT');
         return { accepted: false, reason: 'not_found', import: null };
       }
-      if (!['queued', 'running'].includes(record.status)) {
+      if (!['queued', 'running', 'canceling'].includes(record.status)) {
         this.db.exec('COMMIT');
         return { accepted: false, reason: 'not_active', import: record };
+      }
+      if (record.status === 'canceling') {
+        this.db.exec('COMMIT');
+        return { accepted: true, reason: null, import: record };
       }
       if (record.status === 'queued') {
         this.db.prepare(`
@@ -1058,7 +1080,10 @@ export class Store {
       } else {
         this.db.prepare(`
           UPDATE creator_imports
-          SET cancel_requested_at = COALESCE(cancel_requested_at, ?), updated_at = ?
+          SET
+            status = 'canceling',
+            cancel_requested_at = COALESCE(cancel_requested_at, ?),
+            updated_at = ?
           WHERE id = ?
         `).run(now, now, numericId);
       }
@@ -1084,7 +1109,7 @@ export class Store {
           completed_at = ?,
           updated_at = ?
         WHERE id = ?
-          AND status IN ('queued', 'running')
+          AND status IN ('queued', 'running', 'canceling')
       `).run(now, now, now, now, numericId);
       this.db.exec('COMMIT');
       return this.getCreatorImport(numericId);
@@ -1100,7 +1125,6 @@ export class Store {
       SET status = 'queued', updated_at = ?
       WHERE id = ?
         AND status = 'running'
-        AND cancel_requested_at IS NULL
     `).run(now, Number(id));
     return this.getCreatorImport(id);
   }
@@ -1156,8 +1180,11 @@ export class Store {
           canceled_at = COALESCE(canceled_at, ?),
           completed_at = COALESCE(completed_at, ?),
           updated_at = ?
-        WHERE status IN ('queued', 'running')
-          AND cancel_requested_at IS NOT NULL
+        WHERE status = 'canceling'
+           OR (
+             status IN ('queued', 'running')
+             AND cancel_requested_at IS NOT NULL
+           )
       `).run(now, now, now);
       this.db.prepare(`
         UPDATE creator_import_items
@@ -1175,7 +1202,6 @@ export class Store {
           last_resumed_at = ?,
           updated_at = ?
         WHERE status IN ('queued', 'running')
-          AND cancel_requested_at IS NULL
       `).run(now, now);
       const imports = this.db.prepare(`
         SELECT *
@@ -1242,8 +1268,8 @@ export class Store {
 
   createFileRecord({ videoId = '', username = '', requestedBy = '', sourceUrl, filePath, filename, sizeBytes }, now = Date.now()) {
     const result = this.db.prepare(`
-      INSERT INTO files (video_id, username, requested_by, source_url, path, filename, size_bytes, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO files (video_id, username, requested_by, source_url, path, filename, size_bytes, created_at, retention_status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')
     `).run(videoId, username, String(requestedBy ?? ''), sourceUrl, filePath, filename, sizeBytes, now);
     return Number(result.lastInsertRowid);
   }
@@ -1254,8 +1280,8 @@ export class Store {
       SELECT *
       FROM files
       WHERE video_id = ?
-        ${includeTrashed ? '' : 'AND trashed_at IS NULL AND delete_requested_at IS NULL'}
-      ORDER BY created_at DESC
+        ${includeTrashed ? '' : "AND retention_status = 'active'"}
+      ORDER BY created_at DESC, id DESC
       LIMIT 1
     `).get(String(videoId)) ?? null;
   }
@@ -1309,8 +1335,9 @@ export class Store {
     // for deletion. Its historical attempt count remains useful for diagnosis.
     this.db.prepare(`
       UPDATE files
-      SET delete_requested_at = NULL, delete_error = NULL
+      SET delete_requested_at = NULL, delete_error = NULL, retention_status = 'active'
       WHERE id = ?
+        AND retention_status IN ('active', 'expiry_claimed', 'expiry_failed')
     `).run(fileId);
   }
 
@@ -1493,7 +1520,8 @@ export class Store {
           SET
             delete_requested_at = ?,
             delete_attempts = delete_attempts + 1,
-            delete_error = NULL
+            delete_error = NULL,
+            retention_status = 'expiry_claimed'
           WHERE id IN (${placeholders})
         `).run(now, ...ids);
       }
@@ -1512,7 +1540,11 @@ export class Store {
       SET
         delete_requested_at = COALESCE(delete_requested_at, ?),
         delete_attempts = delete_attempts + CASE WHEN delete_requested_at IS NULL THEN 1 ELSE 0 END,
-        delete_error = ?
+        delete_error = ?,
+        retention_status = CASE
+          WHEN trashed_at IS NOT NULL OR retention_status IN ('trashed', 'trash_claimed', 'trash_failed') THEN 'trash_failed'
+          ELSE 'expiry_failed'
+        END
       WHERE id = ?
     `).run(now, message, Number(fileId));
     return result.changes > 0;
@@ -1586,9 +1618,10 @@ export class Store {
       SET
         trashed_at = ?,
         delete_requested_at = NULL,
-        delete_error = NULL
+        delete_error = NULL,
+        retention_status = 'trashed'
       WHERE id = ?
-        AND trashed_at IS NULL
+        AND retention_status IN ('active', 'expiry_claimed', 'expiry_failed')
     `).run(now, numericId);
     if (!result.changes) return null;
     return this.getTrashedFile(numericId);
@@ -1613,8 +1646,10 @@ export class Store {
       SET
         trashed_at = ?,
         delete_requested_at = NULL,
-        delete_error = NULL
+        delete_error = NULL,
+        retention_status = 'trashed'
       WHERE id IN (${placeholders})
+        AND retention_status IN ('active', 'expiry_claimed', 'expiry_failed')
     `).run(now, ...ids);
     return ids;
   }
@@ -1626,15 +1661,15 @@ export class Store {
       SELECT *
       FROM files
       WHERE id = ?
-        AND trashed_at IS NOT NULL
+        AND retention_status IN ('trashed', 'trash_claimed', 'trash_failed')
     `).get(numericId) ?? null;
   }
 
   listTrashedFiles(limit = 100) {
     return this.db.prepare(`
-      SELECT id, video_id, username, source_url, path, filename, size_bytes, created_at, trashed_at
+      SELECT id, video_id, username, source_url, path, filename, size_bytes, created_at, trashed_at, retention_status
       FROM files
-      WHERE trashed_at IS NOT NULL
+      WHERE retention_status IN ('trashed', 'trash_claimed', 'trash_failed')
       ORDER BY trashed_at DESC, id DESC
       LIMIT ?
     `).all(Math.max(1, Math.min(1_000, Number(limit) || 100)));
@@ -1648,10 +1683,10 @@ export class Store {
       SET
         trashed_at = NULL,
         delete_requested_at = NULL,
-        delete_error = NULL
+        delete_error = NULL,
+        retention_status = 'active'
       WHERE id = ?
-        AND trashed_at IS NOT NULL
-        AND (delete_requested_at IS NULL OR delete_error IS NOT NULL)
+        AND retention_status IN ('trashed', 'trash_failed')
     `).run(numericId);
     return result.changes > 0 ? this.db.prepare('SELECT * FROM files WHERE id = ?').get(numericId) : null;
   }
@@ -1679,9 +1714,10 @@ export class Store {
           SET
             delete_requested_at = ?,
             delete_attempts = delete_attempts + 1,
-            delete_error = NULL
+            delete_error = NULL,
+            retention_status = 'trash_claimed'
           WHERE id IN (${placeholders})
-            AND trashed_at IS NOT NULL
+            AND retention_status IN ('trashed', 'trash_failed', 'trash_claimed')
         `).run(now, ...ids);
       }
       this.db.exec('COMMIT');
@@ -1701,8 +1737,7 @@ export class Store {
         SELECT id, path, filename, video_id, username, trashed_at
         FROM files
         WHERE id = ?
-          AND trashed_at IS NOT NULL
-          AND (delete_requested_at IS NULL OR delete_error IS NOT NULL)
+          AND retention_status IN ('trashed', 'trash_failed')
       `).get(numericId);
       if (!file) {
         this.db.exec('COMMIT');
@@ -1713,10 +1748,10 @@ export class Store {
         SET
           delete_requested_at = ?,
           delete_attempts = delete_attempts + 1,
-          delete_error = NULL
+          delete_error = NULL,
+          retention_status = 'trash_claimed'
         WHERE id = ?
-          AND trashed_at IS NOT NULL
-          AND (delete_requested_at IS NULL OR delete_error IS NOT NULL)
+          AND retention_status IN ('trashed', 'trash_failed')
       `).run(Number(now), numericId);
       this.db.exec('COMMIT');
       return claimed.changes > 0 ? file : null;
@@ -1732,8 +1767,7 @@ export class Store {
       const files = this.db.prepare(`
         SELECT id, path, filename, video_id, username, trashed_at
         FROM files
-        WHERE trashed_at IS NOT NULL
-          AND (delete_requested_at IS NULL OR delete_error IS NOT NULL)
+        WHERE retention_status IN ('trashed', 'trash_failed')
         ORDER BY trashed_at ASC, id ASC
       `).all();
       if (files.length) {
@@ -1744,10 +1778,10 @@ export class Store {
           SET
             delete_requested_at = ?,
             delete_attempts = delete_attempts + 1,
-            delete_error = NULL
+            delete_error = NULL,
+            retention_status = 'trash_claimed'
           WHERE id IN (${placeholders})
-            AND trashed_at IS NOT NULL
-            AND (delete_requested_at IS NULL OR delete_error IS NOT NULL)
+            AND retention_status IN ('trashed', 'trash_failed')
         `).run(Number(now), ...ids);
       }
       this.db.exec('COMMIT');
