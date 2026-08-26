@@ -42,6 +42,7 @@ test('loadConfig resolves paths and upload limits', () => {
   }, '/tmp/project');
   assert.equal(config.dataDir, '/tmp/project/x');
   assert.equal(config.discordUploadLimitBytes, 2 * 1024 * 1024);
+  assert.equal(loadConfig({}, '/tmp/project').discordUploadLimitBytes, 10 * 1024 * 1024);
   assert.equal(config.httpPort, 9999);
   assert.equal(config.publicBaseUrl, 'https://example.com');
   assert.equal(config.downloadLinkTtlMinutes, 30);

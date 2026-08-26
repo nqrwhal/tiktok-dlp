@@ -8,8 +8,10 @@ import {
   buildLinkHistoryEmbed,
   buildMonitorAlertPayload,
   handleButtonInteraction,
+  isDiscordEntityTooLarge,
   monitorScopeMatches,
   resolveMonitorDeliveryScope,
+  sendVideoAlert,
 } from '../src/discord/client.js';
 import { createStore } from '../src/state/store.js';
 
@@ -163,6 +165,65 @@ test('monitor alert payload is embed-first with monitor-only buttons', async () 
   );
   assert.equal(payload.components[0].components[0].data.url, 'https://example.com/files/monitor-token');
   assert.equal(payload.components[0].components[1].data.custom_id, 'monitor:delete:monitor-token');
+});
+
+test('isDiscordEntityTooLarge detects 40005 and 413', () => {
+  const tooLarge = Object.assign(new Error('Request entity too large'), { code: 40005, status: 413 });
+  assert.equal(isDiscordEntityTooLarge(tooLarge), true);
+  assert.equal(isDiscordEntityTooLarge(Object.assign(new Error('File uploaded exceeds the maximum size'), { code: 50045 })), true);
+  assert.equal(isDiscordEntityTooLarge(new Error('discord failed')), false);
+});
+
+test('sendVideoAlert falls back to link-only on 40005 and still marks seen', async () => {
+  const sends = [];
+  const seen = [];
+  const client = {
+    channels: {
+      fetch: async () => ({
+        send: async (payload) => {
+          sends.push({ files: payload.files?.length ?? 0, hasEmbed: Boolean(payload.embeds?.length) });
+          if (payload.files?.length) {
+            throw Object.assign(new Error('Request entity too large'), { code: 40005, status: 413 });
+          }
+        },
+      }),
+    },
+  };
+  const store = {
+    markVideoSeen(record) {
+      seen.push(record);
+    },
+  };
+
+  await sendVideoAlert({
+    client,
+    config: {
+      publicBaseUrl: 'https://example.com',
+      discordUploadLimitBytes: 20 * 1024 * 1024,
+      discordChannelId: 'channel-1',
+    },
+    store,
+    result: {
+      token: 'monitor-token',
+      publicUrl: 'https://example.com/files/monitor-token',
+      filePath: '/tmp/video.mp4',
+      filename: 'video.mp4',
+      title: 'too big',
+      sourceUrl: 'https://www.tiktok.com/@creator/video/7676968257571556626',
+      sizeBytes: 11_286_541,
+      videoId: '7676968257571556626',
+      username: 'creator',
+    },
+    video: { id: '7676968257571556626', username: 'creator', url: 'https://www.tiktok.com/@creator/video/7676968257571556626', title: 'too big' },
+    watch: { username: 'creator', channel_id: 'channel-1' },
+  });
+
+  assert.equal(sends.length, 2);
+  assert.equal(sends[0].files, 1);
+  assert.equal(sends[1].files, 0);
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].videoId, '7676968257571556626');
+  assert.equal(Boolean(seen[0].alertedAt), true);
 });
 
 test('monitor story alert payload reflects story type and keeps download in the button', async () => {

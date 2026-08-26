@@ -576,6 +576,59 @@ test('runOnce retries failed alerts and marks videos seen only after alert succe
   assert.equal(store.seenRecords[0].record.alertedAt, now);
 });
 
+test('runOnce poisons a video after repeated download failures', async () => {
+  const now = 1_700_000_350_000;
+  const store = new FakeStore([
+    {
+      username: 'creator',
+      channel_id: 'channel-1',
+      failure_count: 0,
+      next_check_at: null,
+    },
+  ]);
+  const downloader = new FakeDownloader([
+    {
+      id: 'broken-1',
+      title: 'Broken video',
+      webpage_url: 'https://www.tiktok.com/@creator/video/broken-1',
+    },
+  ]);
+  downloader.download = async (video, context) => {
+    downloader.downloadCalls.push({ video, context });
+    throw new Error('yt-dlp completed without producing a playable video file.');
+  };
+
+  const monitor = new TikTokMonitor({
+    store,
+    downloader,
+    downloadFailurePoisonAfter: 3,
+    now: () => now,
+  });
+
+  const first = await monitor.runOnce({ waitForDownloads: true });
+  assert.equal(store.seen.has('broken-1'), false);
+  assert.equal(first.alertedVideos, 0);
+
+  store.watches[0].next_check_at = null;
+  const second = await monitor.runOnce({ waitForDownloads: true });
+  assert.equal(store.seen.has('broken-1'), false);
+  assert.equal(second.alertedVideos, 0);
+
+  store.watches[0].next_check_at = null;
+  const third = await monitor.runOnce({ waitForDownloads: true });
+  assert.equal(downloader.downloadCalls.length, 3);
+  assert.equal(store.seen.has('broken-1'), true);
+  assert.equal(third.alertedVideos, 0);
+  assert.equal(store.seenRecords[0].record.videoId, 'broken-1');
+  assert.equal(store.seenRecords[0].record.alertedAt, undefined);
+
+  store.watches[0].next_check_at = null;
+  const fourth = await monitor.runOnce({ waitForDownloads: true });
+  assert.equal(downloader.downloadCalls.length, 3);
+  assert.equal(fourth.queuedDownloads, 0);
+  assert.equal(fourth.seenVideos, 1);
+});
+
 test('runOnce serializes overlapping cycles', async () => {
   const now = 1_700_000_400_000;
   let listCalls = 0;

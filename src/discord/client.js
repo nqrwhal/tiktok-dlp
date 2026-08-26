@@ -371,6 +371,16 @@ export async function handleButtonInteraction({ interaction, config, store }) {
   return false;
 }
 
+export function isDiscordEntityTooLarge(error) {
+  const code = Number(error?.code);
+  const status = Number(error?.status ?? error?.statusCode);
+  const message = String(error?.message ?? error ?? '');
+  return code === 40005
+    || code === 50045
+    || status === 413
+    || /entity too large|payload too large|file uploaded exceeds/i.test(message);
+}
+
 export async function sendVideoAlert({ client, config, store, result, video, watch }) {
   const channelId = watch?.channel_id || config.discordChannelId;
   const channel = await client.channels.fetch(channelId);
@@ -380,7 +390,15 @@ export async function sendVideoAlert({ client, config, store, result, video, wat
     watch,
     now,
   });
-  await channel.send(payload);
+  try {
+    await channel.send(payload);
+  } catch (error) {
+    if (!isDiscordEntityTooLarge(error) || !payload.files?.length) throw error;
+    console.warn(
+      `[discord] Attachment too large for ${video?.id || result?.videoId || 'unknown'} (${Number(result?.sizeBytes || 0)} bytes); sending link-only.`,
+    );
+    await channel.send({ ...payload, files: [] });
+  }
   if (video?.id) {
     store.markVideoSeen({
       videoId: video.id,

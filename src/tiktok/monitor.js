@@ -11,6 +11,7 @@ const DEFAULT_DELETION_CHECK_LEASE_MS = 10 * 60 * 1000;
 const DELETION_CONFIRMATION_DELAY_MS = 15 * 60 * 1000;
 const DEFAULT_BACKOFF_BASE_MS = 60 * 1000;
 const DEFAULT_BACKOFF_MAX_MS = 60 * 60 * 1000;
+const DEFAULT_DOWNLOAD_FAILURE_POISON_AFTER = 5;
 const DELETION_CHECK_DELAYS_MS = [
   60 * 1000,
   60 * 1000,
@@ -280,6 +281,7 @@ export class TikTokMonitor {
     deletionCheckLeaseMs = DEFAULT_DELETION_CHECK_LEASE_MS,
     backoffBaseMs = DEFAULT_BACKOFF_BASE_MS,
     backoffMaxMs = DEFAULT_BACKOFF_MAX_MS,
+    downloadFailurePoisonAfter = DEFAULT_DOWNLOAD_FAILURE_POISON_AFTER,
     now = () => Date.now(),
     sleep = defaultSleep,
   } = {}) {
@@ -302,6 +304,7 @@ export class TikTokMonitor {
     this.deletionCheckLeaseMs = Math.max(1, Number(deletionCheckLeaseMs) || DEFAULT_DELETION_CHECK_LEASE_MS);
     this.backoffBaseMs = backoffBaseMs;
     this.backoffMaxMs = backoffMaxMs;
+    this.downloadFailurePoisonAfter = Math.max(1, Number(downloadFailurePoisonAfter) || DEFAULT_DOWNLOAD_FAILURE_POISON_AFTER);
     this.now = now;
     this.sleep = sleep;
 
@@ -321,6 +324,7 @@ export class TikTokMonitor {
   #downloadQueue = [];
   #activeDownloads = 0;
   #pendingDownloadIds = new Set();
+  #downloadFailures = new Map();
   #deletionQueue = [];
   #activeDeletionChecks = 0;
   #pendingDeletionIds = new Set();
@@ -688,6 +692,7 @@ export class TikTokMonitor {
       );
 
       const now = this.now();
+      this.#downloadFailures.delete(videoId);
       await Promise.resolve(this.store.markVideoSeen({ ...seenRecord, alertedAt: now }, now));
       if (mediaType !== 'story') {
         await Promise.resolve(this.store.scheduleVideoDeletionCheck?.(videoId, now + nextDeletionCheckDelayMs(0)));
@@ -697,7 +702,16 @@ export class TikTokMonitor {
     } catch (error) {
       this.#metrics.totalDownloadFailures += 1;
       this.#metrics.lastError = error instanceof Error ? error.message : String(error);
+      const failures = (this.#downloadFailures.get(videoId) ?? 0) + 1;
+      this.#downloadFailures.set(videoId, failures);
       this.logger?.warn?.(`TikTok monitor download failed for ${videoId}: ${this.#metrics.lastError}`);
+      if (failures >= this.downloadFailurePoisonAfter) {
+        const poisonAt = this.now();
+        await Promise.resolve(this.store.markVideoSeen(seenRecord, poisonAt));
+        this.#downloadFailures.delete(videoId);
+        this.logger?.warn?.(`TikTok monitor poisoned ${videoId} after ${failures} failures.`);
+        return { downloaded: false, alerted: false, poisoned: true };
+      }
       throw error;
     }
   }
