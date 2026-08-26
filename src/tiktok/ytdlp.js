@@ -59,9 +59,12 @@ const DOWNLOAD_BASE_ARGS = [
 ];
 
 const MOBILE_USER_AGENT = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
+// TikTok's webpage extractor currently rejects the default/mobile yt-dlp UA with
+// "Unexpected response from webpage request". A desktop Chrome UA restores metadata + downloads.
+const YTDLP_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 
 export function buildMetadataArgs(sourceUrl, options = {}) {
-  const args = [...METADATA_BASE_ARGS];
+  const args = [...METADATA_BASE_ARGS, '--user-agent', YTDLP_USER_AGENT];
   if (options.flatPlaylist) args.push('--flat-playlist');
   if (options.playlist === true || options.flatPlaylist) args.push('--yes-playlist');
   else args.push('--no-playlist');
@@ -83,6 +86,8 @@ export function buildDownloadArgs(sourceUrl, options = {}) {
   const outputDir = path.resolve(options.outputDir);
   const args = [
     ...DOWNLOAD_BASE_ARGS,
+    '--user-agent',
+    YTDLP_USER_AGENT,
     '--paths',
     `home:${outputDir}`,
     '--paths',

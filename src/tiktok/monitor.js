@@ -909,14 +909,16 @@ export class TikTokMonitor {
   async #delayUntilNextDueWatch() {
     if (typeof this.store.listWatches !== 'function') return this.pollIntervalMs;
     const watches = await Promise.resolve(this.store.listWatches());
-    const dueTimes = (watches ?? [])
-      .map((watch) => Number(watch?.next_check_at ?? 0))
-      .filter((dueAt) => Number.isFinite(dueAt) && dueAt > 0);
-    if (!dueTimes.length) return this.pollIntervalMs;
-
     const now = this.now();
-    const nextDueAt = Math.min(...dueTimes);
-    return Math.max(0, nextDueAt - now);
+    let earliestFuture = null;
+    for (const watch of watches ?? []) {
+      const dueAt = Number(watch?.next_check_at ?? 0);
+      // Null/zero/past means due immediately — don't wait on other watches' backoff.
+      if (!Number.isFinite(dueAt) || dueAt <= 0 || dueAt <= now) return 0;
+      if (earliestFuture == null || dueAt < earliestFuture) earliestFuture = dueAt;
+    }
+    if (earliestFuture == null) return this.pollIntervalMs;
+    return Math.max(0, earliestFuture - now);
   }
 
   #schedule(delayMs) {

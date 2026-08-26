@@ -13,9 +13,9 @@ RUN apt-get update \
     tini \
     tzdata \
   && curl --fail --location --retry 3 \
-    https://github.com/yt-dlp/yt-dlp/releases/download/2026.07.04/yt-dlp \
+    https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp \
     --output /usr/local/bin/yt-dlp \
-  && echo "495be29ff4d9d4e9be7eabdfef225221e5d5282e77f2f505abc6dca80349f3fd  /usr/local/bin/yt-dlp" | sha256sum --check --strict \
+  && echo "1fa6733c37ea6fb51c99ad8fe785e7b7e5f3246c9b980230329d4fb72ed8d4d6  /usr/local/bin/yt-dlp" | sha256sum --check --strict \
   && chmod a+rx /usr/local/bin/yt-dlp \
   && yt-dlp --version \
   && apt-get clean \
