@@ -1,4 +1,5 @@
 import { mkdtemp, chmod, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { spawn as defaultSpawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { strict as assert } from 'node:assert';
@@ -36,6 +37,8 @@ test('buildMetadataArgs builds a conservative metadata command', () => {
     '--dump-single-json',
     '--user-agent',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+    '--impersonate',
+    'chrome',
     '--no-playlist',
     '--proxy',
     'http://proxy.test:8888',
@@ -91,6 +94,8 @@ test('buildDownloadArgs points yt-dlp at explicit output dirs', () => {
     '%(id)s.%(ext)s',
     '--user-agent',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+    '--impersonate',
+    'chrome',
     '--paths',
     'home:/tmp/out',
     '--paths',
@@ -659,6 +664,39 @@ test('configured cookies are required to exist and are sent on photo/story HTTP 
   assert.ok(imageCalls.every((call) => headerValue(call.init.headers, 'cookie').includes('sessionid=test-session')));
 });
 
+test('yt-dlp gets --impersonate chrome and a writable cookies copy, not the mounted source file', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-cookies-durable-'));
+  const original = path.join(dir, 'tiktok.txt');
+  const originalText = [
+    '# Netscape HTTP Cookie File',
+    '.tiktok.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\ttest-session',
+    '.tiktok.com\tTRUE\t/\tTRUE\t2147483647\tttwid\ttest-ttwid',
+    '.tiktok.com\tTRUE\t/\tTRUE\t2147483647\tmsToken\ttest-mstoken',
+  ].join('\n');
+  await writeFile(original, originalText, { mode: 0o444 });
+
+  const captured = [];
+  const fake = await createCookieRewritingYtDlp();
+  await fetchVideoMetadata('https://www.tiktok.com/@creator/video/9876543210', {
+    ytdlpPath: fake,
+    ytdlpCookiesFile: original,
+    ytdlpProxy: 'http://proxy.test:8888',
+    spawnImpl: (executable, args, spawnOptions) => {
+      captured.push({ args, env: spawnOptions?.env });
+      return defaultSpawn(executable, args, spawnOptions);
+    },
+  });
+
+  assert.equal(await readFile(original, 'utf8'), originalText);
+  assert.equal(captured.length, 1);
+  assert.equal(captured[0].args[captured[0].args.indexOf('--impersonate') + 1], 'chrome');
+  const cookiesPath = captured[0].args[captured[0].args.indexOf('--cookies') + 1];
+  assert.notEqual(cookiesPath, original);
+  assert.match(cookiesPath, /tiktok-cookies-copy-/);
+  assert.equal(captured[0].env.http_proxy, 'http://proxy.test:8888');
+  assert.equal(captured[0].env.HTTPS_PROXY, 'http://proxy.test:8888');
+});
+
 async function createFakeYtDlp() {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'fake-ytdlp-'));
   const scriptPath = path.join(dir, 'yt-dlp');
@@ -720,6 +758,32 @@ fs.mkdirSync(downloadDir, { recursive: true });
 const outputPath = path.join(downloadDir, 'downloaded.mp4');
 fs.writeFileSync(outputPath, 'fake video');
 process.stdout.write(outputPath + '\\n');
+process.exit(0);
+`;
+
+  await writeFile(scriptPath, script, { mode: 0o755 });
+  await chmod(scriptPath, 0o755);
+  return scriptPath;
+}
+
+async function createCookieRewritingYtDlp() {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'fake-ytdlp-cookies-rewrite-'));
+  const scriptPath = path.join(dir, 'yt-dlp');
+  const script = `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+const cookies = args[args.indexOf('--cookies') + 1];
+if (!cookies) {
+  process.stderr.write('missing cookies');
+  process.exit(2);
+}
+fs.writeFileSync(cookies, '# Netscape HTTP Cookie File\\n# yt-dlp clobbered sessionid\\n');
+process.stdout.write(JSON.stringify({
+  id: '9876543210',
+  title: 'A video',
+  uploader: 'creator',
+  webpage_url: 'https://www.tiktok.com/@creator/video/9876543210',
+}));
 process.exit(0);
 `;
 

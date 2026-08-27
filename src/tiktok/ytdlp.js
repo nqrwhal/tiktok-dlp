@@ -1,6 +1,6 @@
 import { spawn as defaultSpawn } from 'node:child_process';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { mkdir, mkdtemp, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, rename, rm, stat, writeFile, copyFile, chmod } from 'node:fs/promises';
 import { once } from 'node:events';
 import { Readable } from 'node:stream';
 import os from 'node:os';
@@ -63,12 +63,12 @@ const DOWNLOAD_BASE_ARGS = [
 ];
 
 const MOBILE_USER_AGENT = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
-// TikTok's webpage extractor currently rejects the default/mobile yt-dlp UA with
-// "Unexpected response from webpage request". A desktop Chrome UA restores metadata + downloads.
+// Desktop Chrome UA plus --impersonate chrome (curl_cffi) is required for
+// follower-only CDN fetches. Impersonate also covers the webpage challenge.
 const YTDLP_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 
 export function buildMetadataArgs(sourceUrl, options = {}) {
-  const args = [...METADATA_BASE_ARGS, '--user-agent', YTDLP_USER_AGENT];
+  const args = [...METADATA_BASE_ARGS, '--user-agent', YTDLP_USER_AGENT, '--impersonate', 'chrome'];
   if (options.flatPlaylist) args.push('--flat-playlist');
   if (options.playlist === true || options.flatPlaylist) args.push('--yes-playlist');
   else args.push('--no-playlist');
@@ -91,6 +91,8 @@ export function buildDownloadArgs(sourceUrl, options = {}) {
     ...DOWNLOAD_BASE_ARGS,
     '--user-agent',
     YTDLP_USER_AGENT,
+    '--impersonate',
+    'chrome',
     '--paths',
     `home:${outputDir}`,
     '--paths',
@@ -478,14 +480,20 @@ export function classifyYtdlpError(error, options = {}) {
 
 async function runYtDlp(executable, args, options = {}) {
   await loadTikTokCookieSession(options);
+  const cookiesStaging = await stageCookiesCopy(options);
+  if (cookiesStaging.path) replaceCookiesArg(args, cookiesStaging.path);
+
   const spawnImpl = options.spawnImpl ?? defaultSpawn;
   const timeoutMs = Number(options.timeoutMs ?? options.ytdlpTimeoutMs ?? 120000);
+  const childEnv = ytdlpChildEnv(options);
 
-  return new Promise((resolve, reject) => {
-    let timeout = null;
-    const child = spawnImpl(executable, args, {
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+  try {
+    return await new Promise((resolve, reject) => {
+      let timeout = null;
+      const child = spawnImpl(executable, args, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: childEnv,
+      });
 
     let stdout = '';
     let stderr = '';
@@ -544,10 +552,13 @@ async function runYtDlp(executable, args, options = {}) {
           child.kill('SIGKILL');
         }, timeoutMs)
       : null;
-  }).catch((error) => {
-    const classified = classifyYtdlpError(error, options);
-    throw Object.assign(new Error(classified.message), classified, { cause: error });
-  });
+    }).catch((error) => {
+      const classified = classifyYtdlpError(error, options);
+      throw Object.assign(new Error(classified.message), classified, { cause: error });
+    });
+  } finally {
+    await cookiesStaging.cleanup();
+  }
 }
 
 function parseJsonOutput(stdout, label) {
@@ -1139,6 +1150,52 @@ function replaceArgValue(args, flag, value) {
 function appendCookiesArg(args, options = {}) {
   const cookiesFile = resolvedCookiesFile(options);
   if (cookiesFile) args.push('--cookies', cookiesFile);
+}
+
+function replaceCookiesArg(args, cookiesPath) {
+  const index = args.indexOf('--cookies');
+  if (index >= 0) {
+    args[index + 1] = cookiesPath;
+    return;
+  }
+  const end = args.indexOf('--');
+  if (end >= 0) args.splice(end, 0, '--cookies', cookiesPath);
+  else args.push('--cookies', cookiesPath);
+}
+
+async function stageCookiesCopy(options = {}) {
+  const source = resolvedCookiesFile(options);
+  if (!source) return { path: '', cleanup: async () => {} };
+
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-cookies-copy-'));
+  const dest = path.join(dir, 'cookies.txt');
+  try {
+    await copyFile(source, dest);
+    await chmod(dest, 0o600);
+  } catch (error) {
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    throw error;
+  }
+  return {
+    path: dest,
+    cleanup: async () => {
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+    },
+  };
+}
+
+function ytdlpChildEnv(options = {}) {
+  const env = { ...process.env };
+  const proxy = String(options.proxy || options.ytdlpProxy || '').trim();
+  if (proxy) {
+    env.http_proxy = proxy;
+    env.https_proxy = proxy;
+    env.HTTP_PROXY = proxy;
+    env.HTTPS_PROXY = proxy;
+    env.ALL_PROXY = proxy;
+    env.all_proxy = proxy;
+  }
+  return env;
 }
 
 function hasCookiesConfigured(options = {}) {

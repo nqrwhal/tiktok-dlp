@@ -312,30 +312,44 @@ Rewind bridge:
 | Media bounds | `DISCORD_UPLOAD_LIMIT_MB`, `MAX_MEDIA_DOWNLOAD_MB`, `MAX_SLIDESHOW_IMAGES`, `MAX_SLIDESHOW_ITEM_MB`, `MAX_SLIDESHOW_TOTAL_MB` |
 | Paths/tools | `DATA_DIR`, `STATE_DB`, `DOWNLOAD_DIR`, `YTDLP_PATH`, `YTDLP_PROXY`, `YTDLP_COOKIES_FILE`, `YTDLP_RETRIES`, `YTDLP_TIMEOUT_SECONDS` |
 
-If TikTok requires a logged-in session, place a Netscape cookies file at
-`./cookies/tiktok.txt` and set:
+If TikTok requires a logged-in session, export a **full** Netscape `tiktok.com`
+cookie jar (not a hand-picked subset). The working live path needed
+`sessionid`, `ttwid`, `msToken`, `odin_tt`, `sid_ucp_v1`, `uid_tt`, and the rest
+of the jar — `sessionid` alone, or even `sessionid`+`ttwid`+`msToken`, was not
+enough. Place the file at `./cookies/tiktok.txt` and set:
 
 ```env
 YTDLP_COOKIES_FILE=/app/cookies/tiktok.txt
 ```
 
-Then recreate the bot container (`docker compose up -d --force-recreate tiktok-discord-downloader`).
-Compose already mounts `./cookies` read-only at `/app/cookies`. Never commit cookies.
+Then **rebuild and recreate** the bot container so it picks up `curl_cffi` and
+`--impersonate chrome`:
 
-Export cookies with a browser extension or follow the yt-dlp wiki Netscape format:
+```bash
+docker compose up -d --build --force-recreate tiktok-discord-downloader
+```
+
+Compose already mounts `./cookies` read-only at `/app/cookies`. Never commit
+cookies. yt-dlp `--cookies` rewrites its cookie file and can drop `sessionid`;
+the bot copies the jar to a writable temp file for each yt-dlp run and leaves
+the mounted original intact.
+
+Export with a browser extension or follow the yt-dlp wiki Netscape format:
 https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp
-TikTok needs a valid `sessionid` cookie from an account that can already play the
-post in a browser. Direct video URLs work with that session. Listing a fully
-private account can still fail in yt-dlp even when individual posts download;
-paste the post URL in that case.
+The cookie account must already be able to play the post in a browser. Direct
+video URLs work with that session. Listing a fully private account can still
+fail in yt-dlp even when individual posts download; paste the post URL in that
+case.
 
 Unset `YTDLP_COOKIES_FILE` keeps the previous public-only behavior. A missing or
 unreadable cookies file is a hard startup/download error, not a silent public
 fallback. Content the cookie account cannot watch still fails with
 `access_denied` / `auth_required` and is not retried.
 
-`YTDLP_PROXY` routes yt-dlp traffic and the Node photo/story HTTP fallbacks
-through an HTTP proxy. Discord and the web service keep direct egress. This is useful
+`YTDLP_PROXY` is passed to yt-dlp as `--proxy` and is also set on the yt-dlp
+child environment (`http_proxy` / `https_proxy`) so curl_cffi impersonation uses
+the same proxy. Discord and the web service keep direct egress. Do not set
+`HTTP_PROXY` on the bot container; that would proxy Discord too. This is useful
 when TikTok blocks the host IP without forcing Discord or the web service through
 the same proxy. A host-reachable proxy needs no Compose changes. If the proxy is
 another container on an existing Docker network, enable the optional overlay:
