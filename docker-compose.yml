@@ -52,7 +52,9 @@ services:
       - "${HTTP_PORT:-8080}"
     volumes:
       - ./data:/app/data
-      # Optional cookies mount. Set YTDLP_COOKIES_FILE=/app/cookies/tiktok.txt if used.
+      # Full Netscape tiktok.com cookie jar (not sessionid alone) for follower-only posts
+      # the cookie account can already watch. Set YTDLP_COOKIES_FILE=/app/cookies/tiktok.txt
+      # and rebuild/recreate this container. The mount is read-only; the bot copies the file.
       - ./cookies:/app/cookies:ro
     restart: unless-stopped
 

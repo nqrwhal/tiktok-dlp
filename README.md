@@ -12,18 +12,23 @@ surfaces, while Cloudflare Tunnel can expose tokenized downloads and a
 Cloudflare Access-protected archive.
 
 > [!IMPORTANT]
-> This project works with public TikTok content. It does not bypass private
-> accounts, deleted content, paywalls, or TikTok access controls. Make sure your
-> use complies with the platform's terms and applicable law.
+> Optional Netscape cookies authenticate as a real TikTok account so the bot can
+> archive follower-only / friends-only posts that account can already watch. They
+> do not bypass private accounts, deleted content, paywalls, or other permissions
+> the account does not have. Unset cookies keep public-only behavior. Make sure
+> your use complies with the platform's terms and applicable law.
 
 ## Features
 
 ### Discord downloader and monitor
 
-- Downloads public TikTok videos from slash commands, DMs, and up to three URLs
-  in a Discord message.
+- Downloads TikTok videos from slash commands, DMs, and up to three URLs
+  in a Discord message. With `YTDLP_COOKIES_FILE` set, this includes
+  follower-only / friends-only posts the cookie account can already watch.
 - Handles public photo/slideshow posts with a direct fallback and ZIP output.
-- Performs best-effort public story discovery and downloads.
+  Configured cookies and the yt-dlp proxy are applied to those HTTP fallbacks.
+- Performs best-effort story discovery and downloads, including an authenticated
+  session when cookies are configured.
 - Monitors creators on a per-server or per-DM subscription basis.
 - Detects creator username changes and reports when saved source posts disappear.
 - Uses a bounded, deduplicated download queue with per-user and per-server limits.
@@ -33,7 +38,8 @@ Cloudflare Access-protected archive.
 
 ### Creator imports and archive management
 
-- Imports an entire public creator profile through the dashboard or admin API.
+- Imports an entire creator profile through the dashboard or admin API.
+  Friends-only items yt-dlp can extract for the cookie account are included.
 - Skips already saved posts and videos above an adjustable duration limit.
 - Persists per-video import checkpoints, resumes interrupted jobs after restart,
   and supports cooperative cancellation and retry.
@@ -71,7 +77,7 @@ the Discord bot are not shown in its video feed.
 
 ```mermaid
 flowchart LR
-    TikTok[TikTok public content] --> Media[yt-dlp + ffmpeg]
+    TikTok[TikTok content] --> Media[yt-dlp + ffmpeg]
     Discord[Discord] <--> Backend[Node backend]
     Media --> Backend
     Backend <--> State[(SQLite + data/downloads)]
@@ -244,7 +250,8 @@ Content-Type: application/json
 }
 ```
 
-The backend enumerates the complete public profile, skips existing files, skips
+The backend enumerates the profile yt-dlp can extract for the configured
+session, skips existing files, skips
 videos above the selected limit, and downloads the remaining posts as permanent
 archive files. It checkpoints every item in SQLite, resumes interrupted imports,
 and avoids downloading an item whose duration remains unknown. The supported
@@ -305,14 +312,44 @@ Rewind bridge:
 | Media bounds | `DISCORD_UPLOAD_LIMIT_MB`, `MAX_MEDIA_DOWNLOAD_MB`, `MAX_SLIDESHOW_IMAGES`, `MAX_SLIDESHOW_ITEM_MB`, `MAX_SLIDESHOW_TOTAL_MB` |
 | Paths/tools | `DATA_DIR`, `STATE_DB`, `DOWNLOAD_DIR`, `YTDLP_PATH`, `YTDLP_PROXY`, `YTDLP_COOKIES_FILE`, `YTDLP_RETRIES`, `YTDLP_TIMEOUT_SECONDS` |
 
-If TikTok requires authenticated cookies for public content in your environment,
-place a cookies file at `./cookies/tiktok.txt` and set:
+If TikTok requires a logged-in session, export a **full** Netscape `tiktok.com`
+cookie jar (not a hand-picked subset). The working live path needed
+`sessionid`, `ttwid`, `msToken`, `odin_tt`, `sid_ucp_v1`, `uid_tt`, and the rest
+of the jar — `sessionid` alone, or even `sessionid`+`ttwid`+`msToken`, was not
+enough. Place the file at `./cookies/tiktok.txt` and set:
 
 ```env
 YTDLP_COOKIES_FILE=/app/cookies/tiktok.txt
 ```
 
-`YTDLP_PROXY` routes only `yt-dlp` traffic through an HTTP proxy. This is useful
+Then **rebuild and recreate** the bot container so it picks up `curl_cffi` and
+`--impersonate chrome`:
+
+```bash
+docker compose up -d --build --force-recreate tiktok-discord-downloader
+```
+
+Compose already mounts `./cookies` read-only at `/app/cookies`. Never commit
+cookies. yt-dlp `--cookies` rewrites its cookie file and can drop `sessionid`;
+the bot copies the jar to a writable temp file for each yt-dlp run and leaves
+the mounted original intact.
+
+Export with a browser extension or follow the yt-dlp wiki Netscape format:
+https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp
+The cookie account must already be able to play the post in a browser. Direct
+video URLs work with that session. Listing a fully private account can still
+fail in yt-dlp even when individual posts download; paste the post URL in that
+case.
+
+Unset `YTDLP_COOKIES_FILE` keeps the previous public-only behavior. A missing or
+unreadable cookies file is a hard startup/download error, not a silent public
+fallback. Content the cookie account cannot watch still fails with
+`access_denied` / `auth_required` and is not retried.
+
+`YTDLP_PROXY` is passed to yt-dlp as `--proxy` and is also set on the yt-dlp
+child environment (`http_proxy` / `https_proxy`) so curl_cffi impersonation uses
+the same proxy. Discord and the web service keep direct egress. Do not set
+`HTTP_PROXY` on the bot container; that would proxy Discord too. This is useful
 when TikTok blocks the host IP without forcing Discord or the web service through
 the same proxy. A host-reachable proxy needs no Compose changes. If the proxy is
 another container on an existing Docker network, enable the optional overlay:

@@ -4,7 +4,7 @@ import { access, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { DatabaseSync } from 'node:sqlite';
 import os from 'node:os';
 import path from 'node:path';
-import { loadConfig, loadEnvFile, parseNonNegativeInt, parsePositiveInt } from '../src/config.js';
+import { loadConfig, loadEnvFile, parseNonNegativeInt, parsePositiveInt, validateRuntimeConfig } from '../src/config.js';
 import {
   extractVideoId,
   extractTikTokUrls,
@@ -61,6 +61,12 @@ test('loadConfig resolves paths and upload limits', () => {
   assert.equal(config.maxSlideshowImages, 35);
   assert.equal(config.ytdlpProxy, 'http://proxy.test:8888');
   assert.equal(config.ytdlpTimeoutMs, 60_000);
+  assert.equal(config.ytdlpCookiesFile, '');
+  assert.equal(
+    loadConfig({ YTDLP_COOKIES_FILE: './cookies/tiktok.txt' }, '/tmp/project').ytdlpCookiesFile,
+    '/tmp/project/cookies/tiktok.txt',
+  );
+  validateRuntimeConfig(config, { requireDiscord: false });
 });
 
 test('loadConfig supports minute TTL and ignores legacy hour TTL', () => {

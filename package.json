@@ -11,7 +11,8 @@
     "test": "node --test test/*.test.js"
   },
   "dependencies": {
-    "discord.js": "^14.26.4"
+    "discord.js": "^14.26.4",
+    "undici": "6.27.0"
   },
   "overrides": {
     "undici": "6.27.0"

@@ -1,5 +1,6 @@
 import { mkdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
+import { assertCookiesFileConfigured } from './tiktok/cookies.js';
 
 export async function loadEnvFile(filePath = path.resolve(process.cwd(), '.env'), env = process.env) {
   try {
@@ -112,6 +113,7 @@ export function validateRuntimeConfig(config, { requireDiscord = true } = {}) {
   if (missing.length) {
     throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
   }
+  assertCookiesFileConfigured(config.ytdlpCookiesFile);
 }
 
 function resolvePath(value, cwd) {
