@@ -227,12 +227,10 @@ export class CreatorImportService {
       duration = normalizeDuration(metadata.duration);
     }
 
+    // Photo/slideshow posts often have no duration and no mediaType yet.
+    // Still download so yt-dlp photo fallback can save a ZIP.
     if (isUnknownDuration(duration, metadata.mediaType)) {
-      return {
-        status: 'skipped_unknown_duration',
-        videoId,
-        error: 'Duration remained unavailable after metadata lookup.',
-      };
+      duration = 0;
     }
     if (duration > task.maxDurationSeconds) {
       return { status: 'skipped_duration', videoId, durationSeconds: duration };

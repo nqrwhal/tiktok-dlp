@@ -7,6 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fetch as undiciFetch, ProxyAgent } from 'undici';
 import { cookieHeaderForUrl, loadTikTokCookieSession, resolvedCookiesFile } from './cookies.js';
+import { resolvePhotoPost } from './photoResolver.js';
 import { assertTikTokDownloadUrl, fileSize, isTikTokUrl, makeDownloadLayout, moveDirectoryContents, pickPrimaryVideo, profileUrl as makeProfileUrl, storyUrl as makeStoryUrl, slugify } from '../util/files.js';
 
 const proxyAgents = new Map();
@@ -333,28 +334,50 @@ export async function downloadVideo(sourceUrl, options = {}) {
 
 export async function fetchPhotoPostMetadata(sourceUrl, options = {}) {
   sourceUrl = assertTikTokDownloadUrl(sourceUrl);
-  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
-  if (typeof fetchImpl !== 'function') {
+  if (typeof (options.fetchImpl ?? globalThis.fetch) !== 'function') {
     throw new Error('Fetch API is not available for TikTok photo fallback.');
   }
 
-  const maxMetadataBytes = positiveOrDefault(options.maxPhotoMetadataBytes, 10 * 1024 * 1024);
-  const response = await tiktokFetch(sourceUrl, options, {
-    timeoutMs: fetchTimeoutMs(options),
-    maxBytes: maxMetadataBytes,
-    label: 'TikTok photo metadata',
-    headers: {
-      'user-agent': MOBILE_USER_AGENT,
-      'accept-language': 'en-US,en;q=0.9',
-      accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  const result = await resolvePhotoPost({ url: sourceUrl }, options);
+  if (result.ok) return photoMetadataFromResolver(result, sourceUrl);
+
+  throw Object.assign(new Error('TikTok photo post metadata was not found.'), {
+    kind: result.error === 'no_images' ? 'photo_images_not_found' : 'photo_metadata_not_found',
+    sourceUrl: String(sourceUrl),
+    stdout: '',
+    stderr: '',
+    resolverError: result.error,
+    ...(result.message ? { resolverMessage: result.message } : {}),
+  });
+}
+
+function photoMetadataFromResolver(result, sourceUrl) {
+  const username = String(result.username ?? '');
+  const id = String(result.awemeId ?? '');
+  return {
+    id,
+    title: String(result.description || result.title || id),
+    description: String(result.description ?? ''),
+    uploader: username,
+    channel: username,
+    creator: username,
+    webpage_url: sourceUrl || makePhotoUrl(username, id),
+    original_url: sourceUrl || makePhotoUrl(username, id),
+    thumbnail: String(result.coverUrl || result.images[0]?.url || ''),
+    timestamp: numberOrNull(result.createTime) ?? 0,
+    duration: numberOrNull(result.durationSeconds) ?? 0,
+    mediaType: 'slideshow',
+    imageCount: result.images.length,
+    imageUrls: result.images.map((image) => String(image.url)).filter(Boolean),
+    audioUrl: String(result.audioUrl || ''),
+    imagePost: {
+      images: result.images.map((image) => ({
+        imageURL: { urlList: [image.url] },
+        imageWidth: image.width,
+        imageHeight: image.height,
+      })),
     },
-  });
-  const html = await readResponseText(response, {
-    maxBytes: maxMetadataBytes,
-    timeoutMs: fetchTimeoutMs(options),
-    label: 'TikTok photo metadata',
-  });
-  return parsePhotoPostMetadata(html, response.url || sourceUrl);
+  };
 }
 
 export function parsePhotoPostMetadata(html, sourceUrl = '') {
