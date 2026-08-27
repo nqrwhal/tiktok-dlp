@@ -442,6 +442,23 @@ them. It copies requested media on demand, prefers saved JPEG thumbnail sidecars
 before its ffmpeg fallback, and supports imports, trash, and restore operations
 by forwarding them to the backend.
 
+## CI/CD
+
+`npm test` runs on pull requests and on pushes to `main`.
+
+Pushing `main` deploys the Discord bot after those tests pass. Deploy runs on a
+self-hosted runner labeled `yufeihl` and executes `scripts/deploy-prod.sh` in
+the existing production checkout `/home/yufei/tiktok-discord-downloader`. The
+script fast-forwards `main`, restores the live TikTok cookie jar from
+`data/tiktok-cookies.master.txt` when the live file is missing a `sessionid`
+cookie name, and rebuilds only the `tiktok-discord-downloader` Compose service.
+Rewind and `cloudflared` are not recreated.
+
+Register the runner under repo **Settings → Actions → Runners**. Add the label
+`yufeihl` and use a work directory outside the production checkout, for example
+`~/actions-runner`. Keep `.env`, cookies, `data/`, and `.secrets/` on the host;
+they are not in git.
+
 ## Operational notes
 
 - The monitor's normal profile window defaults to 5 posts and expands to a
