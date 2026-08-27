@@ -110,6 +110,20 @@ test('buildDownloadArgs points yt-dlp at explicit output dirs', () => {
     format: 'bv*+ba/b',
   });
   assert.equal(overridden[overridden.indexOf('--format') + 1], 'bv*+ba/b');
+
+  const fromConfig = buildMetadataArgs('https://www.tiktok.com/@user/video/123', {
+    ytdlpCookiesFile: '/app/cookies/tiktok.txt',
+  });
+  assert.equal(fromConfig.filter((arg) => arg === '--cookies').length, 1);
+  assert.equal(fromConfig[fromConfig.indexOf('--cookies') + 1], '/app/cookies/tiktok.txt');
+
+  const bothCookieOptions = buildDownloadArgs('https://www.tiktok.com/@user/video/123', {
+    outputDir: '/tmp/out',
+    cookiesFile: '/tmp/override.txt',
+    ytdlpCookiesFile: '/app/cookies/tiktok.txt',
+  });
+  assert.equal(bothCookieOptions.filter((arg) => arg === '--cookies').length, 1);
+  assert.equal(bothCookieOptions[bothCookieOptions.indexOf('--cookies') + 1], '/tmp/override.txt');
 });
 
 test('yt-dlp public download entry points reject unsafe URLs before subprocess or fetch work', async () => {
@@ -152,10 +166,25 @@ test('classifyYtdlpError maps common yt-dlp failures', () => {
   assert.equal(classifyYtdlpError(new Error('Video unavailable')).kind, 'not_found');
   assert.equal(classifyYtdlpError(new Error('Sign in to confirm your age')).kind, 'auth_required');
   assert.equal(classifyYtdlpError(new Error('Your IP address is blocked from accessing this post')).kind, 'access_blocked');
-  assert.equal(
-    classifyYtdlpError(new Error('This user’s account is private. Log in or use --cookies.')).kind,
-    'access_denied',
+  const privateWithoutCookies = classifyYtdlpError(new Error('This user’s account is private. Log in or use --cookies.'));
+  assert.equal(privateWithoutCookies.kind, 'access_denied');
+  assert.equal(privateWithoutCookies.retryable, false);
+  assert.match(privateWithoutCookies.message, /not publicly accessible/);
+
+  const privateWithCookies = classifyYtdlpError(
+    new Error('You do not have permission to view this post. Log into an account that has access'),
+    { ytdlpCookiesFile: '/app/cookies/tiktok.txt' },
   );
+  assert.equal(privateWithCookies.kind, 'access_denied');
+  assert.equal(privateWithCookies.retryable, false);
+  assert.match(privateWithCookies.message, /cookie session cannot access/i);
+
+  const friendsOnlyDenied = classifyYtdlpError(
+    new Error('This video is friends-only'),
+    { cookiesFile: '/tmp/cookies.txt' },
+  );
+  assert.equal(friendsOnlyDenied.kind, 'access_denied');
+  assert.equal(friendsOnlyDenied.retryable, false);
 });
 
 test('fetchVideoMetadata, listProfileVideos, and downloadVideo work with a fake executable', async () => {
@@ -488,11 +517,146 @@ test('listProfileStories refreshes cached no-story profiles before hitting the s
   assert.equal(stories.metadata.hasStory, false);
 });
 
+test('cookie-backed private failures stay access_denied and do not spawn a retryable path', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-private-cookies-'));
+  const cookiesFile = path.join(dir, 'tiktok.txt');
+  await writeFile(cookiesFile, [
+    '# Netscape HTTP Cookie File',
+    '.tiktok.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\ttest-session',
+  ].join('\n'));
+  const fake = await createPrivateYtDlp();
+
+  await assert.rejects(
+    fetchVideoMetadata('https://www.tiktok.com/@creator/video/123', {
+      ytdlpPath: fake,
+      ytdlpCookiesFile: cookiesFile,
+      disablePhotoFallback: true,
+    }),
+    (error) => {
+      assert.equal(error.kind, 'access_denied');
+      assert.equal(error.retryable, false);
+      assert.match(error.message, /cookie session cannot access/i);
+      return true;
+    },
+  );
+
+  await assert.rejects(
+    fetchVideoMetadata('https://www.tiktok.com/@creator/video/123', {
+      ytdlpPath: fake,
+      disablePhotoFallback: true,
+    }),
+    (error) => {
+      assert.equal(error.kind, 'access_denied');
+      assert.equal(error.retryable, false);
+      assert.match(error.message, /not publicly accessible/);
+      return true;
+    },
+  );
+});
+
 test('parsePhotoPostMetadata rejects HTML without image data', () => {
   assert.throws(
     () => parsePhotoPostMetadata('<html></html>', 'https://www.tiktok.com/@user/photo/1'),
     /rehydration data/,
   );
+});
+
+test('configured cookies are required to exist and are sent on photo/story HTTP fallbacks', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-cookies-session-'));
+  const cookiesFile = path.join(dir, 'tiktok.txt');
+  await writeFile(cookiesFile, [
+    '# Netscape HTTP Cookie File',
+    '.tiktok.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\ttest-session',
+    '.tiktok.com\tTRUE\t/\tTRUE\t2147483647\tsid_tt\ttest-sid',
+  ].join('\n'));
+
+  let spawnCalls = 0;
+  await assert.rejects(
+    fetchVideoMetadata('https://www.tiktok.com/@creator/video/123', {
+      ytdlpCookiesFile: path.join(dir, 'missing.txt'),
+      spawnImpl: () => {
+        spawnCalls += 1;
+        throw new Error('must not spawn');
+      },
+    }),
+    (error) => {
+      assert.equal(error.kind, 'cookies_unreadable');
+      assert.equal(error.retryable, false);
+      assert.match(error.message, /missing or unreadable/);
+      return true;
+    },
+  );
+  assert.equal(spawnCalls, 0);
+
+  const emptyFile = path.join(dir, 'empty.txt');
+  await writeFile(emptyFile, '# Netscape HTTP Cookie File\n');
+  await assert.rejects(
+    fetchPhotoPostMetadata('https://www.tiktok.com/@creator/photo/1', {
+      ytdlpCookiesFile: emptyFile,
+      fetchImpl: async () => {
+        throw new Error('must not fetch anonymously');
+      },
+    }),
+    (error) => error.kind === 'cookies_unreadable' && /did not contain any Netscape cookies/.test(error.message),
+  );
+
+  const photoCalls = [];
+  const photoFetch = createPhotoFetch(photoCalls);
+  await fetchPhotoPostMetadata('https://www.tiktok.com/@creator/photo/1', {
+    ytdlpCookiesFile: cookiesFile,
+    ytdlpProxy: 'http://proxy.test:8888',
+    fetchImpl: photoFetch,
+  });
+  assert.equal(photoCalls.length, 1);
+  assert.match(headerValue(photoCalls[0].init.headers, 'cookie'), /sessionid=test-session/);
+  assert.ok(photoCalls[0].init.dispatcher);
+
+  const anonymousPhotoCalls = [];
+  await fetchPhotoPostMetadata('https://www.tiktok.com/@creator/photo/1', {
+    fetchImpl: createPhotoFetch(anonymousPhotoCalls),
+  });
+  assert.equal(headerValue(anonymousPhotoCalls[0].init.headers, 'cookie'), '');
+  assert.equal(anonymousPhotoCalls[0].init.dispatcher, undefined);
+
+  const storyFetch = createStoryFetch();
+  const stories = await listProfileStories('creator', {
+    fetchImpl: storyFetch,
+    limit: 2,
+    ytdlpCookiesFile: cookiesFile,
+    ytdlpProxy: 'http://proxy.test:8888',
+  });
+  assert.equal(stories.count, 1);
+  assert.ok(storyFetch.calls.length >= 2);
+  assert.ok(storyFetch.calls.every((call) => headerValue(call.init.headers, 'cookie').includes('sessionid=test-session')));
+  assert.ok(storyFetch.calls.every((call) => call.init.dispatcher));
+
+  const storyRoot = await mkdtemp(path.join(os.tmpdir(), 'tiktok-story-cookie-downloads-'));
+  await downloadVideo(stories.entries[0].url, {
+    fetchImpl: storyFetch,
+    metadata: stories.entries[0],
+    downloadDir: storyRoot,
+    ytdlpCookiesFile: cookiesFile,
+  });
+  const cdnCall = storyFetch.calls.find((call) => String(call.url).includes('cdn.example.test/story.mp4'));
+  assert.ok(cdnCall);
+  assert.match(headerValue(cdnCall.init.headers, 'cookie'), /sessionid=test-session/);
+
+  const imageCalls = [];
+  const photoRoot = await mkdtemp(path.join(os.tmpdir(), 'tiktok-photo-cookie-downloads-'));
+  await downloadVideo('https://www.tiktok.com/@creator/photo/streamed-photo', {
+    metadata: {
+      id: 'streamed-photo',
+      title: 'streamed photo',
+      uploader: 'creator',
+      mediaType: 'slideshow',
+      imageUrls: ['https://cdn.example.test/one.jpeg'],
+    },
+    fetchImpl: createPhotoFetch(imageCalls),
+    downloadDir: photoRoot,
+    ytdlpCookiesFile: cookiesFile,
+  });
+  assert.ok(imageCalls.some((call) => /\.jpe?g/.test(String(call.url))));
+  assert.ok(imageCalls.every((call) => headerValue(call.init.headers, 'cookie').includes('sessionid=test-session')));
 });
 
 async function createFakeYtDlp() {
@@ -577,6 +741,19 @@ process.exit(1);
   return scriptPath;
 }
 
+async function createPrivateYtDlp() {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'fake-ytdlp-private-'));
+  const scriptPath = path.join(dir, 'yt-dlp');
+  const script = `#!/usr/bin/env node
+process.stderr.write("ERROR: This user’s account is private. Log in or use --cookies.\\n");
+process.exit(1);
+`;
+
+  await writeFile(scriptPath, script, { mode: 0o755 });
+  await chmod(scriptPath, 0o755);
+  return scriptPath;
+}
+
 async function createArtifactOnlyYtDlp({ seedVideo = false } = {}) {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'fake-ytdlp-artifacts-'));
   const scriptPath = path.join(dir, 'yt-dlp');
@@ -605,8 +782,15 @@ process.exit(0);
   return scriptPath;
 }
 
-function createPhotoFetch() {
-  return async (url) => {
+function headerValue(headers, name) {
+  if (!headers) return '';
+  const match = Object.entries(headers).find(([key]) => key.toLowerCase() === name.toLowerCase());
+  return match ? String(match[1]) : '';
+}
+
+function createPhotoFetch(calls = []) {
+  return async (url, init = {}) => {
+    calls.push({ url: String(url), init });
     const textUrl = String(url);
     if (/\.jpe?g/.test(textUrl)) {
       const image = Buffer.from(`image:${textUrl}`);
@@ -628,8 +812,9 @@ function createPhotoFetch() {
 }
 
 function createStoryFetch({ userStoryStatus = 1, hasItems = true } = {}) {
-  const fetchImpl = async (url) => {
+  const fetchImpl = async (url, init = {}) => {
     const textUrl = String(url);
+    fetchImpl.calls.push({ url: textUrl, init });
     if (textUrl.includes('/api/story/item_list/')) {
       fetchImpl.apiRequests += 1;
       const parsed = new URL(textUrl);
@@ -694,6 +879,7 @@ function createStoryFetch({ userStoryStatus = 1, hasItems = true } = {}) {
   };
   fetchImpl.profileRequests = 0;
   fetchImpl.apiRequests = 0;
+  fetchImpl.calls = [];
   return fetchImpl;
 }
 

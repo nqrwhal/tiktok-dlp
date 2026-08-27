@@ -5,7 +5,11 @@ import { once } from 'node:events';
 import { Readable } from 'node:stream';
 import os from 'node:os';
 import path from 'node:path';
+import { fetch as undiciFetch, ProxyAgent } from 'undici';
+import { cookieHeaderForUrl, loadTikTokCookieSession, resolvedCookiesFile } from './cookies.js';
 import { assertTikTokDownloadUrl, fileSize, isTikTokUrl, makeDownloadLayout, moveDirectoryContents, pickPrimaryVideo, profileUrl as makeProfileUrl, storyUrl as makeStoryUrl, slugify } from '../util/files.js';
+
+const proxyAgents = new Map();
 
 const METADATA_BASE_ARGS = [
   '--ignore-config',
@@ -73,8 +77,7 @@ export function buildMetadataArgs(sourceUrl, options = {}) {
     args.push('--playlist-end', String(playlistEnd));
   }
   if (options.proxy || options.ytdlpProxy) args.push('--proxy', String(options.proxy || options.ytdlpProxy));
-  if (options.cookiesFile) args.push('--cookies', String(options.cookiesFile));
-  if (options.ytdlpCookiesFile) args.push('--cookies', String(options.ytdlpCookiesFile));
+  appendCookiesArg(args, options);
   if (Array.isArray(options.extraArgs)) args.push(...options.extraArgs.map(String));
   args.push('--', String(sourceUrl));
   return args;
@@ -94,8 +97,7 @@ export function buildDownloadArgs(sourceUrl, options = {}) {
     `temp:${outputDir}`,
   ];
   if (options.proxy || options.ytdlpProxy) args.push('--proxy', String(options.proxy || options.ytdlpProxy));
-  if (options.cookiesFile) args.push('--cookies', String(options.cookiesFile));
-  if (options.ytdlpCookiesFile) args.push('--cookies', String(options.ytdlpCookiesFile));
+  appendCookiesArg(args, options);
   if (options.format) replaceArgValue(args, '--format', String(options.format));
   if (options.ytdlpRetries) {
     replaceArgValue(args, '--retries', String(options.ytdlpRetries));
@@ -335,7 +337,7 @@ export async function fetchPhotoPostMetadata(sourceUrl, options = {}) {
   }
 
   const maxMetadataBytes = positiveOrDefault(options.maxPhotoMetadataBytes, 10 * 1024 * 1024);
-  const response = await fetchWithLimits(sourceUrl, fetchImpl, {
+  const response = await tiktokFetch(sourceUrl, options, {
     timeoutMs: fetchTimeoutMs(options),
     maxBytes: maxMetadataBytes,
     label: 'TikTok photo metadata',
@@ -397,7 +399,7 @@ export function parsePhotoPostMetadata(html, sourceUrl = '') {
   };
 }
 
-export function classifyYtdlpError(error) {
+export function classifyYtdlpError(error, options = {}) {
   if (!error) {
     return {
       kind: 'unknown',
@@ -445,11 +447,17 @@ export function classifyYtdlpError(error) {
     return makeClassification('access_blocked', 'TikTok blocked the current network path.', true, exitCode, signal, stdout, stderr);
   }
 
-  if (/private|age[- ]restricted|members[- ]only|video is private|not available in your country/.test(combined)) {
+  if (/private|age[- ]restricted|members[- ]only|video is private|friends[- ]only|followers[- ]only|do not have permission|not available in your country/.test(combined)) {
+    if (hasCookiesConfigured(options)) {
+      return makeClassification('access_denied', 'The cookie session cannot access this content.', false, exitCode, signal, stdout, stderr);
+    }
     return makeClassification('access_denied', 'The video is not publicly accessible.', false, exitCode, signal, stdout, stderr);
   }
 
   if (/sign in|login|logged in|authentication|cookies?/.test(combined)) {
+    if (hasCookiesConfigured(options)) {
+      return makeClassification('auth_required', 'The configured cookies could not authenticate this source.', false, exitCode, signal, stdout, stderr);
+    }
     return makeClassification('auth_required', 'yt-dlp needs authentication cookies for this source.', false, exitCode, signal, stdout, stderr);
   }
 
@@ -469,6 +477,7 @@ export function classifyYtdlpError(error) {
 }
 
 async function runYtDlp(executable, args, options = {}) {
+  await loadTikTokCookieSession(options);
   const spawnImpl = options.spawnImpl ?? defaultSpawn;
   const timeoutMs = Number(options.timeoutMs ?? options.ytdlpTimeoutMs ?? 120000);
 
@@ -536,7 +545,7 @@ async function runYtDlp(executable, args, options = {}) {
         }, timeoutMs)
       : null;
   }).catch((error) => {
-    const classified = classifyYtdlpError(error);
+    const classified = classifyYtdlpError(error, options);
     throw Object.assign(new Error(classified.message), classified, { cause: error });
   });
 }
@@ -679,7 +688,7 @@ async function fetchProfileStoryIdentity(profileUrl, options = {}) {
   }
 
   const maxMetadataBytes = positiveOrDefault(options.maxStoryMetadataBytes, 10 * 1024 * 1024);
-  const response = await fetchWithLimits(String(profileUrl), fetchImpl, {
+  const response = await tiktokFetch(String(profileUrl), options, {
     timeoutMs: fetchTimeoutMs(options),
     maxBytes: maxMetadataBytes,
     label: 'TikTok story profile',
@@ -739,7 +748,7 @@ async function fetchStoryItemList(profile, options = {}) {
   apiUrl.searchParams.set('count', String(Number(options.limit ?? 4) || 4));
 
   const maxMetadataBytes = positiveOrDefault(options.maxStoryMetadataBytes, 10 * 1024 * 1024);
-  const response = await fetchWithLimits(apiUrl.toString(), fetchImpl, {
+  const response = await tiktokFetch(apiUrl.toString(), options, {
     timeoutMs: fetchTimeoutMs(options),
     maxBytes: maxMetadataBytes,
     label: 'TikTok story',
@@ -859,7 +868,7 @@ async function downloadPhotoPost(sourceUrl, metadata, tempDir, options = {}) {
   const imageEntries = [];
   let totalImageBytes = 0;
   for (const [index, imageUrl] of imageUrls.entries()) {
-    const response = await fetchWithLimits(imageUrl, fetchImpl, {
+    const response = await tiktokFetch(imageUrl, options, {
       timeoutMs: fetchTimeoutMs(options),
       maxBytes: maxItemBytes,
       headers: {
@@ -985,7 +994,7 @@ async function downloadStoryPost(sourceUrl, metadata, tempDir, options = {}) {
     });
   }
 
-  const response = await fetchWithLimits(directVideoUrl, fetchImpl, {
+  const response = await tiktokFetch(directVideoUrl, options, {
     timeoutMs: fetchTimeoutMs(options),
     maxBytes: positiveOrDefault(options.maxMediaDownloadBytes, 2 * 1024 * 1024 * 1024),
     headers: {
@@ -1127,6 +1136,15 @@ function replaceArgValue(args, flag, value) {
   if (index >= 0) args[index + 1] = value;
 }
 
+function appendCookiesArg(args, options = {}) {
+  const cookiesFile = resolvedCookiesFile(options);
+  if (cookiesFile) args.push('--cookies', cookiesFile);
+}
+
+function hasCookiesConfigured(options = {}) {
+  return Boolean(resolvedCookiesFile(options) || options.hasCookies);
+}
+
 function makeClassification(kind, message, retryable, exitCode, signal, stdout, stderr) {
   return {
     kind,
@@ -1244,11 +1262,47 @@ function findProfileUser(value) {
   return null;
 }
 
+async function tiktokFetch(url, options = {}, fetchOptions = {}) {
+  const session = await loadTikTokCookieSession(options);
+  const headers = { ...(fetchOptions.headers || {}) };
+  const cookie = cookieHeaderForUrl(session.cookies, url, { includeTikTokSession: true });
+  if (cookie) headers.cookie = cookie;
+
+  const proxy = session.proxy;
+  const dispatcher = proxy ? getProxyAgent(proxy) : undefined;
+  const fetchImpl = resolveTikTokFetchImpl(options, proxy);
+  return fetchWithLimits(url, fetchImpl, {
+    ...fetchOptions,
+    headers,
+    dispatcher,
+  });
+}
+
+function resolveTikTokFetchImpl(options = {}, proxy = '') {
+  if (typeof options.fetchImpl === 'function') return options.fetchImpl;
+  if (proxy) {
+    return (url, init) => undiciFetch(url, init);
+  }
+  if (typeof globalThis.fetch === 'function') return globalThis.fetch;
+  throw new Error('Fetch API is not available for TikTok HTTP fallback.');
+}
+
+function getProxyAgent(proxyUrl) {
+  const key = String(proxyUrl);
+  let agent = proxyAgents.get(key);
+  if (!agent) {
+    agent = new ProxyAgent(key);
+    proxyAgents.set(key, agent);
+  }
+  return agent;
+}
+
 async function fetchWithLimits(url, fetchImpl, {
   timeoutMs = 30_000,
   maxBytes = 20 * 1024 * 1024,
   headers = {},
   label = 'TikTok media',
+  dispatcher,
 } = {}) {
   const controller = typeof AbortController === 'function' ? new AbortController() : null;
   const timer = controller && timeoutMs > 0
@@ -1258,6 +1312,7 @@ async function fetchWithLimits(url, fetchImpl, {
     const response = await fetchImpl(String(url), {
       redirect: 'follow',
       headers,
+      ...(dispatcher ? { dispatcher } : {}),
       ...(controller ? { signal: controller.signal } : {}),
     });
     if (!response?.ok) {
