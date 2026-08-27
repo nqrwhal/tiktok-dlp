@@ -254,13 +254,37 @@ The backend enumerates the profile yt-dlp can extract for the configured
 session, skips existing files, skips
 videos above the selected limit, and downloads the remaining posts as permanent
 archive files. It checkpoints every item in SQLite, resumes interrupted imports,
-and avoids downloading an item whose duration remains unknown. The supported
-per-import duration range is 1–3600 seconds.
+and still attempts items whose duration remains unknown (photo posts often
+report none) so the photo resolver can save them as slideshow ZIPs. The
+supported per-import duration range is 1–3600 seconds.
 
 Read progress with `GET /api/imports?limit=20` or `GET /api/imports/:id`.
 Cancel or retry eligible jobs with `POST /api/imports/:id/cancel` and
 `POST /api/imports/:id/retry`. Cancellation is cooperative: an in-flight TikTok
 request finishes before the job stops.
+
+## Photo/slideshow resolver
+
+Follower-only photo posts are app-gated on the `/photo/{id}` web route, but the
+authenticated session can still read them from the `/video/{id}` page and the
+unsigned `www.tiktok.com/api/item/detail` endpoint. `src/tiktok/photoResolver.js`
+implements that chain (desktop video page → item detail API → legacy mobile-UA
+fetch) and `src/tiktok/ytdlp.js` uses it whenever yt-dlp cannot produce a
+playable video file. No app-request signing or device registration is involved.
+
+A standalone CLI is available inside the app container for debugging:
+
+```bash
+docker compose exec tiktok-discord-downloader node src/tiktok/photo-resolve-cli.js \
+  --cookies /app/data/tiktok-cookies.txt --proxy http://gluetun:8888 \
+  --url 'https://www.tiktok.com/@user/photo/7636317293982649631'
+```
+
+It prints the resolver contract as JSON (`ok`, `awemeId`, `username`,
+`createTime`, `durationSeconds`, `audioUrl`, `coverUrl`, and `images[]` with
+direct image URLs plus dimensions) and exits non-zero when the post cannot be
+resolved (`no_access`, `no_images`, or `not_found`). Cookie values are never
+logged.
 
 ## HTTP surfaces
 

@@ -7,7 +7,7 @@ import path from 'node:path';
 import { createCreatorImportService, normalizeDurationLimit } from '../src/import/creator.js';
 import { createStore } from '../src/state/store.js';
 
-test('creator imports skip saved or trashed videos and long videos while continuing past item failures', async () => {
+test('creator imports skip saved or long videos, still download unknown-duration items, and continue past item failures', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'tiktok-import-'));
   const store = createStore(path.join(root, 'state.db'));
   const existingPath = path.join(root, 'saved.mp4');
@@ -65,15 +65,16 @@ test('creator imports skip saved or trashed videos and long videos while continu
     assert.equal(completed.max_duration_seconds, 120);
     assert.equal(completed.discovered_count, 6);
     assert.equal(completed.processed_count, 6);
-    assert.equal(completed.downloaded_count, 1);
+    assert.equal(completed.downloaded_count, 2);
     assert.equal(completed.skipped_existing_count, 1);
     assert.equal(completed.skipped_duration_count, 2);
-    assert.equal(completed.skipped_unknown_duration_count, 1);
+    assert.equal(completed.skipped_unknown_duration_count, 0);
     assert.equal(completed.failed_count, 1);
     assert.match(completed.last_error, /download failed/i);
     assert.deepEqual(requested.map(({ options }) => options.metadata.id), [
       '1000000000000000003',
       '1000000000000000005',
+      '1000000000000000006',
     ]);
     assert.deepEqual(
       completed.items.map((item) => item.status),
@@ -83,10 +84,10 @@ test('creator imports skip saved or trashed videos and long videos while continu
         'downloaded',
         'skipped_duration',
         'failed',
-        'skipped_unknown_duration',
+        'downloaded',
       ],
     );
-    assert.match(completed.items.at(-1).error, /duration remained unavailable/i);
+    assert.equal(completed.items.at(-1).error, null);
     assert.equal(requested[0].options.permanent, true);
     assert.equal(requested[0].options.type, 'import');
   } finally {
