@@ -1,0 +1,55 @@
+name: Deploy
+
+on:
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: tiktok-dlp-prod
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  deploy:
+    name: Deploy bot
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: [self-hosted, yufeihl]
+    timeout-minutes: 20
+    env:
+      ROOT: /home/yufei/tiktok-discord-downloader
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Verify production checkout
+        run: |
+          set -euo pipefail
+          if [[ ! -d "${ROOT}/.git" ]]; then
+            echo "::error::Production checkout missing at ${ROOT}."
+            echo "::error::This job must run on the self-hosted runner labeled yufeihl, not a GitHub-hosted runner."
+            exit 1
+          fi
+
+      - name: Deploy from production checkout
+        run: |
+          set -euo pipefail
+          cd "$ROOT"
+          export GIT_TERMINAL_PROMPT=0
+          git fetch origin
+          if [[ -f scripts/deploy-prod.sh ]]; then
+            bash scripts/deploy-prod.sh
+          else
+            tmp="$(mktemp)"
+            trap 'rm -f "$tmp"' EXIT
+            git show origin/main:scripts/deploy-prod.sh > "$tmp"
+            bash "$tmp"
+          fi
