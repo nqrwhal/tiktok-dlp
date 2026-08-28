@@ -81,6 +81,8 @@ services:
 
   cloudflared:
     image: cloudflare/cloudflared:latest
+    # Distroless cloudflared runs as uid 65532, which cannot read Docker secret files (root 0400).
+    user: "0:0"
     profiles:
       - cloudflare
     command: tunnel --no-autoupdate run --token-file /run/secrets/cloudflare_tunnel_token
