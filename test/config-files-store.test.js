@@ -975,6 +975,7 @@ test('store migrates older databases before creating indexes for new columns', a
     const alertDeliveryColumns = store.db.prepare('PRAGMA table_info(alert_deliveries)').all().map((column) => column.name);
     const migrationColumns = store.db.prepare('PRAGMA table_info(schema_migrations)').all().map((column) => column.name);
     const indexes = store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all().map((index) => index.name);
+    assert.ok(watchColumns.includes('platform'));
     assert.ok(watchColumns.includes('creator_id'));
     assert.ok(watchColumns.includes('has_story'));
     assert.ok(watchColumns.includes('story_status_checked_at'));
@@ -1014,13 +1015,18 @@ test('store migrates older databases before creating indexes for new columns', a
       'last_error',
     ]);
     assert.ok(indexes.includes('idx_alert_deliveries_subscription_event'));
+    assert.ok(watchColumns.includes('platform'));
+    assert.ok(indexes.includes('idx_watched_users_platform_username'));
+    assert.ok(indexes.includes('idx_watch_subscriptions_platform_username'));
     assert.deepEqual(migrationColumns, ['version', 'name', 'applied_at']);
-    assert.equal(store.getSchemaVersion(), 4);
+    assert.equal(store.getSchemaVersion(), 6);
     assert.deepEqual(store.listSchemaMigrations().map(({ version, name }) => ({ version, name })), [
       { version: 1, name: 'legacy-schema-bootstrap' },
       { version: 2, name: 'monitor-download-dead-letters' },
       { version: 3, name: 'rewind-read-indexes' },
       { version: 4, name: 'rewind-media-read-indexes' },
+      { version: 5, name: 'platform-aware-watches' },
+      { version: 6, name: 'highlight-check-schedule' },
     ]);
   } finally {
     store.close();
@@ -1253,6 +1259,7 @@ test('store records watched username changes', async () => {
       creatorId: 'stable-123',
       secUid: '',
       authorId: '',
+      platform: 'tiktok',
     });
     assert.equal(store.getWatch('old.creator'), null);
     assert.equal(store.getWatch('new.creator').previous_username, 'old.creator');

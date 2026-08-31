@@ -83,7 +83,7 @@ test('watch failure listing and retry stay scoped to the current Discord watch',
       monitor: {},
       downloadOne: async () => {},
     });
-    assert.match(otherList.replies[0].embeds[0].data.description, /No monitored TikTok posts/);
+    assert.match(otherList.replies[0].embeds[0].data.description, /No monitored posts/);
     assert.doesNotMatch(otherList.replies[0].embeds[0].data.description, /broken-1/);
 
     const deniedRetry = makeWatchInteraction('retry', {

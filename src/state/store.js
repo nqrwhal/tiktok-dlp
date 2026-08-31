@@ -47,10 +47,19 @@ export class Store {
         name: 'rewind-media-read-indexes',
         up: () => this.migrateRewindMediaReadIndexes(),
       },
+      {
+        version: 5,
+        name: 'platform-aware-watches',
+        up: () => this.migratePlatformAwareWatches(),
+      },
+      {
+        version: 6,
+        name: 'highlight-check-schedule',
+        up: () => this.migrateHighlightCheckSchedule(),
+      },
     ]);
     this.recoverInterruptedMonitorDownloadRetries();
   }
-
   migrateLegacySchema() {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS watched_users (
@@ -396,6 +405,87 @@ export class Store {
         ON monitor_download_failures(username COLLATE NOCASE, status, updated_at DESC);
     `);
   }
+
+  migratePlatformAwareWatches() {
+    const hasWatchedPlatform = this.db.prepare(
+      `SELECT COUNT(*) AS c FROM pragma_table_info('watched_users') WHERE name='platform'`
+    ).get()?.c > 0;
+    if (!hasWatchedPlatform) {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS watched_users_new (
+          platform TEXT NOT NULL DEFAULT 'tiktok',
+          username TEXT NOT NULL,
+          channel_id TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          creator_id TEXT,
+          sec_uid TEXT,
+          author_id TEXT,
+          has_story INTEGER,
+          story_status_checked_at INTEGER,
+          previous_username TEXT,
+          username_changed_at INTEGER,
+          last_checked_at INTEGER,
+          last_success_at INTEGER,
+          failure_count INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT,
+          next_check_at INTEGER,
+          PRIMARY KEY (platform, username)
+        );
+        INSERT OR IGNORE INTO watched_users_new (
+          platform, username, channel_id, created_at, creator_id, sec_uid, author_id,
+          has_story, story_status_checked_at, previous_username, username_changed_at,
+          last_checked_at, last_success_at, failure_count, last_error, next_check_at
+        )
+        SELECT 'tiktok', username, channel_id, created_at, creator_id, sec_uid, author_id,
+          has_story, story_status_checked_at, previous_username, username_changed_at,
+          last_checked_at, last_success_at, failure_count, last_error, next_check_at
+        FROM watched_users;
+        DROP TABLE watched_users;
+        ALTER TABLE watched_users_new RENAME TO watched_users;
+        CREATE INDEX IF NOT EXISTS idx_watched_users_next_check_at ON watched_users(next_check_at);
+        CREATE INDEX IF NOT EXISTS idx_watched_users_platform_username ON watched_users(platform, username);
+      `);
+    }
+    const hasSubscriptionPlatform = this.db.prepare(
+      `SELECT COUNT(*) AS c FROM pragma_table_info('watch_subscriptions') WHERE name='platform'`
+    ).get()?.c > 0;
+    if (!hasSubscriptionPlatform) {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS watch_subscriptions_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          platform TEXT NOT NULL DEFAULT 'tiktok',
+          username TEXT NOT NULL,
+          guild_id TEXT NOT NULL DEFAULT '',
+          channel_id TEXT NOT NULL,
+          created_by TEXT NOT NULL DEFAULT '',
+          created_at INTEGER NOT NULL,
+          UNIQUE(platform, username, guild_id)
+        );
+        INSERT OR IGNORE INTO watch_subscriptions_new (id, platform, username, guild_id, channel_id, created_by, created_at)
+          SELECT id, 'tiktok', username, guild_id, channel_id, created_by, created_at FROM watch_subscriptions;
+        DROP TABLE watch_subscriptions;
+        ALTER TABLE watch_subscriptions_new RENAME TO watch_subscriptions;
+        CREATE INDEX IF NOT EXISTS idx_watch_subscriptions_platform_username ON watch_subscriptions(platform, username);
+        CREATE INDEX IF NOT EXISTS idx_watch_subscriptions_guild ON watch_subscriptions(guild_id);
+      `);
+    }
+    this.ensureColumn('seen_videos', 'platform', "TEXT NOT NULL DEFAULT 'tiktok'");
+    this.ensureColumn('monitor_download_failures', 'platform', "TEXT NOT NULL DEFAULT 'tiktok'");
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_seen_videos_platform_next_deletion ON seen_videos(platform, next_deletion_check_at);
+      CREATE INDEX IF NOT EXISTS idx_monitor_download_failures_platform_status ON monitor_download_failures(platform, status, updated_at DESC);
+    `);
+  }
+  migrateHighlightCheckSchedule() {
+    this.ensureColumn('watched_users', 'next_highlight_check_at', 'INTEGER');
+    this.ensureColumn('watched_users', 'last_highlight_check_at', 'INTEGER');
+    this.ensureColumn('watched_users', 'highlight_failure_count', 'INTEGER NOT NULL DEFAULT 0');
+    this.ensureColumn('watched_users', 'highlight_last_error', 'TEXT');
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_watched_users_next_highlight_check_at ON watched_users(next_highlight_check_at);
+    `);
+  }
+
 
   recoverInterruptedMonitorDownloadRetries(now = Date.now()) {
     return this.db.prepare(`
@@ -957,32 +1047,44 @@ export class Store {
     const options = typeof channelOrOptions === 'object' && channelOrOptions !== null
       ? channelOrOptions
       : { channelId: channelOrOptions };
+    const platform = normalizePlatform(options.platform ?? options.platformName ?? 'tiktok');
     const channelId = String(options.channelId ?? options.channel_id ?? '');
     const guildId = String(options.guildId ?? options.guild_id ?? '');
     const createdBy = String(options.createdBy ?? options.created_by ?? '');
     if (!channelId) throw new Error('A watch subscription requires a Discord channel.');
+    const normalizedUsername = String(username ?? '').trim();
+    if (!normalizedUsername) throw new Error('Username is required.');
     this.db.prepare(`
-      INSERT INTO watched_users (username, channel_id, created_at)
-      VALUES (?, ?, ?)
-      ON CONFLICT(username) DO NOTHING
-    `).run(username, channelId, now);
+      INSERT INTO watched_users (platform, username, channel_id, created_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(platform, username) DO NOTHING
+    `).run(platform, normalizedUsername, channelId, now);
     this.db.prepare(`
-      INSERT INTO watch_subscriptions (username, guild_id, channel_id, created_by, created_at)
-      VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(username, guild_id) DO UPDATE SET
+      INSERT INTO watch_subscriptions (platform, username, guild_id, channel_id, created_by, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(platform, username, guild_id) DO UPDATE SET
         channel_id = excluded.channel_id,
         created_by = excluded.created_by
-    `).run(username, guildId, channelId, createdBy, now);
-    return this.getWatch(username);
+    `).run(platform, normalizedUsername, guildId, channelId, createdBy, now);
+    return this.getWatch(normalizedUsername, platform);
   }
 
   removeWatch(username, scope = null) {
+    const normalizedUsername = String(username ?? '').trim();
+    const platform = normalizePlatform(scope?.platform ?? 'tiktok');
     if (!scope || typeof scope !== 'object') {
       this.db.exec('BEGIN IMMEDIATE');
       try {
-        this.db.prepare('DELETE FROM watch_subscriptions WHERE username = ?').run(username);
-        const result = this.db.prepare('DELETE FROM watched_users WHERE username = ?').run(username);
-        this.clearDeletionChecksForUsername(username);
+        if (scope && typeof scope === 'object' && scope.platform) {
+          this.db.prepare('DELETE FROM watch_subscriptions WHERE platform = ? AND username = ?').run(platform, normalizedUsername);
+          const result = this.db.prepare('DELETE FROM watched_users WHERE platform = ? AND username = ?').run(platform, normalizedUsername);
+          this.clearDeletionChecksForUsername(normalizedUsername, platform);
+          this.db.exec('COMMIT');
+          return result.changes > 0;
+        }
+        this.db.prepare('DELETE FROM watch_subscriptions WHERE username = ?').run(normalizedUsername);
+        const result = this.db.prepare('DELETE FROM watched_users WHERE username = ?').run(normalizedUsername);
+        this.clearDeletionChecksForUsername(normalizedUsername);
         this.db.exec('COMMIT');
         return result.changes > 0;
       } catch (error) {
@@ -992,13 +1094,14 @@ export class Store {
     }
 
     const guildId = String(scope.guildId ?? scope.guild_id ?? '');
+    const scopePlatform = normalizePlatform(scope.platform ?? platform);
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      const result = this.db.prepare('DELETE FROM watch_subscriptions WHERE username = ? AND guild_id = ?').run(username, guildId);
-      const remaining = this.db.prepare('SELECT 1 FROM watch_subscriptions WHERE username = ? LIMIT 1').get(username);
+      const result = this.db.prepare('DELETE FROM watch_subscriptions WHERE platform = ? AND username = ? AND guild_id = ?').run(scopePlatform, normalizedUsername, guildId);
+      const remaining = this.db.prepare('SELECT 1 FROM watch_subscriptions WHERE platform = ? AND username = ? LIMIT 1').get(scopePlatform, normalizedUsername);
       if (!remaining) {
-        this.db.prepare('DELETE FROM watched_users WHERE username = ?').run(username);
-        this.clearDeletionChecksForUsername(username);
+        this.db.prepare('DELETE FROM watched_users WHERE platform = ? AND username = ?').run(scopePlatform, normalizedUsername);
+        this.clearDeletionChecksForUsername(normalizedUsername, scopePlatform);
       }
       this.db.exec('COMMIT');
       return result.changes > 0;
@@ -1008,62 +1111,206 @@ export class Store {
     }
   }
 
-  getWatch(username) {
-    return this.db.prepare('SELECT * FROM watched_users WHERE username = ?').get(username) ?? null;
+  getWatch(username, platform = 'tiktok') {
+    const normalizedUsername = String(username ?? '').trim();
+    if (!normalizedUsername) return null;
+    // Allow calling with object like { platform, username } or platform string
+    if (typeof platform === 'object' && platform !== null && platform.platform) {
+      const p = normalizePlatform(platform.platform);
+      try {
+        return this.db.prepare('SELECT * FROM watched_users WHERE platform = ? AND username = ?').get(p, normalizedUsername) ?? null;
+      } catch {
+        return this.db.prepare('SELECT * FROM watched_users WHERE username = ?').get(normalizedUsername) ?? null;
+      }
+    }
+    const normalizedPlatform = normalizePlatform(platform ?? 'tiktok');
+    try {
+      return this.db.prepare('SELECT * FROM watched_users WHERE platform = ? AND username = ?').get(normalizedPlatform, normalizedUsername) ?? null;
+    } catch {
+      return this.db.prepare('SELECT * FROM watched_users WHERE username = ?').get(normalizedUsername) ?? null;
+    }
   }
 
-  listWatches() {
-    return this.db.prepare(`
-      SELECT *
-      FROM watched_users
-      ORDER BY COALESCE(next_check_at, 0), username
-    `).all();
+  listWatches(filter = null) {
+    if (filter && typeof filter === 'object' && filter.platform) {
+      const platform = normalizePlatform(filter.platform);
+      try {
+        return this.db.prepare(`
+          SELECT *
+          FROM watched_users
+          WHERE platform = ?
+          ORDER BY COALESCE(next_check_at, 0), username
+        `).all(platform);
+      } catch {
+        return this.db.prepare(`SELECT * FROM watched_users ORDER BY COALESCE(next_check_at, 0), username`).all().filter((r) => (r.platform ?? 'tiktok') === platform);
+      }
+    }
+    if (typeof filter === 'string' && filter) {
+      const platform = normalizePlatform(filter);
+      try {
+        return this.db.prepare(`
+          SELECT *
+          FROM watched_users
+          WHERE platform = ?
+          ORDER BY COALESCE(next_check_at, 0), username
+        `).all(platform);
+      } catch {
+        return this.db.prepare(`SELECT * FROM watched_users ORDER BY COALESCE(next_check_at, 0), username`).all().filter((r) => (r.platform ?? 'tiktok') === platform);
+      }
+    }
+    try {
+      return this.db.prepare(`
+        SELECT *
+        FROM watched_users
+        ORDER BY platform, COALESCE(next_check_at, 0), username
+      `).all();
+    } catch {
+      return this.db.prepare(`SELECT * FROM watched_users ORDER BY COALESCE(next_check_at, 0), username`).all();
+    }
   }
 
-  listWatchesForScope({ guildId = '', channelId = '' } = {}) {
-    return this.db.prepare(`
-      WITH ranked_subscriptions AS (
-        SELECT watch_subscriptions.*,
-          ROW_NUMBER() OVER (
-            PARTITION BY watch_subscriptions.username
-            ORDER BY CASE WHEN watch_subscriptions.guild_id = ? THEN 0 ELSE 1 END,
-              watch_subscriptions.id
-          ) AS scope_rank
-        FROM watch_subscriptions
-        WHERE watch_subscriptions.guild_id = ?
-          OR (
-            watch_subscriptions.guild_id = ''
-            AND watch_subscriptions.channel_id = ?
+  listWatchesForScope({ guildId = '', channelId = '', platform = '' } = {}) {
+    const normalizedPlatform = platform ? normalizePlatform(platform) : '';
+    if (normalizedPlatform) {
+      try {
+        return this.db.prepare(`
+          WITH ranked_subscriptions AS (
+            SELECT watch_subscriptions.*,
+              ROW_NUMBER() OVER (
+                PARTITION BY watch_subscriptions.platform, watch_subscriptions.username
+                ORDER BY CASE WHEN watch_subscriptions.guild_id = ? THEN 0 ELSE 1 END,
+                  watch_subscriptions.id
+              ) AS scope_rank
+            FROM watch_subscriptions
+            WHERE platform = ?
+              AND (
+                watch_subscriptions.guild_id = ?
+                OR (
+                  watch_subscriptions.guild_id = ''
+                  AND watch_subscriptions.channel_id = ?
+                )
+              )
           )
-      )
-      SELECT watched_users.*, ranked_subscriptions.channel_id AS subscription_channel_id,
-        ranked_subscriptions.created_by AS subscription_created_by
-      FROM ranked_subscriptions
-      JOIN watched_users ON watched_users.username = ranked_subscriptions.username
-      WHERE ranked_subscriptions.scope_rank = 1
-      ORDER BY watched_users.username
-    `).all(String(guildId ?? ''), String(guildId ?? ''), String(channelId ?? ''));
+          SELECT watched_users.*, ranked_subscriptions.channel_id AS subscription_channel_id,
+            ranked_subscriptions.created_by AS subscription_created_by
+          FROM ranked_subscriptions
+          JOIN watched_users ON watched_users.platform = ranked_subscriptions.platform AND watched_users.username = ranked_subscriptions.username
+          WHERE ranked_subscriptions.scope_rank = 1
+          ORDER BY watched_users.username
+        `).all(String(guildId ?? ''), normalizedPlatform, String(guildId ?? ''), String(channelId ?? ''));
+      } catch {
+        return [];
+      }
+    }
+    try {
+      return this.db.prepare(`
+        WITH ranked_subscriptions AS (
+          SELECT watch_subscriptions.*,
+            ROW_NUMBER() OVER (
+              PARTITION BY watch_subscriptions.platform, watch_subscriptions.username
+              ORDER BY CASE WHEN watch_subscriptions.guild_id = ? THEN 0 ELSE 1 END,
+                watch_subscriptions.id
+            ) AS scope_rank
+          FROM watch_subscriptions
+          WHERE watch_subscriptions.guild_id = ?
+            OR (
+              watch_subscriptions.guild_id = ''
+              AND watch_subscriptions.channel_id = ?
+            )
+        )
+        SELECT watched_users.*, ranked_subscriptions.channel_id AS subscription_channel_id,
+          ranked_subscriptions.created_by AS subscription_created_by
+        FROM ranked_subscriptions
+        JOIN watched_users ON watched_users.platform = ranked_subscriptions.platform AND watched_users.username = ranked_subscriptions.username
+        WHERE ranked_subscriptions.scope_rank = 1
+        ORDER BY watched_users.platform, watched_users.username
+      `).all(String(guildId ?? ''), String(guildId ?? ''), String(channelId ?? ''));
+    } catch {
+      // Fallback for legacy DB without platform column
+      return this.db.prepare(`
+        WITH ranked_subscriptions AS (
+          SELECT watch_subscriptions.*,
+            ROW_NUMBER() OVER (
+              PARTITION BY watch_subscriptions.username
+              ORDER BY CASE WHEN watch_subscriptions.guild_id = ? THEN 0 ELSE 1 END,
+                watch_subscriptions.id
+            ) AS scope_rank
+          FROM watch_subscriptions
+          WHERE watch_subscriptions.guild_id = ?
+            OR (
+              watch_subscriptions.guild_id = ''
+              AND watch_subscriptions.channel_id = ?
+            )
+        )
+        SELECT watched_users.*, ranked_subscriptions.channel_id AS subscription_channel_id,
+          ranked_subscriptions.created_by AS subscription_created_by
+        FROM ranked_subscriptions
+        JOIN watched_users ON watched_users.username = ranked_subscriptions.username
+        WHERE ranked_subscriptions.scope_rank = 1
+        ORDER BY watched_users.username
+      `).all(String(guildId ?? ''), String(guildId ?? ''), String(channelId ?? ''));
+    }
   }
 
-  getWatchSubscription(username, { guildId = '' } = {}) {
-    return this.db.prepare(`
-      SELECT *
-      FROM watch_subscriptions
-      WHERE username = ? AND guild_id = ?
-    `).get(String(username), String(guildId ?? '')) ?? null;
+  getWatchSubscription(username, { guildId = '', platform = 'tiktok' } = {}) {
+    const normalizedUsername = String(username ?? '').trim();
+    const normalizedGuildId = String(guildId ?? '');
+    const normalizedPlatform = normalizePlatform(platform ?? 'tiktok');
+    try {
+      return this.db.prepare(`
+        SELECT *
+        FROM watch_subscriptions
+        WHERE platform = ? AND username = ? AND guild_id = ?
+      `).get(normalizedPlatform, normalizedUsername, normalizedGuildId) ?? null;
+    } catch {
+      return this.db.prepare(`
+        SELECT *
+        FROM watch_subscriptions
+        WHERE username = ? AND guild_id = ?
+      `).get(normalizedUsername, normalizedGuildId) ?? null;
+    }
   }
 
   hasWatchSubscription(username, scope = {}) {
-    return Boolean(this.getWatchSubscription(username, scope));
+    const platform = normalizePlatform(scope?.platform ?? scope?.platformName ?? 'tiktok');
+    return Boolean(this.getWatchSubscription(username, { guildId: String(scope.guildId ?? scope.guild_id ?? ''), platform }));
   }
 
-  listWatchSubscriptions(username) {
-    return this.db.prepare(`
-      SELECT *
-      FROM watch_subscriptions
-      WHERE username = ?
-      ORDER BY guild_id, created_at, id
-    `).all(String(username));
+  listWatchSubscriptions(username, platform = null) {
+    const normalizedUsername = String(username ?? '').trim();
+    if (platform) {
+      const normalizedPlatform = normalizePlatform(platform);
+      try {
+        return this.db.prepare(`
+          SELECT *
+          FROM watch_subscriptions
+          WHERE platform = ? AND username = ?
+          ORDER BY guild_id, created_at, id
+        `).all(normalizedPlatform, normalizedUsername);
+      } catch {
+        return this.db.prepare(`
+          SELECT *
+          FROM watch_subscriptions
+          WHERE username = ?
+          ORDER BY guild_id, created_at, id
+        `).all(normalizedUsername).filter((r) => (r.platform ?? 'tiktok') === normalizedPlatform);
+      }
+    }
+    try {
+      return this.db.prepare(`
+        SELECT *
+        FROM watch_subscriptions
+        WHERE username = ?
+        ORDER BY platform, guild_id, created_at, id
+      `).all(normalizedUsername);
+    } catch {
+      return this.db.prepare(`
+        SELECT *
+        FROM watch_subscriptions
+        WHERE username = ?
+        ORDER BY guild_id, created_at, id
+      `).all(normalizedUsername);
+    }
   }
 
   getAlertDelivery({ videoId, subscriptionId, eventType = 'new_post' } = {}) {
@@ -1335,6 +1582,7 @@ export class Store {
     authorId = '',
     hasStory = null,
     storyStatusCheckedAt = null,
+    platform = '',
   } = {}, now = Date.now()) {
     const previousUsername = String(username ?? '');
     const nextUsername = String(currentUsername || previousUsername);
@@ -1345,20 +1593,46 @@ export class Store {
     const nextStoryStatusCheckedAt = nextHasStory === null
       ? null
       : normalizeNullableInteger(storyStatusCheckedAt) ?? now;
-    const existing = this.getWatch(previousUsername);
+    let inferredPlatform = platform ? normalizePlatform(platform) : '';
+    if (!inferredPlatform) {
+      const existingFallback = this.getWatch(previousUsername) ?? this.db.prepare('SELECT * FROM watched_users WHERE username = ? LIMIT 1').get(previousUsername) ?? null;
+      inferredPlatform = normalizePlatform(existingFallback?.platform ?? 'tiktok');
+    } else {
+      inferredPlatform = normalizePlatform(inferredPlatform);
+    }
+    let existing;
+    try {
+      existing = this.db.prepare('SELECT * FROM watched_users WHERE platform = ? AND username = ?').get(inferredPlatform, previousUsername) ?? null;
+    } catch {
+      existing = this.db.prepare('SELECT * FROM watched_users WHERE username = ?').get(previousUsername) ?? null;
+      inferredPlatform = normalizePlatform(existing?.platform ?? inferredPlatform);
+    }
     if (!existing) return { changed: false, username: nextUsername, previousUsername, creatorId: id, secUid: nextSecUid, authorId: nextAuthorId };
 
     if (id || nextSecUid || nextAuthorId || nextHasStory !== null) {
-      this.db.prepare(`
-        UPDATE watched_users
-        SET
-          creator_id = COALESCE(NULLIF(?, ''), creator_id),
-          sec_uid = COALESCE(NULLIF(?, ''), sec_uid),
-          author_id = COALESCE(NULLIF(?, ''), author_id),
-          has_story = COALESCE(?, has_story),
-          story_status_checked_at = COALESCE(?, story_status_checked_at)
-        WHERE username = ?
-      `).run(id, nextSecUid, nextAuthorId, nextHasStory, nextStoryStatusCheckedAt, previousUsername);
+      try {
+        this.db.prepare(`
+          UPDATE watched_users
+          SET
+            creator_id = COALESCE(NULLIF(?, ''), creator_id),
+            sec_uid = COALESCE(NULLIF(?, ''), sec_uid),
+            author_id = COALESCE(NULLIF(?, ''), author_id),
+            has_story = COALESCE(?, has_story),
+            story_status_checked_at = COALESCE(?, story_status_checked_at)
+          WHERE platform = ? AND username = ?
+        `).run(id, nextSecUid, nextAuthorId, nextHasStory, nextStoryStatusCheckedAt, inferredPlatform, previousUsername);
+      } catch {
+        this.db.prepare(`
+          UPDATE watched_users
+          SET
+            creator_id = COALESCE(NULLIF(?, ''), creator_id),
+            sec_uid = COALESCE(NULLIF(?, ''), sec_uid),
+            author_id = COALESCE(NULLIF(?, ''), author_id),
+            has_story = COALESCE(?, has_story),
+            story_status_checked_at = COALESCE(?, story_status_checked_at)
+          WHERE username = ?
+        `).run(id, nextSecUid, nextAuthorId, nextHasStory, nextStoryStatusCheckedAt, previousUsername);
+      }
     }
 
     if (!nextUsername || nextUsername.toLowerCase() === previousUsername.toLowerCase()) {
@@ -1369,6 +1643,7 @@ export class Store {
         creatorId: id || existing.creator_id || '',
         secUid: nextSecUid || existing.sec_uid || '',
         authorId: nextAuthorId || existing.author_id || '',
+        platform: inferredPlatform,
       };
     }
 
@@ -1377,56 +1652,115 @@ export class Store {
       VALUES (?, ?, ?, ?)
     `).run(id || existing.creator_id || '', previousUsername, nextUsername, now);
 
-    const conflict = this.getWatch(nextUsername);
+    let conflict;
+    try {
+      conflict = this.db.prepare('SELECT * FROM watched_users WHERE platform = ? AND username = ?').get(inferredPlatform, nextUsername) ?? null;
+    } catch {
+      conflict = this.db.prepare('SELECT * FROM watched_users WHERE username = ?').get(nextUsername) ?? null;
+    }
     if (conflict) {
-      this.db.prepare(`
-        UPDATE watched_users
-        SET
-          creator_id = COALESCE(NULLIF(?, ''), creator_id),
-          sec_uid = COALESCE(NULLIF(?, ''), sec_uid),
-          author_id = COALESCE(NULLIF(?, ''), author_id),
-          has_story = COALESCE(?, has_story),
-          story_status_checked_at = COALESCE(?, story_status_checked_at),
-          previous_username = ?,
-          username_changed_at = ?,
-          last_checked_at = COALESCE(last_checked_at, ?),
-          last_success_at = COALESCE(last_success_at, ?)
-        WHERE username = ?
-      `).run(
-        id,
-        nextSecUid,
-        nextAuthorId,
-        nextHasStory,
-        nextStoryStatusCheckedAt,
-        previousUsername,
-        now,
-        existing.last_checked_at,
-        existing.last_success_at,
-        nextUsername,
-      );
-      this.db.prepare('DELETE FROM watched_users WHERE username = ?').run(previousUsername);
+      try {
+        this.db.prepare(`
+          UPDATE watched_users
+          SET
+            creator_id = COALESCE(NULLIF(?, ''), creator_id),
+            sec_uid = COALESCE(NULLIF(?, ''), sec_uid),
+            author_id = COALESCE(NULLIF(?, ''), author_id),
+            has_story = COALESCE(?, has_story),
+            story_status_checked_at = COALESCE(?, story_status_checked_at),
+            previous_username = ?,
+            username_changed_at = ?,
+            last_checked_at = COALESCE(last_checked_at, ?),
+            last_success_at = COALESCE(last_success_at, ?)
+          WHERE platform = ? AND username = ?
+        `).run(
+          id,
+          nextSecUid,
+          nextAuthorId,
+          nextHasStory,
+          nextStoryStatusCheckedAt,
+          previousUsername,
+          now,
+          existing.last_checked_at,
+          existing.last_success_at,
+          inferredPlatform,
+          nextUsername,
+        );
+        this.db.prepare('DELETE FROM watched_users WHERE platform = ? AND username = ?').run(inferredPlatform, previousUsername);
+      } catch {
+        this.db.prepare(`
+          UPDATE watched_users
+          SET
+            creator_id = COALESCE(NULLIF(?, ''), creator_id),
+            sec_uid = COALESCE(NULLIF(?, ''), sec_uid),
+            author_id = COALESCE(NULLIF(?, ''), author_id),
+            has_story = COALESCE(?, has_story),
+            story_status_checked_at = COALESCE(?, story_status_checked_at),
+            previous_username = ?,
+            username_changed_at = ?,
+            last_checked_at = COALESCE(last_checked_at, ?),
+            last_success_at = COALESCE(last_success_at, ?)
+          WHERE username = ?
+        `).run(
+          id,
+          nextSecUid,
+          nextAuthorId,
+          nextHasStory,
+          nextStoryStatusCheckedAt,
+          previousUsername,
+          now,
+          existing.last_checked_at,
+          existing.last_success_at,
+          nextUsername,
+        );
+        this.db.prepare('DELETE FROM watched_users WHERE username = ?').run(previousUsername);
+      }
     } else {
-      this.db.prepare(`
-        UPDATE watched_users
-        SET
-          username = ?,
-          creator_id = COALESCE(NULLIF(?, ''), creator_id),
-          sec_uid = COALESCE(NULLIF(?, ''), sec_uid),
-          author_id = COALESCE(NULLIF(?, ''), author_id),
-          has_story = COALESCE(?, has_story),
-          story_status_checked_at = COALESCE(?, story_status_checked_at),
-          previous_username = ?,
-          username_changed_at = ?
-        WHERE username = ?
-      `).run(nextUsername, id, nextSecUid, nextAuthorId, nextHasStory, nextStoryStatusCheckedAt, previousUsername, now, previousUsername);
+      try {
+        this.db.prepare(`
+          UPDATE watched_users
+          SET
+            username = ?,
+            creator_id = COALESCE(NULLIF(?, ''), creator_id),
+            sec_uid = COALESCE(NULLIF(?, ''), sec_uid),
+            author_id = COALESCE(NULLIF(?, ''), author_id),
+            has_story = COALESCE(?, has_story),
+            story_status_checked_at = COALESCE(?, story_status_checked_at),
+            previous_username = ?,
+            username_changed_at = ?
+          WHERE platform = ? AND username = ?
+        `).run(nextUsername, id, nextSecUid, nextAuthorId, nextHasStory, nextStoryStatusCheckedAt, previousUsername, now, inferredPlatform, previousUsername);
+      } catch {
+        this.db.prepare(`
+          UPDATE watched_users
+          SET
+            username = ?,
+            creator_id = COALESCE(NULLIF(?, ''), creator_id),
+            sec_uid = COALESCE(NULLIF(?, ''), sec_uid),
+            author_id = COALESCE(NULLIF(?, ''), author_id),
+            has_story = COALESCE(?, has_story),
+            story_status_checked_at = COALESCE(?, story_status_checked_at),
+            previous_username = ?,
+            username_changed_at = ?
+          WHERE username = ?
+        `).run(nextUsername, id, nextSecUid, nextAuthorId, nextHasStory, nextStoryStatusCheckedAt, previousUsername, now, previousUsername);
+      }
     }
 
-    this.moveWatchSubscriptions(previousUsername, nextUsername);
-    this.db.prepare(`
-      UPDATE monitor_download_failures
-      SET username = ?, updated_at = ?
-      WHERE username = ? COLLATE NOCASE
-    `).run(nextUsername, now, previousUsername);
+    this.moveWatchSubscriptions(previousUsername, nextUsername, inferredPlatform);
+    try {
+      this.db.prepare(`
+        UPDATE monitor_download_failures
+        SET username = ?, updated_at = ?
+        WHERE platform = ? AND username = ? COLLATE NOCASE
+      `).run(nextUsername, now, inferredPlatform, previousUsername);
+    } catch {
+      this.db.prepare(`
+        UPDATE monitor_download_failures
+        SET username = ?, updated_at = ?
+        WHERE username = ? COLLATE NOCASE
+      `).run(nextUsername, now, previousUsername);
+    }
 
     return {
       changed: true,
@@ -1435,11 +1769,25 @@ export class Store {
       creatorId: id || existing.creator_id || '',
       secUid: nextSecUid || existing.sec_uid || '',
       authorId: nextAuthorId || existing.author_id || '',
+      platform: inferredPlatform,
     };
   }
 
-  moveWatchSubscriptions(previousUsername, nextUsername) {
+  moveWatchSubscriptions(previousUsername, nextUsername, platform = '') {
     if (!previousUsername || !nextUsername || previousUsername === nextUsername) return;
+    const normalizedPlatform = platform ? normalizePlatform(platform) : '';
+    if (normalizedPlatform) {
+      try {
+        this.db.prepare(`
+          INSERT OR IGNORE INTO watch_subscriptions (platform, username, guild_id, channel_id, created_by, created_at)
+          SELECT platform, ?, guild_id, channel_id, created_by, created_at
+          FROM watch_subscriptions
+          WHERE platform = ? AND username = ?
+        `).run(nextUsername, normalizedPlatform, previousUsername);
+        this.db.prepare('DELETE FROM watch_subscriptions WHERE platform = ? AND username = ?').run(normalizedPlatform, previousUsername);
+        return;
+      } catch {}
+    }
     this.db.prepare(`
       INSERT OR IGNORE INTO watch_subscriptions (username, guild_id, channel_id, created_by, created_at)
       SELECT ?, guild_id, channel_id, created_by, created_at
@@ -1447,6 +1795,15 @@ export class Store {
       WHERE username = ?
     `).run(nextUsername, previousUsername);
     this.db.prepare('DELETE FROM watch_subscriptions WHERE username = ?').run(previousUsername);
+    try {
+      this.db.prepare(`
+        INSERT OR IGNORE INTO watch_subscriptions (platform, username, guild_id, channel_id, created_by, created_at)
+        SELECT platform, ?, guild_id, channel_id, created_by, created_at
+        FROM watch_subscriptions
+        WHERE username = ?
+      `).run(nextUsername, previousUsername);
+      this.db.prepare('DELETE FROM watch_subscriptions WHERE username = ? AND platform IS NOT NULL').run(previousUsername);
+    } catch {}
   }
 
   listWatchUsernameHistory(limit = 25) {
@@ -1459,6 +1816,19 @@ export class Store {
   }
 
   markWatchSuccess(username, now = Date.now(), nextCheckAt = null) {
+    const normalizedUsername = String(username ?? '').trim();
+    try {
+      const watch = this.db.prepare('SELECT platform FROM watched_users WHERE username = ? LIMIT 1').get(normalizedUsername);
+      if (watch?.platform) {
+        this.db.prepare(`
+          UPDATE watched_users
+          SET last_checked_at = ?, last_success_at = ?, failure_count = 0, last_error = NULL, next_check_at = ?
+          WHERE platform = ? AND username = ?
+        `).run(now, now, nextCheckAt, watch.platform, normalizedUsername);
+        return;
+      }
+    } catch {}
+
     this.db.prepare(`
       UPDATE watched_users
       SET last_checked_at = ?, last_success_at = ?, failure_count = 0, last_error = NULL, next_check_at = ?
@@ -1467,12 +1837,62 @@ export class Store {
   }
 
   markWatchFailure(username, error, nextCheckAt, now = Date.now()) {
+    const normalizedUsername = String(username ?? '').trim();
+    try {
+      const watch = this.db.prepare('SELECT platform FROM watched_users WHERE username = ? LIMIT 1').get(normalizedUsername);
+      if (watch?.platform) {
+        this.db.prepare(`
+          UPDATE watched_users
+          SET last_checked_at = ?, failure_count = failure_count + 1, last_error = ?, next_check_at = ?
+          WHERE platform = ? AND username = ?
+        `).run(now, String(error).slice(0, 500), nextCheckAt, watch.platform, normalizedUsername);
+        return;
+      }
+    } catch {}
+
     this.db.prepare(`
       UPDATE watched_users
       SET last_checked_at = ?, failure_count = failure_count + 1, last_error = ?, next_check_at = ?
       WHERE username = ?
     `).run(now, String(error).slice(0, 500), nextCheckAt, username);
   }
+  markHighlightCheckSuccess(username, platform = 'instagram', now = Date.now(), nextCheckAt = null) {
+    const normalizedUsername = String(username ?? '').trim();
+    const normalizedPlatform = normalizePlatform(platform ?? 'instagram');
+    try {
+      this.db.prepare(`
+        UPDATE watched_users
+        SET last_highlight_check_at = ?, highlight_failure_count = 0, highlight_last_error = NULL, next_highlight_check_at = ?
+        WHERE platform = ? AND username = ?
+      `).run(now, nextCheckAt, normalizedPlatform, normalizedUsername);
+    } catch {
+      this.db.prepare(`
+        UPDATE watched_users
+        SET last_highlight_check_at = ?, highlight_failure_count = 0, highlight_last_error = NULL, next_highlight_check_at = ?
+        WHERE username = ?
+      `).run(now, nextCheckAt, normalizedUsername);
+    }
+  }
+
+  markHighlightCheckFailure(username, platform = 'instagram', error = '', nextCheckAt = null, now = Date.now()) {
+    const normalizedUsername = String(username ?? '').trim();
+    const normalizedPlatform = normalizePlatform(platform ?? 'instagram');
+    const lastError = String(error?.message ?? error ?? '').slice(0, 500);
+    try {
+      this.db.prepare(`
+        UPDATE watched_users
+        SET last_highlight_check_at = ?, highlight_failure_count = highlight_failure_count + 1, highlight_last_error = ?, next_highlight_check_at = ?
+        WHERE platform = ? AND username = ?
+      `).run(now, lastError, nextCheckAt, normalizedPlatform, normalizedUsername);
+    } catch {
+      this.db.prepare(`
+        UPDATE watched_users
+        SET last_highlight_check_at = ?, highlight_failure_count = highlight_failure_count + 1, highlight_last_error = ?, next_highlight_check_at = ?
+        WHERE username = ?
+      `).run(now, lastError, nextCheckAt, normalizedUsername);
+    }
+  }
+
 
   hasSeenVideo(videoId) {
     return Boolean(this.db.prepare('SELECT 1 FROM seen_videos WHERE video_id = ?').get(videoId));
@@ -1501,7 +1921,19 @@ export class Store {
     `).run(nextCheckAt, String(videoId));
   }
 
-  clearDeletionChecksForUsername(username) {
+  clearDeletionChecksForUsername(username, platform = '') {
+    const normalizedUsername = String(username ?? '').trim();
+    if (platform) {
+      const normalizedPlatform = normalizePlatform(platform);
+      try {
+        return this.db.prepare(`
+          UPDATE seen_videos
+          SET next_deletion_check_at = NULL, deletion_check_claimed_at = NULL
+          WHERE platform = ? AND username = ? COLLATE NOCASE
+        `).run(normalizedPlatform, normalizedUsername).changes;
+      } catch {}
+    }
+
     return this.db.prepare(`
       UPDATE seen_videos
       SET next_deletion_check_at = NULL, deletion_check_claimed_at = NULL

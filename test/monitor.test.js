@@ -198,12 +198,14 @@ class FakeDownloader {
 test('normalizeWatchedUser accepts profile URLs and usernames', () => {
   assert.deepEqual(normalizeWatchedUser('https://www.tiktok.com/@Creator/?lang=en'), {
     username: 'Creator',
+    platform: 'tiktok',
     profileUrl: 'https://www.tiktok.com/@Creator',
     storyUrl: 'https://www.tiktok.com/@Creator/story',
   });
 
   assert.deepEqual(normalizeWatchedUser({ username: 'maker' }), {
     username: 'maker',
+    platform: 'tiktok',
     profileUrl: 'https://www.tiktok.com/@maker',
     storyUrl: 'https://www.tiktok.com/@maker/story',
   });

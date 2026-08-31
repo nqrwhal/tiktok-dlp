@@ -6,6 +6,7 @@ export const PLATFORM_ADAPTER_OPERATIONS = Object.freeze([
   'download',
   'listCreatorPosts',
   'listCreatorStories',
+  'listCreatorHighlights',
   'checkAvailability',
 ]);
 

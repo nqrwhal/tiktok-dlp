@@ -36,6 +36,44 @@ const MONITOR_BUTTON_PREFIX = 'monitor:';
 const MAX_MESSAGE_DOWNLOAD_URLS = 3;
 const MAX_MESSAGE_URL_CANDIDATES = 25;
 const DISCORD_MESSAGE_ATTACHMENT_BUDGET_BYTES = 24 * 1024 * 1024;
+const INSTAGRAM_TRAY_RE = /^\/stories\/([A-Za-z0-9._]{1,30})\/?$/i;
+const INSTAGRAM_TRAY_URL_RE = /^https:\/\/www\.instagram\.com\/stories\/([A-Za-z0-9._]{1,30})\/?$/i;
+function isInstagramStoryTrayUrl(url) {
+  try {
+    const u = new URL(String(url));
+    return /(^|\.)instagram\.com$/i.test(u.hostname) && INSTAGRAM_TRAY_RE.test(u.pathname) && !u.search && !u.hash;
+  } catch { return false; }
+}
+function trayHandleFromUrl(url) {
+  const m = String(url).match(INSTAGRAM_TRAY_URL_RE);
+  return m ? m[1].toLowerCase() : '';
+}
+async function expandTrayUrls(urls, config) {
+  const expanded = [];
+  for (const url of urls) {
+    if (isInstagramStoryTrayUrl(url)) {
+      const handle = trayHandleFromUrl(url);
+      try {
+        const adapter = (await import('../platforms/index.js')).getPlatformAdapter('instagram');
+        if (typeof adapter?.listCreatorStories === 'function') {
+          const listing = await adapter.listCreatorStories(handle, { ...config, limit: 10 });
+          const entries = Array.isArray(listing?.entries) ? listing.entries : [];
+          if (entries.length) {
+            for (const entry of entries) {
+              const storyUrl = entry.webpage_url || entry.url || entry.source_url;
+              if (storyUrl) expanded.push(storyUrl);
+            }
+            continue;
+          }
+        }
+      } catch (e) {
+        // fall through to treat tray as single URL (will error clearly)
+      }
+    }
+    expanded.push(url);
+  }
+  return expanded;
+}
 
 export async function startDiscordBot({ config, store, monitor, downloadOne, registerCommands, downloadService = null }) {
   if (config.registerCommandsOnStart) {
@@ -108,7 +146,52 @@ export async function handleInteraction({ interaction, config, store, monitor, d
 
   if (command === 'download') {
     await interaction.deferReply({ ephemeral: true });
-    const url = normalizeDownloadPostUrl(interaction.options.getString('url', true));
+    const rawUrl = interaction.options.getString('url', true);
+    let url = rawUrl;
+    // Tray expansion: if user pasted stories tray, expand to active stories
+    if (isInstagramStoryTrayUrl(rawUrl) || isInstagramStoryTrayUrl(normalizeDownloadPostUrl(rawUrl))) {
+      try {
+        const canonical = normalizeDownloadPostUrl(rawUrl);
+        const expanded = await expandTrayUrls([canonical], config);
+        if (expanded.length > 1) {
+          // Tray with multiple stories: download each sequentially
+          const delivery = interaction.options.getString('delivery') ?? 'auto';
+          const results = [];
+          for (const storyUrl of expanded.slice(0, 5)) {
+            const r = await downloadOne(storyUrl, {
+              delivery,
+              type: 'manual',
+              requestedBy: interaction.user?.id ?? '',
+              guildId: interaction.guildId ?? '',
+              channelId: interaction.channelId ?? '',
+            });
+            results.push(r);
+          }
+          // Send first result via existing fallback, additional via followups
+          const payload = await buildDeliveryPayload(results[0], config, delivery);
+          await sendDeliveryWithLinkFallback({
+            send: (candidate) => interaction.editReply(candidate),
+            payload,
+            result: results[0],
+            config,
+          });
+          for (let i = 1; i < results.length; i++) {
+            const p2 = await buildDeliveryPayload(results[i], config, delivery);
+            await sendDeliveryWithLinkFallback({
+              send: (candidate) => interaction.followUp(candidate),
+              payload: p2,
+              result: results[i],
+              config,
+            });
+          }
+          return;
+        }
+        url = expanded[0] ?? normalizeDownloadPostUrl(rawUrl);
+      } catch {}
+      url = normalizeDownloadPostUrl(url);
+    } else {
+      url = normalizeDownloadPostUrl(rawUrl);
+    }
     const delivery = interaction.options.getString('delivery') ?? 'auto';
     const result = await downloadOne(url, {
       delivery,
@@ -140,26 +223,33 @@ export async function handleInteraction({ interaction, config, store, monitor, d
     const scope = watchScopeFromInteraction(interaction, config);
     if (subcommand === 'add') {
       const username = normalizeUsername(interaction.options.getString('username', true));
-      const watch = store.addWatch(username, scope);
+      const platform = normalizePlatformInput(interaction.options.getString('platform') ?? 'tiktok');
+      const scopeWithPlatform = { ...scope, platform };
+      const watch = store.addWatch(username, scopeWithPlatform);
       await interaction.reply(buildNoticePayload({
         title: 'Watch Added',
-        description: `Watching @${watch.username}. Alerts will post in this channel.`,
+        description: `Watching @${watch.username} on ${formatPlatformLabel(watch.platform)}. Alerts will post in this channel.`,
       }));
       return;
     }
     if (subcommand === 'remove') {
       const username = normalizeUsername(interaction.options.getString('username', true));
-      const removed = store.removeWatch(username, scope);
+      const platform = normalizePlatformInput(interaction.options.getString('platform') ?? 'tiktok');
+      const scopeWithPlatform = { ...scope, platform };
+      const removed = store.removeWatch(username, scopeWithPlatform);
       await interaction.reply(buildNoticePayload({
         title: removed ? 'Watch Removed' : 'Watch Not Found',
-        description: removed ? `Stopped watching @${username}.` : `@${username} was not watched.`,
+        description: removed ? `Stopped watching @${username} on ${formatPlatformLabel(platform)}.` : `@${username} on ${formatPlatformLabel(platform)} was not watched.`,
       }));
       return;
     }
     if (subcommand === 'list') {
-      const watches = store.listWatchesForScope?.(scope) ?? store.listWatches();
+      const platformFilter = interaction.options.getString('platform') ?? 'all';
+      const watches = platformFilter && platformFilter !== 'all'
+        ? (store.listWatchesForScope?.({ ...scope, platform: platformFilter }) ?? store.listWatches({ platform: platformFilter }))
+        : (store.listWatchesForScope?.(scope) ?? store.listWatches());
       await interaction.reply(buildNoticePayload({
-        title: 'Watched Usernames',
+        title: platformFilter && platformFilter !== 'all' ? `Watched ${formatPlatformLabel(platformFilter)} Usernames` : 'Watched Usernames',
         description: formatWatchList(watches),
       }));
       return;
@@ -167,25 +257,30 @@ export async function handleInteraction({ interaction, config, store, monitor, d
     if (subcommand === 'failures') {
       const usernameInput = interaction.options.getString('username') ?? '';
       const username = usernameInput ? normalizeUsername(usernameInput) : '';
+      const platformFilter = interaction.options.getString('platform') ?? '';
       const failures = store.listMonitorDownloadFailuresForScope?.({
         ...scope,
         username,
+        platform: platformFilter || undefined,
         limit: 10,
       }) ?? [];
+      const filtered = platformFilter && platformFilter !== 'all'
+        ? failures.filter((f) => (f.platform ?? 'tiktok') === normalizePlatformInput(platformFilter))
+        : failures;
       await interaction.reply(buildNoticePayload({
-        title: username ? `Monitor Failures for @${username}` : 'Monitor Failures',
-        description: formatMonitorFailureList(failures),
-        color: failures.length ? UI_COLORS.warning : UI_COLORS.info,
+        title: username ? `Monitor Failures for @${username}` : `Monitor Failures${platformFilter ? ` — ${formatPlatformLabel(platformFilter)}` : ''}`,
+        description: formatMonitorFailureList(filtered),
+        color: filtered.length ? UI_COLORS.warning : UI_COLORS.info,
       }));
       return;
     }
     if (subcommand === 'retry') {
       const videoId = String(interaction.options.getString('post_id', true) ?? '').trim();
       const failure = store.getMonitorDownloadFailure?.(videoId) ?? null;
-      if (!failure || !store.hasWatchSubscription?.(failure.username, scope)) {
+      if (!failure || !store.hasWatchSubscription?.(failure.username, { ...scope, platform: failure.platform ?? 'tiktok' })) {
         await interaction.reply(buildNoticePayload({
           title: 'Monitor Failure Not Found',
-          description: 'That post is not awaiting retry for a TikTok watch in this server or DM.',
+          description: 'That post is not awaiting retry for a watch in this server or DM.',
           color: UI_COLORS.error,
         }));
         return;
@@ -208,7 +303,7 @@ export async function handleInteraction({ interaction, config, store, monitor, d
       if (result.completed) {
         await interaction.editReply(buildNoticePayload({
           title: 'Monitor Retry Succeeded',
-          description: `Downloaded TikTok post ${videoId} for @${failure.username} and delivered its current watch alerts.`,
+          description: `Downloaded ${formatPlatformLabel(failure.platform ?? 'tiktok')} post ${videoId} for @${failure.username} and delivered its current watch alerts.`,
           color: UI_COLORS.success,
           ephemeral: false,
         }));
@@ -218,7 +313,7 @@ export async function handleInteraction({ interaction, config, store, monitor, d
       const retryError = result.error || result.failure?.last_error || 'The retry did not complete.';
       await interaction.editReply(buildNoticePayload({
         title: 'Monitor Retry Failed',
-        description: `TikTok post ${videoId} remains available in \`/watch failures\`.\n${truncateText(retryError, 500)}`,
+        description: `${formatPlatformLabel(failure.platform ?? 'tiktok')} post ${videoId} remains available in \`/watch failures\`.\n${truncateText(retryError, 500)}`,
         color: UI_COLORS.error,
         ephemeral: false,
       }));
@@ -227,18 +322,20 @@ export async function handleInteraction({ interaction, config, store, monitor, d
     if (subcommand === 'run') {
       await interaction.deferReply({ ephemeral: true });
       const username = normalizeUsername(interaction.options.getString('username', true));
-      if (!store.hasWatchSubscription?.(username, scope)) {
+      const platform = normalizePlatformInput(interaction.options.getString('platform') ?? 'tiktok');
+      const scopeWithPlatform = { ...scope, platform };
+      if (!store.hasWatchSubscription?.(username, scopeWithPlatform)) {
         await interaction.editReply(buildNoticePayload({
           title: 'Watch Not Found',
-          description: `@${username} is not registered for this server or DM. Add the watch before running it.`,
+          description: `@${username} on ${formatPlatformLabel(platform)} is not registered for this server or DM. Add the watch before running it.`,
           ephemeral: false,
         }));
         return;
       }
-      const result = await monitor.pollUsername(username, { force: true });
+      const result = await monitor.pollUsername(username, { force: true, platform });
       await interaction.editReply(buildNoticePayload({
         title: 'Watch Check Complete',
-        description: `Checked TikTok @${username}: ${result.newVideos ?? 0} new post(s), ${result.skipped ?? 0} already seen.`,
+        description: `Checked ${formatPlatformLabel(platform)} @${username}: ${result.newVideos ?? 0} new post(s), ${result.skipped ?? 0} already seen.`,
         ephemeral: false,
       }));
       return;
@@ -343,7 +440,8 @@ export async function handleMessageCreate({ message, config, downloadOne }) {
     return true;
   }
 
-  const urls = extractDownloadPostUrls(message.content, MAX_MESSAGE_DOWNLOAD_URLS);
+  const rawUrls = extractDownloadPostUrls(message.content, MAX_MESSAGE_URL_CANDIDATES);
+  const urls = (await expandTrayUrls(rawUrls, config)).slice(0, MAX_MESSAGE_DOWNLOAD_URLS);
   if (!urls.length) return false;
 
   const status = await message.reply(buildNoticePayload({
@@ -426,6 +524,17 @@ export function extractDownloadPostUrls(value, limit = MAX_MESSAGE_DOWNLOAD_URLS
   const urls = [];
   const seen = new Set();
   for (const candidate of extractSupportedPlatformUrls(value, MAX_MESSAGE_URL_CANDIDATES)) {
+    // Allow Instagram story tray URLs to pass through for expansion even though they are not single-post URLs
+    if (isInstagramStoryTrayUrl(candidate)) {
+      const canonical = candidate.replace(/\/+$/, '') + '/';
+      const m = String(canonical).match(INSTAGRAM_TRAY_URL_RE);
+      const trayCanonical = m ? `https://www.instagram.com/stories/${m[1].toLowerCase()}/` : canonical;
+      if (seen.has(trayCanonical)) continue;
+      seen.add(trayCanonical);
+      urls.push(trayCanonical);
+      if (urls.length >= maximum) break;
+      continue;
+    }
     let source;
     try {
       source = resolveDownloadSource(candidate);
@@ -1615,16 +1724,18 @@ async function acknowledgeMonitorDelete(interaction, payload) {
 }
 
 function formatWatchList(watches) {
+  if (!watches?.length) return 'No watches configured.';
   if (!watches.length) return 'No watched usernames yet.';
   return watches.map((watch) => {
+    const platformLabel = formatPlatformLabel(watch.platform ?? 'tiktok');
     const last = watch.last_success_at ? new Date(watch.last_success_at).toISOString() : 'never';
     const suffix = watch.last_error ? `, last error: ${watch.last_error}` : '';
-    return `@${watch.username} — last success: ${last}${suffix}`;
+    return `@${watch.username} (${platformLabel}) — last success: ${last}${suffix}`;
   }).join('\n');
 }
 
 function formatMonitorFailureList(failures) {
-  if (!failures.length) return 'No monitored TikTok posts are awaiting manual retry in this server or DM.';
+  if (!failures.length) return 'No monitored posts are awaiting manual retry in this server or DM.';
   const rows = failures.map((failure, index) => {
     const state = failure.status === 'retrying' ? 'retry running' : 'dead-lettered';
     const error = truncateText(failure.last_error || 'Unknown extractor failure', 180);
@@ -1678,6 +1789,22 @@ function formatPlatformProfile(profile = {}) {
   const handle = String(profile.handle ?? '').replace(/^@/, '') || 'unknown';
   const url = String(profile.profile_url ?? profile.canonicalUrl ?? '');
   return `${displayPlatform} ${formatInlineCode(`@${handle}`)}${url ? ` — <${url}>` : ''}`;
+}
+
+function normalizePlatformInput(value) {
+  const raw = String(value ?? '').trim().toLowerCase();
+  if (!raw || raw === 'all') return 'all';
+  if (raw === 'instagram' || raw === 'ig') return 'instagram';
+  if (raw === 'tiktok' || raw === 'tt') return 'tiktok';
+  if (raw === 'x' || raw === 'twitter') return 'x';
+  return raw;
+}
+function formatPlatformLabel(platform) {
+  const p = String(platform ?? '').toLowerCase();
+  if (p === 'instagram') return 'Instagram';
+  if (p === 'tiktok') return 'TikTok';
+  if (p === 'x') return 'X';
+  return p || 'Unknown';
 }
 
 function formatInlineCode(value) {

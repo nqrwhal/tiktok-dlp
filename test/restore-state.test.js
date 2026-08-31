@@ -61,7 +61,7 @@ test('restore verifies the backup and preserves the replaced database first', as
       now: new Date(Date.UTC(2026, 7, 30, 12, 0, 2)),
     });
 
-    assert.equal(restored.schemaVersion, 4);
+    assert.equal(restored.schemaVersion, 6);
     assert.ok(restored.safetyBackup);
     assert.deepEqual(archivedVideoIds(destination), ['before-backup']);
     assert.deepEqual(

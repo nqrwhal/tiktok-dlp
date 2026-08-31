@@ -1,13 +1,18 @@
 import { createPostReference, createProfileReference } from './references.js';
 import { definePlatformAdapter, parseCredentialFreeHttpsUrl } from './registry.js';
-import { downloadGalleryDlPost, probeGalleryDlPost } from './galleryDl.js';
+import {
+  downloadGalleryDlPost,
+  listInstagramCreatorHighlights,
+  listInstagramCreatorPosts,
+  listInstagramCreatorStories,
+  probeGalleryDlPost,
+} from './galleryDl.js';
 import {
   downloadVideo as downloadTikTokVideo,
   fetchVideoMetadata as probeTikTokPost,
   listProfileStories as listTikTokCreatorStories,
   listProfileVideos as listTikTokCreatorPosts,
 } from '../tiktok/ytdlp.js';
-
 const TRACKING_QUERY_KEYS = new Set([
   'fbclid',
   'igsh',
@@ -120,7 +125,12 @@ export const instagramAdapter = definePlatformAdapter({
   canonicalHost: 'www.instagram.com',
   capabilities: {
     directDownload: true,
+    directStories: true,
     multiAsset: true,
+    creatorListing: true,
+    stories: true,
+    highlights: true,
+    availability: false,
     probeBeforeDownload: false,
     archiveOwnedStaging: true,
     preferRequestedCreatorHandle: false,
@@ -132,6 +142,12 @@ export const instagramAdapter = definePlatformAdapter({
     if (post) return post.canonicalUrl;
     const profile = parseInstagramProfile(url);
     if (profile) return profile.canonicalUrl;
+    // Tray-style story URL: https://www.instagram.com/stories/{username}/ (no story id) is not a post or profile,
+    // but treat it as canonical so ingestion can expand it into individual story items.
+    const trayMatch = url.pathname.match(/^\/stories\/([A-Za-z0-9._]{1,30})\/?$/i);
+    if (trayMatch && !trayMatch[1].includes('..')) {
+      return `https://www.instagram.com/stories/${trayMatch[1].toLowerCase()}/`;
+    }
     return canonicalizeGenericUrl(url, 'www.instagram.com');
   },
   parsePostReference(value) {
@@ -148,8 +164,16 @@ export const instagramAdapter = definePlatformAdapter({
   download(value, options = {}) {
     return downloadGalleryDlPost(requirePostReference(value, INSTAGRAM_HOSTS, 'Instagram', parseInstagramPost), options);
   },
+  listCreatorPosts(value, options = {}) {
+    return listInstagramCreatorPosts(value, flattenAdapterOptions(options));
+  },
+  listCreatorStories(value, options = {}) {
+    return listInstagramCreatorStories(value, flattenAdapterOptions(options));
+  },
+  listCreatorHighlights(value, options = {}) {
+    return listInstagramCreatorHighlights(value, flattenAdapterOptions(options));
+  },
 });
-
 export const xAdapter = definePlatformAdapter({
   platform: 'x',
   displayName: 'X',

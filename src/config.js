@@ -98,6 +98,11 @@ export function loadConfig(env = process.env, cwd = process.cwd()) {
     galleryDlMaxTotalBytes: galleryDlTotalLimitMb * 1024 * 1024,
     instagramCookiesFile: env.INSTAGRAM_COOKIES_FILE ? resolvePath(env.INSTAGRAM_COOKIES_FILE, cwd) : '',
     instagramProxy: String(env.INSTAGRAM_PROXY ?? '').trim(),
+    instagramHighlightsHandles: String(env.INSTAGRAM_HIGHLIGHTS_HANDLES ?? env.HIGHLIGHTS_HANDLES ?? '')
+      .split(',')
+      .map((s) => s.trim().toLowerCase().replace(/^@/, ''))
+      .filter((s) => /^[a-z0-9._]{1,30}$/.test(s) && !s.includes('..')),
+    highlightPollIntervalMs: parsePositiveInt(env.HIGHLIGHT_POLL_INTERVAL_SECONDS, 12 * 60 * 60) * 1000,
     xCookiesFile: env.X_COOKIES_FILE ? resolvePath(env.X_COOKIES_FILE, cwd) : '',
     xProxy: String(env.X_PROXY ?? '').trim(),
     pingMode: String(env.PING_MODE ?? 'none').toLowerCase(),
@@ -110,7 +115,6 @@ export function loadConfig(env = process.env, cwd = process.cwd()) {
     registerCommandsOnStart: parseBoolean(env.REGISTER_COMMANDS_ON_START, false),
   };
 }
-
 export async function ensureRuntimeDirs(config) {
   await mkdir(path.dirname(config.stateDbPath), { recursive: true });
   await mkdir(config.downloadDir, { recursive: true });

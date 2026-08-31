@@ -12,6 +12,7 @@ import {
 import { registerCommands } from './discord/register-commands.js';
 import { TikTokMonitor, resolveVideoMediaType } from './tiktok/monitor.js';
 import { getPlatformAdapter } from './platforms/index.js';
+import { normalizePlatform } from './platforms/references.js';
 import { cleanupExpiredDownloads } from './cleanup/downloads.js';
 import { createDownloadService } from './download/service.js';
 import { createCreatorImportService } from './import/creator.js';
@@ -132,6 +133,7 @@ if (process.env.NODE_ENV !== 'test') {
   const creatorImportService = createCreatorImportService({ config, store, downloadService });
   const downloadOne = downloadService.request.bind(downloadService);
   const tiktokPlatformAdapter = getPlatformAdapter('tiktok');
+  const instagramPlatformAdapter = getPlatformAdapter('instagram');
   if (
     typeof tiktokPlatformAdapter?.listCreatorPosts !== 'function'
     || typeof tiktokPlatformAdapter?.listCreatorStories !== 'function'
@@ -139,8 +141,16 @@ if (process.env.NODE_ENV !== 'test') {
   ) {
     throw new Error('The TikTok platform adapter is missing required monitor operations.');
   }
+  if (
+    typeof instagramPlatformAdapter?.listCreatorPosts !== 'function'
+    || typeof instagramPlatformAdapter?.listCreatorStories !== 'function'
+  ) {
+    throw new Error('The Instagram platform adapter is missing required monitor operations.');
+  }
 
   async function checkVideoAvailable(video) {
+    const platform = (() => { try { return normalizePlatform(video?.platform ?? 'tiktok'); } catch { return 'tiktok'; } })();
+    if (platform === 'instagram') return { available: true };
     return checkVideoAvailability(video, config, tiktokPlatformAdapter.checkAvailability);
   }
 
@@ -154,16 +164,23 @@ if (process.env.NODE_ENV !== 'test') {
     downloadConcurrency: config.maxConcurrentDownloads,
     deletionCheckConcurrency: config.deletionCheckConcurrency,
     deletionCheckBatchSize: config.deletionCheckBatchSize,
+    highlightPollIntervalMs: config.highlightPollIntervalMs,
+    highlightHandles: config.instagramHighlightsHandles,
     downloader: {
-      listProfileVideos: async (username, options = {}) => (
-        tiktokPlatformAdapter.listCreatorPosts(username, { ...config, ...options })
-      ),
-      listProfileStories: async (username, options = {}) => (
-        tiktokPlatformAdapter.listCreatorStories(username, { ...config, ...options })
-      ),
+      listProfileVideos: async (username, options = {}) => {
+        const platform = (() => { try { return normalizePlatform(options.watch?.platform ?? 'tiktok'); } catch { return 'tiktok'; } })();
+        const adapter = platform === 'instagram' ? instagramPlatformAdapter : tiktokPlatformAdapter;
+        return adapter.listCreatorPosts(username, { ...config, ...options });
+      },
+      listProfileStories: async (username, options = {}) => {
+        const platform = (() => { try { return normalizePlatform(options.watch?.platform ?? 'tiktok'); } catch { return 'tiktok'; } })();
+        const adapter = platform === 'instagram' ? instagramPlatformAdapter : tiktokPlatformAdapter;
+        return adapter.listCreatorStories(username, { ...config, ...options });
+      },
       downloadVideo: async (video, options = {}) => downloadOne(video.url || video.webpage_url || video.sourceUrl || options.sourceUrl, {
         type: 'monitor',
         username: options.username || video.username,
+        platform: options.platform || video.platform || options.watch?.platform || 'tiktok',
         permanent: true,
         metadata: video.mediaType === 'story' ? video : null,
         createDelivery: false,
@@ -172,7 +189,10 @@ if (process.env.NODE_ENV !== 'test') {
     },
     alert: async ({ result, video, watch }) => {
       if (!discordClient) return;
-      const subscriptions = store.listWatchSubscriptions?.(watch?.username ?? '') ?? [];
+      const platform = (() => { try { return normalizePlatform(watch?.platform ?? video?.platform ?? 'tiktok'); } catch { return 'tiktok'; } })();
+      const username = watch?.username ?? video?.username ?? '';
+      const allSubs = store.listWatchSubscriptions?.(username, platform) ?? store.listWatchSubscriptions?.(username) ?? [];
+      const subscriptions = allSubs.filter((s) => (s.platform ?? 'tiktok') === platform);
       const targets = subscriptions.length ? subscriptions : [{
         guild_id: '',
         channel_id: watch?.channel_id || config.discordChannelId,
@@ -203,8 +223,10 @@ if (process.env.NODE_ENV !== 'test') {
       if (!discordClient) {
         throw new Error('Discord is not ready to deliver deletion alerts.');
       }
-      const watch = store.getWatch(video?.username ?? '') ?? null;
-      const subscriptions = store.listWatchSubscriptions?.(watch?.username ?? '') ?? [];
+      const platform = (() => { try { return normalizePlatform(video?.platform ?? 'tiktok'); } catch { return 'tiktok'; } })();
+      const watch = store.getWatch(video?.username ?? '', platform) ?? store.getWatch(video?.username ?? '') ?? null;
+      const allSubs = store.listWatchSubscriptions?.(watch?.username ?? '', platform) ?? store.listWatchSubscriptions?.(watch?.username ?? '') ?? [];
+      const subscriptions = allSubs.filter((s) => (s.platform ?? 'tiktok') === platform);
       if (!subscriptions.length) return { delivered: false, retry: false };
       await deliverMonitorAlerts(subscriptions, async (subscription) => {
         const targetScope = await resolveMonitorDeliveryScope(discordClient, subscription);

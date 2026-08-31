@@ -67,6 +67,411 @@ const PLATFORM_RULES = Object.freeze({
   }),
 });
 
+const INSTAGRAM_LISTING_RANGE_MULTIPLIER = 5;
+
+function normalizeInstagramHandle(input) {
+  const raw = String(input ?? '').trim();
+  if (!raw) throw galleryDlError('invalid_url', 'Instagram username is required.');
+  try {
+    const url = new URL(raw.startsWith('http') ? raw : `https://${raw}`);
+    const parts = url.pathname.split('/').filter(Boolean);
+    // Handle /stories/{username}/{id} or /stories/{username} or /p/... etc => prefer username
+    if (parts[0] === 'stories' && parts[1]) return parts[1].toLowerCase();
+    if (parts[0] && !['p', 'reel', 'reels', 'tv', 'stories', 'explore', 'accounts', 'direct'].includes(parts[0].toLowerCase())) {
+      const candidate = parts[0].replace(/^@/, '');
+      if (/^[A-Za-z0-9._]{1,30}$/.test(candidate)) return candidate.toLowerCase();
+    }
+    // Fallback to parsing as profile reference
+    const profileMatch = raw.match(/instagram\.com\/([A-Za-z0-9._]{1,30})/i);
+    if (profileMatch) return profileMatch[1].toLowerCase();
+  } catch {
+    // not a URL, treat as plain username
+  }
+  const cleaned = raw.replace(/^@/, '').trim().toLowerCase();
+  if (!/^[a-z0-9._]{1,30}$/.test(cleaned) || cleaned.includes('..')) {
+    throw galleryDlError('invalid_url', 'Instagram username is invalid.');
+  }
+  return cleaned;
+}
+
+function instagramPostsListingUrl(handle) {
+  return `https://www.instagram.com/${handle}/posts/`;
+}
+
+function instagramStoriesListingUrl(handle) {
+  return `https://www.instagram.com/stories/${handle}/`;
+}
+
+function instagramHighlightsListingUrl(handle) {
+  return `https://www.instagram.com/${handle}/highlights/`;
+}
+
+
+function parseGalleryPostDate(value) {
+  const text = String(value ?? '').trim();
+  if (!text) return null;
+  // gallery-dl uses "YYYY-MM-DD HH:MM:SS"
+  const iso = text.includes(' ') ? text.replace(' ', 'T') + 'Z' : text;
+  const parsed = Date.parse(iso);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function buildListingCommonArgs(platform, settings, runtime, rangeEnd) {
+  const rule = PLATFORM_RULES[platform];
+  if (!rule) throw galleryDlError('invalid_config', `Unsupported platform ${platform} for listing.`);
+  const args = [
+    '--config-ignore',
+    '--no-input',
+    '--no-colors',
+    '--quiet',
+    '--retries',
+    '2',
+    '--http-timeout',
+    String(Math.max(1, Math.min(60, Math.ceil(settings.timeoutMs / 1000)))),
+    '--cache-file',
+    runtime.cacheFile,
+    '--range',
+    `1-${rangeEnd}`,
+  ];
+  for (const value of rule.extractorOptions) {
+    args.push('-o', value);
+  }
+  if (settings.proxy) args.push('--proxy', settings.proxy);
+  if (runtime.cookiesFile) args.push('--cookies', runtime.cookiesFile);
+  return args;
+}
+
+async function withPlatformRuntime(platform, settings, callback) {
+  const runtimeDir = await mkdtemp(path.join(os.tmpdir(), `${platform}-gallery-dl-runtime-`));
+  try {
+    const syntheticReference = { platform, canonicalUrl: `https://${PLATFORM_RULES[platform].canonicalHost}/`, remoteId: 'listing' };
+    const cookiesFile = await stagePlatformCookies(syntheticReference, settings, runtimeDir);
+    const cacheFile = path.join(runtimeDir, 'cache.sqlite3');
+    return await callback({ runtimeDir, cookiesFile, cacheFile });
+  } finally {
+    await rm(runtimeDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+function resolveListingSettings(platform, options = {}) {
+  const values = options?.config && typeof options.config === 'object'
+    ? { ...options.config, ...options }
+    : (options ?? {});
+  const rule = PLATFORM_RULES[platform];
+  if (!rule) throw galleryDlError('invalid_config', `Unsupported platform ${platform}.`);
+  const executable = String(values.galleryDlPath ?? DEFAULT_EXECUTABLE).trim();
+  if (!executable) throw galleryDlError('invalid_config', 'GALLERY_DL_PATH cannot be empty.');
+  const proxy = normalizeProxy(values[rule.proxyOption], rule.proxyEnv);
+  return {
+    executable,
+    spawnImpl: values.spawnImpl ?? defaultSpawn,
+    signal: values.signal ?? null,
+    timeoutMs: positiveInteger(values.galleryDlTimeoutMs, DEFAULT_TIMEOUT_MS),
+    maxAssets: positiveInteger(values.galleryDlMaxAssets, DEFAULT_MAX_ASSETS),
+    maxItemBytes: positiveInteger(values.galleryDlMaxItemBytes, DEFAULT_MAX_ITEM_BYTES),
+    maxTotalBytes: positiveInteger(values.galleryDlMaxTotalBytes, DEFAULT_MAX_TOTAL_BYTES),
+    tempParentDir: path.resolve(String(values.galleryDlTempDir ?? os.tmpdir())),
+    cookiesSource: values[rule.cookiesOption] ? path.resolve(String(values[rule.cookiesOption])) : '',
+    cookiesEnv: rule.cookiesEnv,
+    cookieDomains: rule.cookieDomains,
+    proxy,
+  };
+}
+
+export async function listInstagramCreatorPosts(usernameOrUrl, options = {}) {
+  const handle = normalizeInstagramHandle(usernameOrUrl);
+  const limit = Math.max(1, Math.min(50, Number(options.limit) || 5));
+  const rangeEnd = Math.max(limit * INSTAGRAM_LISTING_RANGE_MULTIPLIER, limit + 2);
+  const listingUrl = instagramPostsListingUrl(handle);
+  const settings = resolveListingSettings('instagram', options);
+  return withPlatformRuntime('instagram', settings, async (runtime) => {
+    const args = [
+      ...buildListingCommonArgs('instagram', settings, runtime, rangeEnd),
+      '-o',
+      'output.num-to-str=true',
+      '--dump-json',
+      '--',
+      listingUrl,
+    ];
+    const { stdout } = await runGalleryDl(settings.executable, args, settings);
+    return parseInstagramPostsListing(stdout, handle, listingUrl, limit);
+  });
+}
+
+export async function listInstagramCreatorStories(usernameOrUrl, options = {}) {
+  const handle = normalizeInstagramHandle(usernameOrUrl);
+  const limit = Math.max(1, Math.min(50, Number(options.limit) || 5));
+  const listingUrl = instagramStoriesListingUrl(handle);
+  const settings = resolveListingSettings('instagram', options);
+  return withPlatformRuntime('instagram', settings, async (runtime) => {
+    const args = [
+      ...buildListingCommonArgs('instagram', settings, runtime, limit * 2),
+      '-o',
+      'output.num-to-str=true',
+      '--dump-json',
+      '--',
+      listingUrl,
+    ];
+    const { stdout } = await runGalleryDl(settings.executable, args, settings);
+    return parseInstagramStoriesListing(stdout, handle, listingUrl, limit);
+  });
+}
+
+export async function listInstagramCreatorHighlights(usernameOrUrl, options = {}) {
+  const handle = normalizeInstagramHandle(usernameOrUrl);
+  const limit = Math.max(1, Math.min(50, Number(options.limit) || 20));
+  const listingUrl = instagramHighlightsListingUrl(handle);
+  const settings = resolveListingSettings('instagram', options);
+  return withPlatformRuntime('instagram', settings, async (runtime) => {
+    const args = [
+      ...buildListingCommonArgs('instagram', settings, runtime, Math.max(limit * 5, 50)),
+      '-o',
+      'output.num-to-str=true',
+      '--dump-json',
+      '--',
+      listingUrl,
+    ];
+    const { stdout } = await runGalleryDl(settings.executable, args, settings);
+    return parseInstagramHighlightsListing(stdout, handle, listingUrl, limit);
+  });
+}
+
+export function parseInstagramPostsListing(stdout, handle, sourceUrl, limit = 5) {
+  let messages;
+  try {
+    messages = JSON.parse(String(stdout ?? ''));
+  } catch (cause) {
+    throw galleryDlError('invalid_output', 'gallery-dl returned invalid JSON metadata.', { retryable: false, cause });
+  }
+  if (!Array.isArray(messages)) throw galleryDlError('invalid_output', 'gallery-dl returned an invalid metadata message stream.');
+  const dirs = [];
+  for (const message of messages) {
+    if (!Array.isArray(message)) continue;
+    if (message[0] === -1) {
+      const details = message[1] && typeof message[1] === 'object' ? message[1] : {};
+      throw classifyGalleryDlFailure(details.message || details.error || 'gallery-dl extraction failed.');
+    }
+    if (message[0] === 2 && message[1] && typeof message[1] === 'object') {
+      dirs.push(message[1]);
+    } else if (message[0] === 6) {
+      throw galleryDlError('unexpected_output', 'gallery-dl tried to leave the requested post extractor.');
+    }
+  }
+  // Some listings emit no dirs when user has no posts; return empty
+  const entries = [];
+  const bounded = Math.max(1, Math.min(50, Number(limit) || 5));
+  for (const dir of dirs.slice(0, bounded)) {
+    const shortcode = String(dir.post_shortcode ?? dir.sidecar_shortcode ?? dir.shortcode ?? '').trim();
+    const numericId = String(dir.post_id ?? dir.sidecar_media_id ?? dir.id ?? '').trim();
+    const canonical = shortcode ? `https://www.instagram.com/p/${shortcode}/` : sourceUrl;
+    const remoteId = shortcode || numericId;
+    if (!remoteId) continue;
+    const dateText = String(dir.post_date ?? dir.date ?? '');
+    const parsedMs = parseGalleryPostDate(dateText);
+    const uploadDate = dateText ? dateText.slice(0, 10).replace(/-/g, '') : '';
+    entries.push({
+      id: remoteId,
+      videoId: remoteId,
+      webpage_url: canonical,
+      url: canonical,
+      source_url: canonical,
+      original_url: canonical,
+      title: String(dir.description ?? '').slice(0, 200),
+      description: String(dir.description ?? ''),
+      uploader: String(dir.username ?? handle),
+      username: String(dir.username ?? handle),
+      uploader_id: String(dir.owner_id ?? dir.user?.id ?? ''),
+      user_id: String(dir.owner_id ?? ''),
+      channel_id: String(dir.owner_id ?? ''),
+      creator_id: String(dir.owner_id ?? ''),
+      timestamp: parsedMs ? Math.floor(parsedMs / 1000) : null,
+      upload_date: /^\d{8}$/.test(uploadDate) ? uploadDate : '',
+      created_at: dateText,
+      date: dateText,
+      mediaType: '',
+      post_shortcode: shortcode,
+      post_id: numericId,
+      owner_id: String(dir.owner_id ?? ''),
+      _galleryMeta: dir,
+    });
+  }
+  const first = dirs[0];
+  const metadata = {
+    id: String(first?.owner_id ?? first?.user?.id ?? ''),
+    user_id: String(first?.owner_id ?? ''),
+    uploader_id: String(first?.owner_id ?? ''),
+    channel_id: String(first?.owner_id ?? ''),
+    uploader: String(first?.username ?? handle),
+    username: String(first?.username ?? handle),
+    creator_id: String(first?.owner_id ?? ''),
+    hasStory: null,
+  };
+  return {
+    sourceUrl,
+    count: entries.length,
+    metadata,
+    entries,
+  };
+}
+
+export function parseInstagramStoriesListing(stdout, handle, sourceUrl, limit = 5) {
+  let messages;
+  try {
+    messages = JSON.parse(String(stdout ?? ''));
+  } catch (cause) {
+    throw galleryDlError('invalid_output', 'gallery-dl returned invalid JSON metadata.', { retryable: false, cause });
+  }
+  if (!Array.isArray(messages)) throw galleryDlError('invalid_output', 'gallery-dl returned an invalid metadata message stream.');
+  const dirs = [];
+  const urlMessages = [];
+  for (const message of messages) {
+    if (!Array.isArray(message)) continue;
+    if (message[0] === -1) {
+      const details = message[1] && typeof message[1] === 'object' ? message[1] : {};
+      throw classifyGalleryDlFailure(details.message || details.error || 'gallery-dl extraction failed.');
+    }
+    if (message[0] === 2 && message[1] && typeof message[1] === 'object') dirs.push(message[1]);
+    else if (message[0] === 3 && typeof message[1] === 'string' && message[2] && typeof message[2] === 'object') {
+      urlMessages.push({ url: message[1], metadata: message[2] });
+    }
+  }
+  const bounded = Math.max(1, Math.min(50, Number(limit) || 5));
+  const entries = [];
+  // Story items are url messages; each has media_id
+  for (const { url, metadata } of urlMessages.slice(0, bounded)) {
+    const mediaId = String(metadata.media_id ?? metadata.id ?? '').trim();
+    if (!mediaId) continue;
+    const canonical = `https://www.instagram.com/stories/${handle}/${mediaId}/`;
+    const dateText = String(metadata.date ?? metadata.post_date ?? dirs[0]?.date ?? '');
+    const parsedMs = parseGalleryPostDate(dateText);
+    const shortcode = String(metadata.shortcode ?? '').trim();
+    entries.push({
+      id: `story_${mediaId}`,
+      videoId: `story_${mediaId}`,
+      media_id: mediaId,
+      webpage_url: canonical,
+      url: canonical,
+      source_url: canonical,
+      original_url: canonical,
+      title: String(metadata.description ?? '').slice(0, 200),
+      description: String(metadata.description ?? ''),
+      uploader: String(metadata.username ?? handle),
+      username: String(metadata.username ?? handle),
+      uploader_id: String(metadata.owner_id ?? metadata.owner?.id ?? dirs[0]?.owner_id ?? ''),
+      user_id: String(metadata.owner_id ?? ''),
+      timestamp: parsedMs ? Math.floor(parsedMs / 1000) : null,
+      upload_date: dateText ? dateText.slice(0, 10).replace(/-/g, '') : '',
+      date: dateText,
+      mediaType: 'story',
+      type: 'story',
+      media_url: String(metadata.video_url ?? metadata.display_url ?? url ?? ''),
+      shortcode,
+      _galleryMeta: metadata,
+    });
+  }
+  const firstDir = dirs[0];
+  const firstUrl = urlMessages[0]?.metadata;
+  const metadata = {
+    id: String(firstDir?.owner_id ?? firstUrl?.owner_id ?? ''),
+    user_id: String(firstDir?.owner_id ?? firstUrl?.owner_id ?? ''),
+    uploader_id: String(firstDir?.owner_id ?? ''),
+    channel_id: String(firstDir?.owner_id ?? ''),
+    uploader: String(firstDir?.username ?? firstUrl?.username ?? handle),
+    username: String(firstDir?.username ?? handle),
+    creator_id: String(firstDir?.owner_id ?? ''),
+    hasStory: entries.length > 0,
+    mediaType: 'story',
+  };
+  return {
+    sourceUrl,
+    storyUrl: `https://www.instagram.com/stories/${handle}/`,
+    count: entries.length,
+    metadata,
+    entries,
+  };
+}
+
+export function parseInstagramHighlightsListing(stdout, handle, sourceUrl, limit = 20) {
+  let messages;
+  try {
+    messages = JSON.parse(String(stdout ?? ''));
+  } catch (cause) {
+    throw galleryDlError('invalid_output', 'gallery-dl returned invalid JSON metadata.', { retryable: false, cause });
+  }
+  if (!Array.isArray(messages)) throw galleryDlError('invalid_output', 'gallery-dl returned an invalid metadata message stream.');
+  const dirs = [];
+  const urlMessages = [];
+  for (const message of messages) {
+    if (!Array.isArray(message)) continue;
+    if (message[0] === -1) {
+      const details = message[1] && typeof message[1] === 'object' ? message[1] : {};
+      throw classifyGalleryDlFailure(details.message || details.error || 'gallery-dl extraction failed.');
+    }
+    if (message[0] === 2 && message[1] && typeof message[1] === 'object') dirs.push(message[1]);
+    else if (message[0] === 3 && typeof message[1] === 'string' && message[2] && typeof message[2] === 'object') {
+      urlMessages.push({ url: message[1], metadata: message[2] });
+    }
+  }
+  const bounded = Math.max(1, Math.min(20, Number(limit) || 20));
+  const entries = [];
+  // Highlights: each directory is a highlight reel; URL messages are items inside.
+  // For monitoring we track highlight reels (not individual items) — a new reel or an updated reel
+  // will be detected via the highlight's post_id. Item-level updates inside an existing highlight
+  // would need per-item tracking; for now we treat the reel as the unit.
+  for (const dir of dirs.slice(0, bounded)) {
+    const highlightId = String(dir.post_id ?? dir.id ?? '').trim();
+    if (!highlightId) continue;
+    const canonical = `https://www.instagram.com/stories/highlights/${highlightId}/`;
+    const dateText = String(dir.post_date ?? dir.date ?? '');
+    const parsedMs = parseGalleryPostDate(dateText);
+    const title = String(dir.highlight_title ?? dir.title ?? '').trim();
+    const itemCount = urlMessages.filter((m) => String(m.metadata.post_id ?? '') === highlightId).length;
+    entries.push({
+      id: `highlight_${highlightId}`,
+      videoId: `highlight_${highlightId}`,
+      media_id: highlightId,
+      highlight_id: highlightId,
+      highlight_title: title,
+      webpage_url: canonical,
+      url: canonical,
+      source_url: canonical,
+      original_url: canonical,
+      title: title || `Highlight ${highlightId}`,
+      description: title,
+      uploader: String(dir.username ?? handle),
+      username: String(dir.username ?? handle),
+      uploader_id: String(dir.owner_id ?? dir.user?.id ?? ''),
+      user_id: String(dir.owner_id ?? ''),
+      timestamp: parsedMs ? Math.floor(parsedMs / 1000) : null,
+      upload_date: dateText ? dateText.slice(0, 10).replace(/-/g, '') : '',
+      date: dateText,
+      mediaType: 'highlight',
+      type: 'highlight',
+      count: itemCount || Number(dir.count ?? 0) || 0,
+      _galleryMeta: dir,
+    });
+  }
+  const firstDir = dirs[0];
+  const metadata = {
+    id: String(firstDir?.owner_id ?? ''),
+    user_id: String(firstDir?.owner_id ?? ''),
+    uploader_id: String(firstDir?.owner_id ?? ''),
+    channel_id: String(firstDir?.owner_id ?? ''),
+    uploader: String(firstDir?.username ?? handle),
+    username: String(firstDir?.username ?? handle),
+    creator_id: String(firstDir?.owner_id ?? ''),
+    hasStory: null,
+    mediaType: 'highlight',
+  };
+  return {
+    sourceUrl,
+    count: entries.length,
+    metadata,
+    entries,
+  };
+}
+
+
 export async function probeGalleryDlPost(referenceInput, options = {}) {
   const reference = requireGalleryDlReference(referenceInput);
   const settings = resolveSettings(reference, options);

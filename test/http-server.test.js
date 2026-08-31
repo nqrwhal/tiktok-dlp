@@ -166,7 +166,7 @@ test('serves files only for valid tokens with private health, HEAD, and Range su
   assert.deepEqual(await readyResponse.json(), {
     status: 'ready',
     database: 'ready',
-    schemaVersion: 4,
+    schemaVersion: 6,
   });
   const readyHeadResponse = await fetch(`${baseUrl}/ready`, { method: 'HEAD' });
   assert.equal(readyHeadResponse.status, 200);

@@ -23,41 +23,84 @@ const downloadCommand = new SlashCommandBuilder()
 
 const watchCommand = new SlashCommandBuilder()
   .setName('watch')
-  .setDescription('Manage watched TikTok usernames (TikTok only for now).')
+  .setDescription('Manage watched usernames for TikTok and Instagram.')
   .addSubcommand((subcommand) =>
     subcommand
       .setName('add')
-      .setDescription('Add a TikTok username to the watch list.')
+      .setDescription('Add a username to the watch list.')
       .addStringOption((option) =>
         option
           .setName('username')
-          .setDescription('TikTok username.')
+          .setDescription('TikTok or Instagram username (without @).')
           .setRequired(true),
+      )
+      .addStringOption((option) =>
+        option
+          .setName('platform')
+          .setDescription('Platform to watch.')
+          .setRequired(false)
+          .addChoices(
+            { name: 'TikTok', value: 'tiktok' },
+            { name: 'Instagram', value: 'instagram' },
+          ),
       ),
   )
   .addSubcommand((subcommand) =>
     subcommand
       .setName('remove')
-      .setDescription('Remove a TikTok username from the watch list.')
+      .setDescription('Remove a username from the watch list.')
       .addStringOption((option) =>
         option
           .setName('username')
-          .setDescription('TikTok username.')
+          .setDescription('Username to remove.')
           .setRequired(true),
+      )
+      .addStringOption((option) =>
+        option
+          .setName('platform')
+          .setDescription('Platform of the watch to remove.')
+          .setRequired(false)
+          .addChoices(
+            { name: 'TikTok', value: 'tiktok' },
+            { name: 'Instagram', value: 'instagram' },
+          ),
       ),
   )
   .addSubcommand((subcommand) =>
-    subcommand.setName('list').setDescription('List watched TikTok usernames.'),
+    subcommand
+      .setName('list')
+      .setDescription('List watched usernames.')
+      .addStringOption((option) =>
+        option
+          .setName('platform')
+          .setDescription('Filter by platform.')
+          .setRequired(false)
+          .addChoices(
+            { name: 'TikTok', value: 'tiktok' },
+            { name: 'Instagram', value: 'instagram' },
+            { name: 'All', value: 'all' },
+          ),
+      ),
   )
   .addSubcommand((subcommand) =>
     subcommand
       .setName('run')
-      .setDescription('Run a TikTok watch check for a username.')
+      .setDescription('Run a watch check for a username.')
       .addStringOption((option) =>
         option
           .setName('username')
-          .setDescription('TikTok username.')
+          .setDescription('Watched username.')
           .setRequired(true),
+      )
+      .addStringOption((option) =>
+        option
+          .setName('platform')
+          .setDescription('Platform to check.')
+          .setRequired(false)
+          .addChoices(
+            { name: 'TikTok', value: 'tiktok' },
+            { name: 'Instagram', value: 'instagram' },
+          ),
       ),
   )
   .addSubcommand((subcommand) =>
@@ -67,8 +110,18 @@ const watchCommand = new SlashCommandBuilder()
       .addStringOption((option) =>
         option
           .setName('username')
-          .setDescription('Optional TikTok username filter.')
+          .setDescription('Optional username filter.')
           .setRequired(false),
+      )
+      .addStringOption((option) =>
+        option
+          .setName('platform')
+          .setDescription('Filter by platform.')
+          .setRequired(false)
+          .addChoices(
+            { name: 'TikTok', value: 'tiktok' },
+            { name: 'Instagram', value: 'instagram' },
+          ),
       ),
   )
   .addSubcommand((subcommand) =>
@@ -78,7 +131,7 @@ const watchCommand = new SlashCommandBuilder()
       .addStringOption((option) =>
         option
           .setName('post_id')
-          .setDescription('TikTok post ID from /watch failures.')
+          .setDescription('Post ID from /watch failures.')
           .setRequired(true),
       ),
   );

@@ -20,17 +20,22 @@ test('exports the expected slash command manifest', () => {
   assert.deepEqual((downloadOptions[1].choices ?? []).map((choice) => choice.name), ['auto', 'file', 'link']);
 
   assert.equal(watch.name, 'watch');
-  assert.match(watch.description, /TikTok only for now/);
+  assert.match(watch.description, /TikTok and Instagram/);
   assert.deepEqual(watchOptions.map((option) => option.name), ['add', 'remove', 'list', 'run', 'failures', 'retry']);
-  assert.deepEqual((watchOptions[0].options ?? []).map((option) => option.name), ['username']);
+  assert.deepEqual((watchOptions[0].options ?? []).map((option) => option.name), ['username', 'platform']);
   assert.equal((watchOptions[0].options ?? [])[0].required, true);
-  assert.deepEqual((watchOptions[1].options ?? []).map((option) => option.name), ['username']);
+  assert.equal((watchOptions[0].options ?? [])[1].required, false);
+  assert.deepEqual((watchOptions[1].options ?? []).map((option) => option.name), ['username', 'platform']);
   assert.equal((watchOptions[1].options ?? [])[0].required, true);
-  assert.deepEqual(watchOptions[2].options ?? [], []);
-  assert.deepEqual((watchOptions[3].options ?? []).map((option) => option.name), ['username']);
+  assert.equal((watchOptions[1].options ?? [])[1].required, false);
+  assert.deepEqual((watchOptions[2].options ?? []).map((option) => option.name), ['platform']);
+  assert.equal((watchOptions[2].options ?? [])[0].required, false);
+  assert.deepEqual((watchOptions[3].options ?? []).map((option) => option.name), ['username', 'platform']);
   assert.equal((watchOptions[3].options ?? [])[0].required, true);
-  assert.deepEqual((watchOptions[4].options ?? []).map((option) => option.name), ['username']);
+  assert.equal((watchOptions[3].options ?? [])[1].required, false);
+  assert.deepEqual((watchOptions[4].options ?? []).map((option) => option.name), ['username', 'platform']);
   assert.equal((watchOptions[4].options ?? [])[0].required, false);
+  assert.equal((watchOptions[4].options ?? [])[1].required, false);
   assert.deepEqual((watchOptions[5].options ?? []).map((option) => option.name), ['post_id']);
   assert.equal((watchOptions[5].options ?? [])[0].required, true);
 

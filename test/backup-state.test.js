@@ -47,7 +47,7 @@ test('online SQLite backups include WAL commits, verify checksums, and prune onl
     const backupDb = new DatabaseSync(latest.path, { readOnly: true });
     try {
       assert.equal(backupDb.prepare('SELECT COUNT(*) AS count FROM files').get().count, 1);
-      assert.equal(backupDb.prepare('PRAGMA user_version').get().user_version, 4);
+      assert.equal(backupDb.prepare('PRAGMA user_version').get().user_version, 6);
     } finally {
       backupDb.close();
     }

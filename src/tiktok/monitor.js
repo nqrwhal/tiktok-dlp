@@ -1,4 +1,5 @@
 import { extractVideoId, normalizeUsername, profileUrl as makeProfileUrl, storyUrl as makeStoryUrl } from '../util/files.js';
+import { normalizePlatform } from '../platforms/references.js';
 
 const DEFAULT_POLL_INTERVAL_MS = 60 * 1000;
 const DEFAULT_SCAN_LIMIT = 5;
@@ -25,10 +26,35 @@ const DELETION_CHECK_DELAYS_MS = [
   7 * 24 * 60 * 60 * 1000,
 ];
 
-export function normalizeWatchedUser(input) {
+export function normalizeWatchedUser(input, platformHint = '') {
+  const rawPlatform = input?.platform ?? input?.platformName ?? platformHint ?? 'tiktok';
+  let platform;
+  try {
+    platform = normalizePlatform(rawPlatform);
+  } catch {
+    platform = 'tiktok';
+  }
   const username = normalizeUsername(input?.username ?? input?.profile_url ?? input?.profileUrl ?? input?.url ?? input);
+  if (platform === 'instagram') {
+    return {
+      username,
+      platform,
+      profileUrl: `https://www.instagram.com/${username}/`,
+      postsUrl: `https://www.instagram.com/${username}/posts/`,
+      storyUrl: `https://www.instagram.com/stories/${username}/`,
+    };
+  }
+  if (platform === 'x') {
+    return {
+      username,
+      platform,
+      profileUrl: `https://x.com/${username}`,
+      storyUrl: `https://x.com/${username}`,
+    };
+  }
   return {
     username,
+    platform,
     profileUrl: makeProfileUrl(username),
     storyUrl: makeStoryUrl(username),
   };
@@ -283,6 +309,8 @@ export class TikTokMonitor {
     backoffMaxMs = DEFAULT_BACKOFF_MAX_MS,
     downloadFailureDeadLetterAfter = null,
     downloadFailurePoisonAfter = null,
+    highlightPollIntervalMs = 12 * 60 * 60 * 1000,
+    highlightHandles = [],
     now = () => Date.now(),
     sleep = defaultSleep,
   } = {}) {
@@ -310,11 +338,14 @@ export class TikTokMonitor {
       Number(downloadFailureDeadLetterAfter ?? downloadFailurePoisonAfter)
         || DEFAULT_DOWNLOAD_FAILURE_DEAD_LETTER_AFTER,
     );
+    this.#highlightPollIntervalMs = Math.max(60 * 1000, Number(highlightPollIntervalMs) || 12 * 60 * 60 * 1000);
+    this.#highlightHandles = new Set((Array.isArray(highlightHandles) ? highlightHandles : String(highlightHandles ?? '').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean)).map(h => String(h).toLowerCase().replace(/^@/, '')));
     this.now = now;
     this.sleep = sleep;
 
     this.#listProfileVideos = resolveMethod(downloader, ['listProfileVideos']);
     this.#listProfileStories = resolveOptionalMethod(downloader, ['listProfileStories', 'listStories']);
+    this.#listHighlights = resolveOptionalMethod(downloader, ['listHighlights', 'listCreatorHighlights', 'listProfileHighlights']);
     this.#downloadVideo = resolveMethod(downloader, ['download', 'downloadVideo']);
     this.#checkVideoAvailable = resolveOptionalMethod(downloader, ['checkVideoAvailable', 'isVideoAvailable']);
   }
@@ -324,8 +355,11 @@ export class TikTokMonitor {
   #lastPollAt = null;
   #listProfileVideos;
   #listProfileStories;
+  #listHighlights;
+  #highlightHandles;
   #downloadVideo;
   #checkVideoAvailable;
+  #highlightPollIntervalMs;
   #downloadQueue = [];
   #activeDownloads = 0;
   #pendingDownloadIds = new Set();
@@ -479,9 +513,9 @@ export class TikTokMonitor {
         limit: this.scanLimit,
         watch,
       });
-      const identity = this.#recordProfileIdentity(normalized.username, profileResult, now);
+      const identity = this.#recordProfileIdentity(normalized.username, profileResult, now, normalized.platform);
       if (identity.changed) {
-        normalized = normalizeWatchedUser(identity.username);
+        normalized = normalizeWatchedUser(identity.username, normalized.platform);
         watch = {
           ...watch,
           username: identity.username,
@@ -536,7 +570,7 @@ export class TikTokMonitor {
 
       const storyResult = await this.#listStoryVideos(normalized, watch, now);
       if (storyResult.identity?.changed) {
-        normalized = normalizeWatchedUser(storyResult.identity.username);
+        normalized = normalizeWatchedUser(storyResult.identity.username, normalized.platform);
         watch = {
           ...watch,
           username: storyResult.identity.username,
@@ -566,6 +600,34 @@ export class TikTokMonitor {
         fallbackUrl: normalized.storyUrl,
         now,
       });
+
+      // Highlights — only for configured Instagram handles on a 12hr cadence
+      if (normalized.platform === 'instagram' && this.#highlightHandles && this.#highlightHandles.has(normalized.username.toLowerCase()) && this.#listHighlights) {
+        const highlightDueAt = Number(watch.next_highlight_check_at ?? 0);
+        const shouldCheckHighlights = !watch.next_highlight_check_at || highlightDueAt <= now;
+        if (shouldCheckHighlights) {
+          try {
+            const highlightResult = await this.#listHighlights(`https://www.instagram.com/${normalized.username}/highlights/`, {
+              username: normalized.username,
+              limit: this.scanLimit,
+              watch,
+            });
+            await this.#processVideoEntries(highlightResult.entries ?? [], {
+              partial,
+              watch,
+              normalized,
+              fallbackUrl: `https://www.instagram.com/${normalized.username}/highlights/`,
+              now,
+            });
+            await Promise.resolve(this.store.markHighlightCheckSuccess?.(normalized.username, normalized.platform, now, now + this.#highlightPollIntervalMs));
+          } catch (error) {
+            const failureCount = Number(watch.highlight_failure_count ?? watch.highlightFailureCount ?? 0);
+            const nextCheck = now + calculateFailureBackoffMs(failureCount, { baseMs: this.backoffBaseMs, maxMs: this.backoffMaxMs });
+            await Promise.resolve(this.store.markHighlightCheckFailure?.(normalized.username, normalized.platform, error, nextCheck, now));
+            this.logger?.warn?.(`highlight check failed for @${normalized.username}: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+      }
 
       await Promise.resolve(this.store.markWatchSuccess(normalized.username, now, now + this.pollIntervalMs));
     } catch (error) {
@@ -602,6 +664,7 @@ export class TikTokMonitor {
       const sourceUrl = resolveVideoSourceUrl(video, fallbackUrl);
       const seenRecord = {
         videoId,
+        platform: normalized.platform ?? watch.platform ?? 'tiktok',
         username: normalized.username,
         sourceUrl,
         title: video?.title ?? video?.description ?? '',
@@ -631,7 +694,7 @@ export class TikTokMonitor {
     return result;
   }
 
-  #recordProfileIdentity(username, profileResult, now) {
+  #recordProfileIdentity(username, profileResult, now, platform = '') {
     if (typeof this.store.recordWatchIdentity !== 'function') {
       return { changed: false, username, previousUsername: username, creatorId: '' };
     }
@@ -647,6 +710,7 @@ export class TikTokMonitor {
       authorId,
       hasStory,
       storyStatusCheckedAt: hasStory === null ? null : now,
+      platform,
     }, now);
   }
 
@@ -687,17 +751,20 @@ export class TikTokMonitor {
       downloaded = await this.#downloadVideo(video, {
         watch,
         username: normalized.username,
+        platform: normalized.platform ?? watch.platform ?? 'tiktok',
         profileUrl: normalized.profileUrl,
         sourceUrl,
       });
     } catch (error) {
       this.#metrics.totalDownloadFailures += 1;
       this.#metrics.lastError = error instanceof Error ? error.message : String(error);
-      this.logger?.warn?.(`TikTok monitor download failed for ${videoId}: ${this.#metrics.lastError}`);
+      const platformLabel = normalized.platform ?? watch.platform ?? 'tiktok';
+      this.logger?.warn?.(`${platformLabel} monitor download failed for ${videoId}: ${this.#metrics.lastError}`);
       let failure;
       if (typeof this.store.recordMonitorDownloadFailure === 'function') {
         failure = await Promise.resolve(this.store.recordMonitorDownloadFailure({
           ...seenRecord,
+          platform: seenRecord.platform ?? platformLabel,
           mediaType: resolveVideoMediaType(video),
           error,
         }, this.downloadFailureDeadLetterAfter, this.now()));
@@ -712,7 +779,7 @@ export class TikTokMonitor {
       if (failure?.status === 'dead_letter') {
         this.#downloadFailures.delete(videoId);
         this.#deadLetteredDownloadIds.add(videoId);
-        this.logger?.warn?.(`TikTok monitor dead-lettered ${videoId} after ${failure.failure_count} download failures.`);
+        this.logger?.warn?.(`${platformLabel} monitor dead-lettered ${videoId} after ${failure.failure_count} download failures.`);
         return { downloaded: false, alerted: false, deadLettered: true };
       }
       throw error;
@@ -832,7 +899,7 @@ export class TikTokMonitor {
       // stays skipped unless usable metadata fields are present.
       const identity = !shouldRecordStoryIdentity(storyResult, normalized, watch)
         ? null
-        : this.#recordProfileIdentity(normalized.username, storyResult, now);
+        : this.#recordProfileIdentity(normalized.username, storyResult, now, normalized.platform);
       return {
         identity,
         entries: entries.map((entry) => ({
@@ -961,11 +1028,11 @@ export class TikTokMonitor {
     }
   }
 
-  async pollUsername(username, { force = false } = {}) {
-    const normalized = normalizeWatchedUser(username);
-    const watch = await Promise.resolve(this.store.getWatch?.(normalized.username));
+  async pollUsername(username, { force = false, platform = '' } = {}) {
+    const normalized = normalizeWatchedUser(username, platform);
+    const watch = await Promise.resolve(this.store.getWatch?.(normalized.username, normalized.platform));
     if (!watch) {
-      throw new Error(`@${normalized.username} is not registered as a watch.`);
+      throw new Error(`@${normalized.username} is not registered as a watch on ${normalized.platform}.`);
     }
     const summary = await this.runOnce({
       waitForDownloads: true,
