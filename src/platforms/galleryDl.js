@@ -40,6 +40,7 @@ const PLATFORM_RULES = Object.freeze({
     proxyOption: 'instagramProxy',
     proxyEnv: 'INSTAGRAM_PROXY',
     pathPattern: /^\/(?:p|reel|tv)\/([A-Za-z0-9_-]{1,64})\/$/,
+    storyPathPattern: /^\/stories\/([A-Za-z0-9._]{1,30})\/(\d{1,32})\/$/,
     extractorOptions: Object.freeze([
       'extractor.instagram.videos=merged',
       'extractor.instagram.previews=false',
@@ -272,7 +273,15 @@ function resolveSettings(reference, options) {
 }
 
 async function stagePlatformCookies(reference, settings, runtimeDir) {
-  if (!settings.cookiesSource) return '';
+  if (!settings.cookiesSource) {
+    if (isInstagramStoryReference(reference)) {
+      throw galleryDlError(
+        'access_denied',
+        'Instagram Story downloads require INSTAGRAM_COOKIES_FILE from a logged-in Instagram session.',
+      );
+    }
+    return '';
+  }
   let info;
   try {
     info = await stat(settings.cookiesSource);
@@ -303,6 +312,12 @@ async function stagePlatformCookies(reference, settings, runtimeDir) {
       `${settings.cookiesEnv} does not contain cookies for ${reference.platform}.`,
     );
   }
+  if (isInstagramStoryReference(reference) && !filtered.cookieNames.has('sessionid')) {
+    throw galleryDlError(
+      'cookies_unreadable',
+      'INSTAGRAM_COOKIES_FILE must contain the Instagram sessionid cookie to download Stories.',
+    );
+  }
 
   const destination = path.join(runtimeDir, 'cookies.txt');
   await writeFile(destination, filtered.text, { mode: 0o600 });
@@ -313,6 +328,7 @@ async function stagePlatformCookies(reference, settings, runtimeDir) {
 function filterNetscapeCookies(source, allowedDomains) {
   const lines = ['# Netscape HTTP Cookie File'];
   let cookieCount = 0;
+  const cookieNames = new Set();
   for (const rawLine of String(source ?? '').split(/\r?\n/)) {
     let candidate = rawLine.trim();
     if (!candidate) continue;
@@ -321,11 +337,13 @@ function filterNetscapeCookies(source, allowedDomains) {
     const [rawDomain] = candidate.split('\t');
     const domain = String(rawDomain ?? '').replace(/^\./, '').toLowerCase();
     if (!domain || !allowedDomains.some((allowed) => domain === allowed || domain.endsWith(`.${allowed}`))) continue;
-    if (candidate.split('\t').length < 7) continue;
+    const fields = candidate.split('\t');
+    if (fields.length < 7) continue;
     lines.push(rawLine.trim());
     cookieCount += 1;
+    cookieNames.add(String(fields[5] ?? '').trim());
   }
-  return { cookieCount, text: `${lines.join('\n')}\n` };
+  return { cookieCount, cookieNames, text: `${lines.join('\n')}\n` };
 }
 
 async function runGalleryDl(executable, args, options) {
@@ -544,7 +562,8 @@ function normalizePost(reference, metadata, assets) {
   );
   const kinds = new Set(assets.map((asset) => asset.kind));
   let mediaType;
-  if (assets.length === 1) mediaType = assets[0].kind;
+  if (isInstagramStoryReference(reference) || metadata.type === 'story') mediaType = 'story';
+  else if (assets.length === 1) mediaType = assets[0].kind;
   else if (kinds.size === 1) mediaType = 'carousel';
   else mediaType = 'mixed';
 
@@ -596,6 +615,13 @@ function requireGalleryDlReference(input) {
     throw galleryDlError('invalid_url', 'The post reference has an invalid canonical URL.');
   }
   const match = rule.pathPattern.exec(url.pathname);
+  const storyMatch = rule.storyPathPattern?.exec(url.pathname) ?? null;
+  const regularIdentityMatches = Boolean(match && match[1] === reference.remoteId);
+  const storyIdentityMatches = Boolean(
+    storyMatch
+      && reference.remoteId === `story_${storyMatch[2]}`
+      && reference.creatorHandle === storyMatch[1].toLowerCase(),
+  );
   if (
     url.protocol !== 'https:'
     || url.hostname !== rule.canonicalHost
@@ -604,12 +630,19 @@ function requireGalleryDlReference(input) {
     || url.port
     || url.search
     || url.hash
-    || !match
-    || match[1] !== reference.remoteId
+    || (!regularIdentityMatches && !storyIdentityMatches)
   ) {
     throw galleryDlError('invalid_url', `The ${reference.platform} post reference is not canonical.`);
   }
   return reference;
+}
+
+function isInstagramStoryReference(reference) {
+  return reference?.platform === 'instagram'
+    && /^story_\d{1,32}$/.test(String(reference.remoteId ?? ''))
+    && /^https:\/\/www\.instagram\.com\/stories\/[A-Za-z0-9._]{1,30}\/\d{1,32}\/$/.test(
+      String(reference.canonicalUrl ?? ''),
+    );
 }
 
 function safeMediaUrl(value) {

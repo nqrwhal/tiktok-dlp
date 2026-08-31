@@ -31,6 +31,13 @@ an immersive mixed-media feed decision, and the coordinated project rename remai
 
 ## Completed
 
+### 2026-08-30 — Exact Instagram Story saves
+
+- Added strict `/stories/{username}/{story-id}` parsing for pasted Discord URLs and `/download`, stripping share tracking parameters and assigning a collision-safe `story_{id}` archive identity.
+- Reused the isolated Instagram gallery-dl transport for one exact story, preserved the creator and original story media ID, and persisted `story` as the normalized media type for Discord and Rewind.
+- Required the platform-scoped Instagram Netscape jar and its `sessionid` cookie before story extraction, while keeping ordinary public Instagram posts cookie-optional and never sharing TikTok/X credentials.
+- Added adapter, Discord ingress, command-manifest, archive, and Store persistence coverage for the supplied story URL shape.
+
 ### 2026-08-30 — Baseline audit
 
 - Verified all Compose services are running and healthy.
@@ -278,6 +285,7 @@ an immersive mixed-media feed decision, and the coordinated project rename remai
 | 2026-08-30 | `find src test scripts -name '*.js' ... node --check` plus bridge/gateway `.mjs` checks | Passed |
 | 2026-08-30 | `docker compose config --quiet` and `docker compose ps` | Passed; backend and Rewind healthy, cloudflared running |
 | 2026-08-30 | Deploy shell syntax, workflow YAML parse, and `git diff --check` | Passed |
+| 2026-08-30 | `npm test` after exact Instagram Story support | 206 passed |
 
 ## Rename Follow-up
 

@@ -483,10 +483,10 @@ export function buildHelpMessage() {
   return buildNoticePayload({
     title: 'Media Downloader Help',
     description: [
-      'Post a TikTok, Instagram, or X post URL in any channel I can read, or DM it to me, and I will save its media.',
+      'Post a TikTok, Instagram, or X post URL, or a TikTok/Instagram Story URL, in any channel I can read or DM it to me, and I will save its media.',
       '',
       'Slash commands:',
-      '`/download url:<post-url> delivery:auto|file|link`',
+      '`/download url:<post-or-story-url> delivery:auto|file|link`',
       '`/downloads list`',
       '`/downloads purge scope:mine confirm:PURGE`',
       '`/profiles link|show|unlink` (explicit cross-platform creator links)',

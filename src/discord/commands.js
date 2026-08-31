@@ -2,11 +2,11 @@ import { SlashCommandBuilder } from 'discord.js';
 
 const downloadCommand = new SlashCommandBuilder()
   .setName('download')
-  .setDescription('Save media from a supported social post.')
+  .setDescription('Save media from a supported social post or Story.')
   .addStringOption((option) =>
     option
       .setName('url')
-      .setDescription('TikTok, Instagram, or X post URL.')
+      .setDescription('TikTok, Instagram, or X post; TikTok/Instagram Story URL.')
       .setRequired(true),
   )
   .addStringOption((option) =>

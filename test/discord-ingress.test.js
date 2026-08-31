@@ -51,11 +51,16 @@ test('Discord post extraction accepts canonical supported posts and rejects unsa
     normalizeDownloadPostUrl('https://vm.tiktok.com/ZMshortOne/?utm_source=chat'),
     'https://vm.tiktok.com/ZMshortOne/',
   );
+  assert.equal(
+    normalizeDownloadPostUrl('https://www.instagram.com/stories/0kViv/3975498055704781626?utm_source=ig_story_item_share&igsi=token'),
+    'https://www.instagram.com/stories/0kviv/3975498055704781626/',
+  );
   for (const value of [
     'http://www.instagram.com/p/Ab_C-1/',
     'https://user:password@x.com/openai/status/123456789',
     'https://x.com.evil.test/openai/status/123456789',
     'https://www.instagram.com/openai/',
+    'https://www.instagram.com/stories/openai/',
     'https://x.com/explore',
     'https://www.tiktok.com/explore',
   ]) {
@@ -67,7 +72,7 @@ test('help copy covers supported post saves without claiming cross-platform moni
   const payload = buildHelpMessage();
   const description = payload.embeds[0].data.description;
   assert.equal(payload.embeds[0].data.title, 'Media Downloader Help');
-  assert.match(description, /TikTok, Instagram, or X post URL/);
+  assert.match(description, /TikTok\/Instagram Story URL/);
   assert.match(description, /\/profiles link\|show\|unlink/);
   assert.match(description, /TikTok profiles only for now/);
   assert.doesNotMatch(description, /Instagram profiles|X profiles/);

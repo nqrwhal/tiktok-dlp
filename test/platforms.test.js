@@ -60,6 +60,16 @@ test('known post URLs canonicalize and produce platform-scoped references', () =
     },
   );
   assert.deepEqual(
+    parsePostReference('https://www.instagram.com/stories/0kViv/3975498055704781626?utm_source=share&igsi=token'),
+    {
+      kind: 'post',
+      platform: 'instagram',
+      remoteId: 'story_3975498055704781626',
+      creatorHandle: '0kviv',
+      canonicalUrl: 'https://www.instagram.com/stories/0kviv/3975498055704781626/',
+    },
+  );
+  assert.deepEqual(
     parsePostReference('https://www.twitter.com/OpenAI/status/123456789/photo/1?s=20'),
     {
       kind: 'post',
@@ -74,6 +84,7 @@ test('known post URLs canonicalize and produce platform-scoped references', () =
     'https://x.com/openai/status/123456789',
   );
   assert.equal(parsePostReference('https://www.instagram.com/explore/'), null);
+  assert.equal(parsePostReference('https://www.instagram.com/stories/0kviv/'), null);
 });
 
 test('profile references are normalized for explicit cross-platform linking', () => {
@@ -116,6 +127,10 @@ test('post identity keys cannot collide across platforms', () => {
   assert.equal(postReferenceKey(tiktok), 'tiktok:post:123');
   assert.equal(postReferenceKey(x), 'x:post:123');
   assert.notEqual(postReferenceKey(tiktok), postReferenceKey(x));
+  assert.equal(
+    postReferenceKey(createPostReference({ platform: 'instagram', remoteId: 'story_3975498055704781626' })),
+    'instagram:post:story_3975498055704781626',
+  );
   assert.throws(
     () => createPostReference({ platform: 'instagram', remoteId: '../bad' }),
     /Invalid instagram post ID/,

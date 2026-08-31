@@ -60,6 +60,7 @@ export const tiktokAdapter = definePlatformAdapter({
   canonicalHost: 'www.tiktok.com',
   capabilities: {
     directDownload: true,
+    directStories: true,
     multiAsset: true,
     creatorListing: true,
     stories: true,
@@ -218,6 +219,17 @@ function parseTikTokProfile(url) {
 }
 
 function parseInstagramPost(url) {
+  const storyMatch = url.pathname.match(/^\/stories\/([A-Za-z0-9._]{1,30})\/(\d{1,32})\/?$/i);
+  if (storyMatch && !storyMatch[1].includes('..')) {
+    const creatorHandle = storyMatch[1].toLowerCase();
+    const storyId = storyMatch[2];
+    return createPostReference({
+      platform: 'instagram',
+      remoteId: `story_${storyId}`,
+      creatorHandle,
+      canonicalUrl: `https://www.instagram.com/stories/${creatorHandle}/${storyId}/`,
+    });
+  }
   const match = url.pathname.match(/^\/(p|reel|reels|tv)\/([A-Za-z0-9_-]{1,64})\/?$/i);
   if (!match) return null;
   const route = match[1].toLowerCase() === 'reels' ? 'reel' : match[1].toLowerCase();

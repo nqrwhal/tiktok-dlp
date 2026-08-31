@@ -28,8 +28,9 @@ Implementation progress and remaining work are tracked in [WORKLOG.md](WORKLOG.m
 
 ### Discord downloader and monitor
 
-- Saves TikTok posts, Instagram posts/reels/carousels, and X status media from
-  slash commands, DMs, and up to three URLs in a Discord message.
+- Saves TikTok posts and Stories, Instagram posts/reels/carousels and exact
+  Story share URLs, and X status media from slash commands, DMs, and up to
+  three URLs in a Discord message.
 - Preserves ordered image/video assets, attaches up to ten files when they fit
   Discord's limits, and keeps a ZIP/link fallback for multi-media posts.
 - With `YTDLP_COOKIES_FILE` set, TikTok downloads include follower-only /
@@ -37,8 +38,8 @@ Implementation progress and remaining work are tracked in [WORKLOG.md](WORKLOG.m
   their own cookie variables and never receive TikTok credentials.
 - Handles public photo/slideshow posts with a direct fallback and ZIP output.
   Configured cookies and the yt-dlp proxy are applied to those HTTP fallbacks.
-- Performs best-effort story discovery and downloads, including an authenticated
-  session when cookies are configured.
+- Performs best-effort TikTok Story discovery and downloads, including an
+  authenticated session when cookies are configured.
 - Monitors creators on a per-server or per-DM subscription basis.
 - Detects creator username changes and reports when saved source posts disappear.
 - Persists repeated monitor download failures as dead letters instead of marking
@@ -408,8 +409,9 @@ still needs Cloudflare Access or an equivalent private access layer.
 | Paths/tools | `DATA_DIR`, `STATE_DB`, `DOWNLOAD_DIR`, `YTDLP_PATH`, `YTDLP_PROXY`, `YTDLP_COOKIES_FILE`, `YTDLP_RETRIES`, `YTDLP_TIMEOUT_SECONDS`, `GALLERY_DL_PATH`, `GALLERY_DL_TEMP_DIR`, `GALLERY_DL_TIMEOUT_SECONDS` |
 | Instagram/X sessions | `INSTAGRAM_COOKIES_FILE`, `INSTAGRAM_PROXY`, `X_COOKIES_FILE`, `X_PROXY` |
 
-Instagram and X direct-post adapters use the pinned `gallery-dl` binary for
-posts, reels, carousels, and status media. Each run ignores user-level
+Instagram and X direct-save adapters use the pinned `gallery-dl` binary for
+posts, reels, carousels, exact Instagram Story share URLs, and status media.
+Each run ignores user-level
 gallery-dl configuration, probes an exact allowlisted post URL through JSON
 output, and writes fixed filenames into a unique directory under
 `GALLERY_DL_TEMP_DIR`. Asset count, per-file bytes, total bytes, subprocess
@@ -430,7 +432,10 @@ X_PROXY=http://gluetun:8888
 The adapter copies and filters a cookie jar to the selected platform before
 spawning gallery-dl, gives the child a minimal non-secret environment, and
 passes only that platform's explicit proxy. Unset session variables keep
-public-only behavior. The shared download service now consumes these adapters
+public-only behavior for normal posts. Instagram Stories always require a
+logged-in jar containing `sessionid`; the bot accepts only an exact
+`/stories/{username}/{story-id}` URL and downloads only that story. The shared
+download service now consumes these adapters
 and persists their ordered assets; Discord presentation can use the resulting
 post bundle or individual media files.
 

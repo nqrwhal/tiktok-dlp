@@ -633,12 +633,12 @@ export function canonicalDownloadKey(sourceUrl, metadata = null, platformInput =
 export function resolveDownloadSource(value, registry = defaultPlatformRegistry) {
   const match = registry?.forUrl?.(value);
   if (!match) {
-    throw new Error('A credential-free HTTPS TikTok, Instagram, or X/Twitter post URL is required.');
+    throw new Error('A credential-free HTTPS TikTok, Instagram, or X/Twitter post URL, or a TikTok/Instagram Story URL, is required.');
   }
   const canonicalUrl = match.adapter.canonicalizeUrl(match.url);
   const reference = match.adapter.parsePostReference(match.url);
   if (!reference && !isTikTokShortPostUrl(match.url, match.adapter.platform)) {
-    throw new Error('A TikTok, Instagram, or X/Twitter post URL is required; profile and feed URLs are not accepted here.');
+    throw new Error('A TikTok, Instagram, or X/Twitter post URL, or a TikTok/Instagram Story URL, is required; profile and feed URLs are not accepted here.');
   }
   return Object.freeze({
     adapter: match.adapter,

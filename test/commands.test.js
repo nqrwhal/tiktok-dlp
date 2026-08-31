@@ -12,10 +12,10 @@ test('exports the expected slash command manifest', () => {
   const watchOptions = watch.options ?? [];
 
   assert.equal(download.name, 'download');
-  assert.equal(download.description, 'Save media from a supported social post.');
+  assert.equal(download.description, 'Save media from a supported social post or Story.');
   assert.deepEqual(downloadOptions.map((option) => option.name), ['url', 'delivery']);
   assert.equal(downloadOptions[0].required, true);
-  assert.equal(downloadOptions[0].description, 'TikTok, Instagram, or X post URL.');
+  assert.equal(downloadOptions[0].description, 'TikTok, Instagram, or X post; TikTok/Instagram Story URL.');
   assert.equal(downloadOptions[1].required, false);
   assert.deepEqual((downloadOptions[1].choices ?? []).map((choice) => choice.name), ['auto', 'file', 'link']);
 

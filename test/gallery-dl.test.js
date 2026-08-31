@@ -104,6 +104,54 @@ test('gallery-dl adapters download normalized Instagram carousels and X mixed me
   }
 });
 
+test('Instagram Story downloads require a scoped session and normalize one exact story', async () => {
+  const storyUrl = 'https://www.instagram.com/stories/0kviv/3975498055704781626?utm_source=share';
+  const withoutCookies = await makeFakeGalleryDl({ withCookies: false });
+  try {
+    await assert.rejects(
+      instagramAdapter.download(storyUrl, withoutCookies.options),
+      (error) => error?.kind === 'access_denied' && /INSTAGRAM_COOKIES_FILE/.test(error.message),
+    );
+    assert.deepEqual(await readInvocationLog(withoutCookies.logPath), []);
+  } finally {
+    await withoutCookies.cleanup();
+  }
+
+  const fixture = await makeFakeGalleryDl();
+  try {
+    const story = await instagramAdapter.download(storyUrl, fixture.options);
+    assert.deepEqual(story.post, {
+      platform: 'instagram',
+      remoteId: 'story_3975498055704781626',
+      canonicalUrl: 'https://www.instagram.com/stories/0kviv/3975498055704781626/',
+      creator: {
+        remoteId: 'ig-owner-story',
+        handle: '0kviv',
+        displayName: 'Story Creator',
+      },
+      caption: '',
+      publishedAt: '2026-08-30T12:00:00.000Z',
+      mediaType: 'story',
+      assetCount: 1,
+    });
+    assert.deepEqual(story.assets.map((asset) => ({
+      remoteId: asset.remoteId,
+      kind: asset.kind,
+      filename: asset.filename,
+    })), [{
+      remoteId: '3975498055704781626',
+      kind: 'video',
+      filename: 'asset_001.mp4',
+    }]);
+    const invocations = await readInvocationLog(fixture.logPath);
+    assert.equal(invocations.length, 2);
+    assert.equal(invocations.every((invocation) => invocation.args.at(-1) === story.post.canonicalUrl), true);
+    assert.equal(invocations.every((invocation) => /sessionid\tig-session-secret/.test(invocation.cookies)), true);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test('gallery-dl enforces probe, filesystem byte, timeout, and abort bounds', async () => {
   const fixture = await makeFakeGalleryDl({ withCookies: false });
   try {
@@ -300,6 +348,42 @@ test('DownloadService archives a built-in gallery-dl carousel and reuses the sto
   }
 });
 
+test('DownloadService persists an exact Instagram Story with isolated identity and story media type', async () => {
+  const fixture = await makeFakeGalleryDl();
+  const store = createStore(path.join(fixture.dir, 'story-state.db'));
+  const downloadDir = path.join(fixture.dir, 'story-downloads');
+  try {
+    const service = createDownloadService({
+      config: {
+        ...fixture.options,
+        downloadDir,
+        publicBaseUrl: 'https://downloads.example.test',
+        downloadLinkTtlMinutes: 30,
+        maxConcurrentDownloads: 1,
+      },
+      store,
+    });
+    const result = await service.request(
+      'https://www.instagram.com/stories/0kviv/3975498055704781626?igsi=tracking',
+      { requestedBy: 'story-user' },
+    );
+    assert.equal(result.platform, 'instagram');
+    assert.equal(result.videoId, 'story_3975498055704781626');
+    assert.equal(result.username, '0kviv');
+    assert.equal(result.mediaType, 'story');
+    assert.equal(path.extname(result.filePath), '.mp4');
+    assert.equal(result.assets.length, 1);
+    assert.equal(result.assets[0].remoteId, '3975498055704781626');
+    const stored = store.getMediaPost('instagram', 'story_3975498055704781626');
+    assert.equal(stored.media_type, 'story');
+    assert.equal(stored.creator_handle, '0kviv');
+    assert.equal(stored.canonical_url, 'https://www.instagram.com/stories/0kviv/3975498055704781626/');
+  } finally {
+    store.close();
+    await fixture.cleanup();
+  }
+});
+
 async function makeFakeGalleryDl({ withCookies = true } = {}) {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'gallery-dl-adapter-'));
   const executable = path.join(dir, 'fake-gallery-dl.cjs');
@@ -379,7 +463,9 @@ if (args.includes('--dump-json')) {
     fs.writeFileSync(outside, 'outside');
     fs.symlinkSync(outside, path.join(outputDir, 'asset_001.jpg'));
   } else {
-    const extensions = url.includes('instagram.com') ? ['jpg', 'mp4', 'jpg'] : ['jpg', 'mp4'];
+    const extensions = url.includes('/stories/')
+      ? ['mp4']
+      : url.includes('instagram.com') ? ['jpg', 'mp4', 'jpg'] : ['jpg', 'mp4'];
     for (let index = 0; index < extensions.length; index += 1) {
       fs.writeFileSync(path.join(outputDir, 'asset_' + String(index + 1).padStart(3, '0') + '.' + extensions[index]), 'asset-' + (index + 1));
     }
@@ -390,6 +476,7 @@ function probe(url) {
   if (url.includes('/TooMany/')) return instagram('TooMany', 3);
   if (url.includes('/TooBig/')) return instagram('TooBig', 1);
   if (url.includes('/Symlink/')) return instagram('Symlink', 1);
+  if (url.includes('/stories/')) return instagramStory(url);
   if (url.includes('instagram.com')) return instagram('AbC', 3);
   return [
     [2, {
@@ -398,6 +485,20 @@ function probe(url) {
     }],
     [3, 'https://pbs.example.test/one.jpg', { num: '1', media_id: 'x-media-1', type: 'photo', extension: 'jpg', width: '1200', height: '900' }],
     [3, 'https://video.example.test/two.mp4', { num: '2', media_id: 'x-media-2', type: 'animated_gif', extension: 'mp4', width: '640', height: '480', duration: '2.5' }],
+  ];
+}
+
+function instagramStory(url) {
+  const match = url.match(/\\/stories\\/([^/]+)\\/(\\d+)/);
+  const storyId = match && match[2] || '3975498055704781626';
+  return [
+    [2, {
+      post_id: storyId, count: '1', type: 'story', username: match && match[1] || '0kviv',
+      owner_id: 'ig-owner-story', fullname: 'Story Creator', date: '2026-08-30T12:00:00+00:00',
+    }],
+    [3, 'https://cdn.example.test/story.mp4', {
+      num: '1', media_id: storyId, type: 'video', extension: 'mp4', width: '1080', height: '1920', duration: '9.5',
+    }],
   ];
 }
 
