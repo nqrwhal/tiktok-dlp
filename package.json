@@ -9,6 +9,8 @@
     "register:commands": "node src/discord/register-commands.js",
     "resolve:photo": "node src/tiktok/photo-resolve-cli.js",
     "prepare:tunnel": "node scripts/prepare-cloudflared-secret.js",
+    "backup:state": "node scripts/backup-state.js",
+    "restore:state": "node scripts/restore-state.js",
     "test": "node --test test/*.test.js"
   },
   "dependencies": {

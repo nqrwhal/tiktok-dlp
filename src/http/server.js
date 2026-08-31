@@ -4,6 +4,7 @@ import { stat } from 'node:fs/promises';
 import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { createReadStream } from 'node:fs';
+import { parseProfileReference } from '../platforms/index.js';
 import { normalizeUsername } from '../util/files.js';
 import { removeStoredFiles } from '../cleanup/downloads.js';
 
@@ -16,6 +17,14 @@ export function createHttpHandler({ config, store, creatorImportService = null }
 
       if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname === '/health') {
         return sendJson(res, 200, buildHealthPayload(config, store), { head: req.method === 'HEAD' });
+      }
+
+      if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname === '/ready') {
+        try {
+          return sendJson(res, 200, buildReadinessPayload(store), { head: req.method === 'HEAD' });
+        } catch {
+          return sendJson(res, 503, { status: 'not_ready' }, { head: req.method === 'HEAD' });
+        }
       }
 
       if (url.pathname === '/api/imports' || /^\/api\/imports\/\d+(?:\/(?:cancel|retry))?$/.test(url.pathname)) {
@@ -43,12 +52,48 @@ export function createHttpHandler({ config, store, creatorImportService = null }
         return handleBookmarksRequest(req, res, { config, store });
       }
 
+      if (
+        url.pathname === '/api/rewind/creators'
+        || url.pathname === '/api/rewind/videos'
+        || url.pathname === '/api/rewind/stats'
+        || url.pathname === '/api/rewind/posts'
+      ) {
+        return handleRewindArchiveReadRequest(req, res, { config, store, url });
+      }
+
       const bookmarkMatch = url.pathname.match(/^\/api\/bookmarks\/(\d+)$/);
       if (bookmarkMatch) {
         return handleBookmarkRequest(req, res, {
           config,
           store,
           fileId: Number(bookmarkMatch[1]),
+        });
+      }
+
+      const postBookmarkMatch = url.pathname.match(/^\/api\/post-bookmarks\/(\d+)$/);
+      if (postBookmarkMatch) {
+        return handlePostBookmarkRequest(req, res, {
+          config,
+          store,
+          fileId: Number(postBookmarkMatch[1]),
+        });
+      }
+
+      const mediaPostRestoreMatch = url.pathname.match(/^\/api\/media-posts\/(\d+)\/restore$/);
+      if (mediaPostRestoreMatch) {
+        return handleMediaPostRestoreRequest(req, res, {
+          config,
+          store,
+          fileId: Number(mediaPostRestoreMatch[1]),
+        });
+      }
+
+      const mediaPostMatch = url.pathname.match(/^\/api\/media-posts\/(\d+)$/);
+      if (mediaPostMatch) {
+        return handleMediaPostRequest(req, res, {
+          config,
+          store,
+          fileId: Number(mediaPostMatch[1]),
         });
       }
 
@@ -59,6 +104,14 @@ export function createHttpHandler({ config, store, creatorImportService = null }
           store,
           fileId: Number(restoreVideoMatch[1]),
         });
+      }
+
+      if (
+        url.pathname === '/api/profile-groups'
+        || /^\/api\/profile-groups\/\d+$/.test(url.pathname)
+        || /^\/api\/profile-groups\/\d+\/profiles\/\d+$/.test(url.pathname)
+      ) {
+        return handleProfileGroupsRequest(req, res, { config, store, url });
       }
 
       const creatorMonitoringMatch = url.pathname.match(/^\/api\/creators\/([^/]+)\/monitoring$/);
@@ -106,6 +159,165 @@ export function createHttpHandler({ config, store, creatorImportService = null }
       }, { head: req.method === 'HEAD' });
     }
   };
+}
+
+export async function handleProfileGroupsRequest(req, res, { config, store, url }) {
+  if (!isImportAuthorized(req, config)) {
+    return sendJson(res, 401, { error: 'Unauthorized' });
+  }
+
+  try {
+    if (req.method === 'GET' && url.pathname === '/api/profile-groups') {
+      return sendJson(res, 200, buildProfileGroupsPayload(store));
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/profile-groups') {
+      const body = await readJsonBody(req);
+      if (!Array.isArray(body.profiles)) {
+        return sendJson(res, 400, { error: 'profiles must be an array of profile URLs or IDs' });
+      }
+      const groupId = body.groupId == null || body.groupId === '' ? null : positiveId(body.groupId);
+      if (!groupId && body.profiles.length < 2) {
+        return sendJson(res, 400, { error: 'Choose at least two profiles when creating a creator group' });
+      }
+      if (groupId && !store.getCreatorGroup?.(groupId)) {
+        return sendJson(res, 404, { error: 'Creator group not found' });
+      }
+      const profiles = body.profiles.map((profile) => resolveProfileForLink(store, profile));
+      const profileIds = [...new Set(profiles.map((profile) => Number(profile.id)))];
+      if (!groupId && profileIds.length < 2) {
+        return sendJson(res, 400, { error: 'Choose two different profiles when creating a creator group' });
+      }
+      const linked = store.linkCreatorProfiles(profileIds, {
+        groupId,
+        ...(Object.hasOwn(body, 'name') ? { name: body.name } : {}),
+        mergeGroups: body.mergeGroups === true,
+      });
+      return sendJson(res, 200, {
+        group: serializeCreatorGroup(linked),
+      });
+    }
+
+    const groupMatch = url.pathname.match(/^\/api\/profile-groups\/(\d+)$/);
+    if (req.method === 'PATCH' && groupMatch) {
+      const body = await readJsonBody(req);
+      if (typeof body.name !== 'string') {
+        return sendJson(res, 400, { error: 'name must be a string' });
+      }
+      const renamed = store.renameCreatorGroup?.(Number(groupMatch[1]), body.name);
+      if (!renamed) return sendJson(res, 404, { error: 'Creator group not found' });
+      return sendJson(res, 200, { group: serializeCreatorGroup(renamed) });
+    }
+
+    const memberMatch = url.pathname.match(/^\/api\/profile-groups\/(\d+)\/profiles\/(\d+)$/);
+    if (req.method === 'DELETE' && memberMatch) {
+      const groupId = Number(memberMatch[1]);
+      const profileId = Number(memberMatch[2]);
+      const member = store.getCreatorGroupMember?.(groupId, profileId);
+      if (!member) return sendJson(res, 404, { error: 'Linked profile not found' });
+      store.unlinkProfileFromCreatorGroup(profileId);
+      const group = store.getCreatorGroup?.(groupId);
+      return sendJson(res, 200, {
+        unlinkedProfile: serializePlatformProfile(store.getPlatformProfile(profileId)),
+        group: group ? serializeCreatorGroup({
+          ...group,
+          members: store.listCreatorGroupMembers(groupId),
+        }) : null,
+      });
+    }
+
+    return sendJson(res, 405, { error: 'Method not allowed' });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const statusCode = Number(error?.statusCode)
+      || (/different creator groups|another creator group/i.test(message) ? 409 : 400);
+    return sendJson(res, statusCode, { error: message });
+  }
+}
+
+export async function handleRewindArchiveReadRequest(req, res, { config, store, url }) {
+  if (!isImportAuthorized(req, config)) {
+    return sendJson(res, 401, { error: 'Unauthorized' });
+  }
+  if (req.method !== 'GET') {
+    return sendJson(res, 405, { error: 'Method not allowed' });
+  }
+
+  try {
+    if (url.pathname === '/api/rewind/posts') {
+      const limit = queryInteger(url, 'limit', { defaultValue: 100, minimum: 1, maximum: 501 });
+      const fileId = queryInteger(url, 'fileId', { defaultValue: null, minimum: 1 });
+      const profileId = queryInteger(url, 'profileId', { defaultValue: null, minimum: 1 });
+      const groupId = queryInteger(url, 'groupId', { defaultValue: null, minimum: 1 });
+      const beforeCreatedAt = queryInteger(url, 'beforeCreatedAt', {
+        defaultValue: null,
+        minimum: 0,
+      });
+      const beforeFileId = queryInteger(url, 'beforeFileId', { defaultValue: null, minimum: 1 });
+      if ((beforeCreatedAt == null) !== (beforeFileId == null)) {
+        return sendJson(res, 400, { error: 'Both Rewind media cursor fields are required' });
+      }
+      const username = String(url.searchParams.get('username') ?? '').trim();
+      if (username.length > 128) {
+        return sendJson(res, 400, { error: 'Rewind username is too long' });
+      }
+      const platform = String(url.searchParams.get('platform') ?? '').trim();
+      if (platform.length > 32) {
+        return sendJson(res, 400, { error: 'Rewind platform is too long' });
+      }
+      const posts = store.listRewindMediaPosts({
+        platform,
+        username,
+        profileId,
+        groupId,
+        fileId,
+        limit,
+        cursor: beforeCreatedAt == null ? null : {
+          createdAt: beforeCreatedAt,
+          fileId: beforeFileId,
+        },
+        bookmarkedOnly: url.searchParams.get('bookmarked') === '1',
+        trashedOnly: url.searchParams.get('trashed') === '1',
+      });
+      return sendJson(res, 200, { posts });
+    }
+    if (url.pathname === '/api/rewind/creators') {
+      return sendJson(res, 200, { creators: store.listRewindCreators() });
+    }
+    if (url.pathname === '/api/rewind/stats') {
+      return sendJson(res, 200, { stats: store.getRewindStats() });
+    }
+
+    const limit = queryInteger(url, 'limit', { defaultValue: 500, minimum: 1, maximum: 5_001 });
+    const fileId = queryInteger(url, 'fileId', { defaultValue: null, minimum: 1 });
+    const beforeCreatedAt = queryInteger(url, 'beforeCreatedAt', {
+      defaultValue: null,
+      minimum: 0,
+    });
+    const beforeFileId = queryInteger(url, 'beforeFileId', { defaultValue: null, minimum: 1 });
+    if ((beforeCreatedAt == null) !== (beforeFileId == null)) {
+      return sendJson(res, 400, { error: 'Both Rewind cursor fields are required' });
+    }
+    const username = String(url.searchParams.get('username') ?? '').trim();
+    if (username.length > 128) {
+      return sendJson(res, 400, { error: 'Rewind username is too long' });
+    }
+    const videos = store.listRewindVideos({
+      username,
+      fileId,
+      limit,
+      cursor: beforeCreatedAt == null ? null : {
+        createdAt: beforeCreatedAt,
+        fileId: beforeFileId,
+      },
+      bookmarkedOnly: url.searchParams.get('bookmarked') === '1',
+    });
+    return sendJson(res, 200, { videos });
+  } catch (error) {
+    return sendJson(res, Number(error?.statusCode) || 400, {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 }
 
 export async function handleCreatorMonitoringRequest(req, res, { config, store, username }) {
@@ -221,6 +433,103 @@ export async function handleBookmarkRequest(req, res, { config, store, fileId })
   return sendJson(res, 200, { fileId: Number(fileId), bookmarked });
 }
 
+export async function handlePostBookmarkRequest(req, res, { config, store, fileId }) {
+  if (!isImportAuthorized(req, config)) {
+    return sendJson(res, 401, { error: 'Unauthorized' });
+  }
+  if (req.method !== 'PUT' && req.method !== 'DELETE') {
+    return sendJson(res, 405, { error: 'Method not allowed' });
+  }
+
+  const bookmarked = req.method === 'PUT';
+  const updated = store.setMediaFileBookmark?.(fileId, bookmarked);
+  if (!updated) return sendJson(res, 404, { error: 'Post not found' });
+  return sendJson(res, 200, { fileId: Number(fileId), bookmarked });
+}
+
+export async function handleMediaPostRequest(req, res, { config, store, fileId }) {
+  if (!isImportAuthorized(req, config)) {
+    return sendJson(res, 401, { error: 'Unauthorized' });
+  }
+  if (req.method !== 'DELETE') {
+    return sendJson(res, 405, { error: 'Method not allowed' });
+  }
+
+  try {
+    const body = await readJsonBody(req);
+    if (Number(body.confirmFileId) !== Number(fileId)) {
+      return sendJson(res, 400, { error: 'Confirm the post before moving it to trash' });
+    }
+    const trashed = store.trashMediaFile?.(fileId);
+    if (!trashed) {
+      const existing = store.getTrashedMediaFile?.(fileId);
+      return sendJson(res, existing ? 409 : 404, {
+        error: existing ? 'The post is already in trash' : 'Post not found',
+      });
+    }
+    return sendJson(res, 200, {
+      fileId: Number(trashed.id),
+      platform: String(trashed.platform ?? ''),
+      remoteId: String(trashed.video_id ?? ''),
+      trashedAt: Number(trashed.trashed_at ?? 0),
+      trashedPost: true,
+    });
+  } catch (error) {
+    return sendJson(res, Number(error?.statusCode) || 400, {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+export async function handleMediaPostRestoreRequest(req, res, { config, store, fileId }) {
+  if (!isImportAuthorized(req, config)) {
+    return sendJson(res, 401, { error: 'Unauthorized' });
+  }
+  if (req.method !== 'POST') {
+    return sendJson(res, 405, { error: 'Method not allowed' });
+  }
+
+  try {
+    const body = await readJsonBody(req);
+    if (Number(body.confirmFileId) !== Number(fileId)) {
+      return sendJson(res, 400, { error: 'Confirm the post before restoring it' });
+    }
+    const trashed = store.getTrashedMediaFile?.(fileId);
+    if (!trashed) return sendJson(res, 404, { error: 'Trashed post not found' });
+    if (trashed.retention_status === 'trash_claimed'
+      || (trashed.delete_requested_at != null && trashed.delete_error == null)) {
+      return sendJson(res, 409, { error: 'The archived post is currently being purged' });
+    }
+
+    const storedPaths = new Set([trashed.path, ...(trashed.asset_paths ?? [])].filter(Boolean));
+    for (const storedPath of storedPaths) {
+      const filePath = resolveDownloadPath(config.downloadDir, storedPath);
+      const fileStats = filePath ? await stat(filePath).catch(() => null) : null;
+      if (!fileStats?.isFile()) {
+        return sendJson(res, 409, { error: 'The archived post media is no longer available on disk' });
+      }
+    }
+
+    const restored = store.restoreTrashedMediaFile?.(fileId);
+    if (!restored) {
+      const current = store.getTrashedMediaFile?.(fileId);
+      return sendJson(res, current ? 409 : 404, {
+        error: current ? 'The archived post is currently being purged' : 'Trashed post not found',
+      });
+    }
+    return sendJson(res, 200, {
+      fileId: Number(restored.id),
+      platform: String(restored.platform ?? ''),
+      remoteId: String(restored.video_id ?? ''),
+      restoredPost: true,
+    });
+  } catch (error) {
+    return sendJson(res, Number(error?.statusCode) || 400, {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
 export async function handleCreatorVideosRequest(req, res, { config, store, username }) {
   if (!isImportAuthorized(req, config)) {
     return sendJson(res, 401, { error: 'Unauthorized' });
@@ -291,13 +600,19 @@ export async function handleTrashRequest(req, res, { config, store, url }) {
       );
       const removal = await removeStoredFiles(files, config, { protectedPaths });
       for (const failure of removal.failed) {
-        store.markFileDeletionFailed?.(failure.file.id, failure.error);
+        store.markFileDeletionFailed?.(failure.file.id, failure.error, Date.now(), {
+          expectedRetentionStatus: 'trash_claimed',
+          expectedRequestedAt: failure.file.delete_requested_at,
+        });
       }
       const failedIds = new Set(removal.failed.map((failure) => Number(failure.file.id)));
       const removableIds = files
         .map((file) => Number(file.id))
         .filter((fileId) => !failedIds.has(fileId));
-      const deletedRecords = store.deleteFileRecords?.(removableIds) ?? 0;
+      const deletedRecords = store.deleteFileRecords?.(removableIds, {
+        requiredRetentionStatus: 'trash_claimed',
+        claimRequestedAt: files[0]?.delete_requested_at,
+      }) ?? 0;
       return sendJson(res, 200, {
         permanentlyDeletedVideos: deletedRecords,
         deletedStoredFiles: removal.deleted,
@@ -349,11 +664,17 @@ export async function handleTrashVideoRequest(req, res, { config, store, fileId 
     const removal = await removeStoredFiles([file], config, { protectedPaths });
     if (removal.failed.length) {
       const failure = removal.failed[0];
-      store.markFileDeletionFailed?.(file.id, failure.error);
+      store.markFileDeletionFailed?.(file.id, failure.error, Date.now(), {
+        expectedRetentionStatus: 'trash_claimed',
+        expectedRequestedAt: file.delete_requested_at,
+      });
       return sendJson(res, 500, { error: 'The video file could not be deleted. You can retry from trash.' });
     }
 
-    const deletedRecords = store.deleteFileRecords?.([file.id]) ?? 0;
+    const deletedRecords = store.deleteFileRecords?.([file.id], {
+      requiredRetentionStatus: 'trash_claimed',
+      claimRequestedAt: file.delete_requested_at,
+    }) ?? 0;
     if (!deletedRecords) {
       return sendJson(res, 404, { error: 'Trashed video not found' });
     }
@@ -582,6 +903,14 @@ export function buildHealthPayload(config, store) {
   };
 }
 
+export function buildReadinessPayload(store) {
+  const readiness = store.checkReadiness?.();
+  if (!readiness || readiness.database !== 'ready') {
+    throw new Error('Archive database is not ready.');
+  }
+  return { status: 'ready', ...readiness };
+}
+
 export function isImportAuthorized(req, config) {
   const remoteAddress = String(req?.socket?.remoteAddress ?? '');
   if (remoteAddress === '127.0.0.1' || remoteAddress === '::1' || remoteAddress === '::ffff:127.0.0.1') {
@@ -659,6 +988,88 @@ export function serializeCreatorImportItem(record) {
     completedAt: record.completed_at == null ? null : Number(record.completed_at),
     updatedAt: Number(record.updated_at ?? 0),
   };
+}
+
+export function buildProfileGroupsPayload(store) {
+  const groups = (store.listCreatorGroups?.({ includeEmpty: false }) ?? []).map((group) => (
+    serializeCreatorGroup({
+      ...group,
+      members: store.listCreatorGroupMembers?.(group.id) ?? [],
+    })
+  ));
+  const unlinkedProfiles = (store.listPlatformProfiles?.({ unlinkedOnly: true }) ?? [])
+    .map(serializePlatformProfile);
+  return { groups, unlinkedProfiles };
+}
+
+export function serializeCreatorGroup(record) {
+  if (!record) return null;
+  const members = Array.isArray(record.members) ? record.members.map(serializePlatformProfile) : [];
+  return {
+    id: Number(record.id),
+    name: String(record.name ?? ''),
+    memberCount: Number(record.member_count ?? members.length),
+    createdAt: Number(record.created_at ?? 0),
+    updatedAt: Number(record.updated_at ?? 0),
+    members,
+  };
+}
+
+export function serializePlatformProfile(record) {
+  if (!record) return null;
+  return {
+    id: Number(record.id),
+    platform: String(record.platform ?? ''),
+    remoteId: record.remote_id == null || record.remote_id === '' ? null : String(record.remote_id),
+    handle: String(record.handle ?? ''),
+    displayName: String(record.display_name ?? ''),
+    profileUrl: String(record.profile_url ?? ''),
+    groupId: record.group_id == null ? null : Number(record.group_id),
+    linkedAt: record.linked_at == null ? null : Number(record.linked_at),
+    createdAt: Number(record.created_at ?? 0),
+    updatedAt: Number(record.updated_at ?? 0),
+  };
+}
+
+function resolveProfileForLink(store, input) {
+  if (Number.isInteger(input) && input > 0) {
+    const profile = store.getPlatformProfile?.(input);
+    if (!profile) throw Object.assign(new Error(`Platform profile ${input} was not found.`), { statusCode: 404 });
+    return profile;
+  }
+  if (typeof input !== 'string') {
+    throw new Error('Every profile must be an existing profile ID or a TikTok, Instagram, or X profile URL.');
+  }
+  const reference = parseProfileReference(input);
+  if (!reference) {
+    throw new Error('A TikTok, Instagram, or X profile URL is required.');
+  }
+  return store.upsertPlatformProfile({
+    platform: reference.platform,
+    remoteId: reference.remoteId,
+    handle: reference.handle,
+    profileUrl: reference.canonicalUrl,
+  });
+}
+
+function positiveId(value) {
+  const id = Number(value);
+  if (!Number.isInteger(id) || id <= 0) throw new Error('A valid creator group ID is required.');
+  return id;
+}
+
+function queryInteger(url, name, {
+  defaultValue = null,
+  minimum = Number.MIN_SAFE_INTEGER,
+  maximum = Number.MAX_SAFE_INTEGER,
+} = {}) {
+  const raw = url.searchParams.get(name);
+  if (raw == null || raw === '') return defaultValue;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`${name} must be an integer between ${minimum} and ${maximum}`);
+  }
+  return value;
 }
 
 export function serializeTrashedFile(record, config = {}) {

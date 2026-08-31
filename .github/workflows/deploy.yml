@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   deploy:
-    name: Deploy bot
+    name: Deploy backend and Rewind
     if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && !(github.event.workflow_run.head_branch && github.event.workflow_run.head_branch != 'main'))
     runs-on: [self-hosted, yufeihl]
     timeout-minutes: 20
@@ -40,16 +40,16 @@ jobs:
           fi
 
       - name: Deploy from production checkout
+        env:
+          DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || '' }}
         run: |
           set -euo pipefail
           cd "$ROOT"
           export GIT_TERMINAL_PROMPT=0
-          git fetch origin
-          if [[ -f scripts/deploy-prod.sh ]]; then
-            bash scripts/deploy-prod.sh
-          else
-            tmp="$(mktemp)"
-            trap 'rm -f "$tmp"' EXIT
-            git show origin/main:scripts/deploy-prod.sh > "$tmp"
-            bash "$tmp"
-          fi
+          git fetch origin main
+          target="${DEPLOY_SHA:-$(git rev-parse origin/main)}"
+          git merge-base --is-ancestor "$target" origin/main
+          tmp="$(mktemp)"
+          trap 'rm -f "$tmp"' EXIT
+          git show "$target":scripts/deploy-prod.sh > "$tmp"
+          DEPLOY_SHA="$target" bash "$tmp"

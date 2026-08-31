@@ -1,5 +1,5 @@
 export type CreatorStatus = "healthy" | "syncing" | "attention";
-export type MediaType = "video" | "slideshow" | "story";
+export type MediaType = "video" | "slideshow" | "story" | "image" | "animated" | "gallery" | "mixed" | "archive";
 
 export interface Creator {
   id: string;
@@ -89,6 +89,57 @@ export interface FeedPage {
   nextCursor: string | null;
 }
 
+export interface SavedMediaAsset {
+  id: string;
+  position: number;
+  kind: "video" | "image" | "animated" | "archive";
+  mimeType: string;
+  mediaUrl: string;
+  filename: string;
+  sizeBytes: number;
+  width: number | null;
+  height: number | null;
+  durationSeconds: number | null;
+}
+
+export interface SavedPost {
+  id: string;
+  platform: ProfilePlatform;
+  remoteId: string;
+  creatorId: string;
+  profileId: number | null;
+  creatorGroupId: number | null;
+  creatorGroupName: string;
+  username: string;
+  displayName: string;
+  creatorProfileUrl: string;
+  title: string;
+  description: string;
+  tags: string[];
+  mediaType: MediaType;
+  assets: SavedMediaAsset[];
+  assetCount: number;
+  thumbnailUrl: string;
+  downloadUrl: string;
+  accent: string;
+  savedAt: string;
+  savedAtLabel: string;
+  publishedAt: string;
+  trashedAt: string;
+  retentionStatus: string;
+  duration: string;
+  durationSeconds: number;
+  sizeBytes: number;
+  sizeLabel: string;
+  sourceUrl: string;
+  bookmarked: boolean;
+}
+
+export interface PostPage {
+  items: SavedPost[];
+  nextCursor: string | null;
+}
+
 export interface TrashedVideo {
   fileId: number;
   videoId: string;
@@ -99,6 +150,35 @@ export interface TrashedVideo {
   createdAt: number;
   trashedAt: number;
   purgeAt: number | null;
+}
+
+export type ProfilePlatform = "tiktok" | "instagram" | "x";
+
+export interface PlatformProfile {
+  id: number;
+  platform: ProfilePlatform;
+  remoteId: string | null;
+  handle: string;
+  displayName: string;
+  profileUrl: string;
+  groupId: number | null;
+  linkedAt: number | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface CreatorProfileGroup {
+  id: number;
+  name: string;
+  memberCount: number;
+  createdAt: number;
+  updatedAt: number;
+  members: PlatformProfile[];
+}
+
+export interface ProfileGroupsPayload {
+  groups: CreatorProfileGroup[];
+  unlinkedProfiles: PlatformProfile[];
 }
 
 export interface ArchiveApi {

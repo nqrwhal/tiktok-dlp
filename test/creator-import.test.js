@@ -364,6 +364,50 @@ test('graceful import stop checkpoints the current item and leaves remaining wor
   }
 });
 
+test('creator imports use TikTok adapter listing and probe operations by default', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'tiktok-import-adapter-'));
+  const store = createStore(path.join(root, 'state.db'));
+  const calls = [];
+  const requested = [];
+  const platformAdapter = {
+    async listCreatorPosts(value, options) {
+      calls.push({ operation: 'list', value, options });
+      return { entries: [entry('1000000000000000401')] };
+    },
+    async probe(value, options) {
+      calls.push({ operation: 'probe', value, options });
+      return entry('1000000000000000401', 30);
+    },
+  };
+  const service = createCreatorImportService({
+    config: { importMaxDurationSeconds: 120, importConcurrency: 1, adapterMarker: 'adapter-config' },
+    store,
+    platformAdapter,
+    downloadService: {
+      async request(sourceUrl, options) {
+        requested.push({ sourceUrl, options });
+        return { reused: false, fileId: 1 };
+      },
+    },
+  });
+
+  try {
+    const started = service.start({ username: 'creator' });
+    await service.waitForIdle();
+
+    assert.equal(service.get(started.import.id).status, 'completed');
+    assert.deepEqual(calls.map((call) => call.operation), ['list', 'probe']);
+    assert.equal(calls[0].value, 'https://www.tiktok.com/@creator');
+    assert.equal(calls[0].options.adapterMarker, 'adapter-config');
+    assert.equal(calls[1].options.config.adapterMarker, 'adapter-config');
+    assert.equal(requested.length, 1);
+    assert.equal(requested[0].options.metadata.duration, 30);
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('duration limits use a two-minute default and enforce safe bounds', () => {
   assert.equal(normalizeDurationLimit(undefined, 120), 120);
   assert.equal(normalizeDurationLimit(90, 120), 90);

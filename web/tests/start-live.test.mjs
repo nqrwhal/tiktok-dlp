@@ -6,8 +6,29 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { isBridgeRequestPath } from "../scripts/start-live-core.mjs";
 
 const projectDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+test("start-live sends every archive and ordered-media route to the bridge", () => {
+  for (const pathname of [
+    "/api/health",
+    "/media/12",
+    "/thumbnail/12.jpg",
+    "/post-media/12/0",
+    "/post-download/12",
+  ]) {
+    assert.equal(isBridgeRequestPath(pathname), true, pathname);
+  }
+  for (const pathname of [
+    "/",
+    "/dashboard/media",
+    "/post-media-lookalike/12/0",
+    "/post-download-lookalike/12",
+  ]) {
+    assert.equal(isBridgeRequestPath(pathname), false, pathname);
+  }
+});
 
 test("start-live fails when a child exits cleanly", async (context) => {
   const fixtureDir = await mkdtemp(path.join(os.tmpdir(), "rewind-supervisor-"));

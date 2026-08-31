@@ -41,11 +41,19 @@ export async function cleanupExpiredDownloads({ config, store, now = Date.now(),
     const protectedPaths = resolveProtectedStoredPaths(store, files, config.downloadDir);
     const removal = await removeStoredFiles(files, config, { protectedPaths });
     for (const failure of removal.failed) {
-      store.markFileDeletionFailed?.(failure.file.id, failure.error, now);
+      store.markFileDeletionFailed?.(failure.file.id, failure.error, now, {
+        expectedRetentionStatus: 'expiry_claimed',
+        expectedRequestedAt: failure.file.delete_requested_at,
+      });
     }
     const failedIds = new Set(removal.failed.map((failure) => failure.file.id));
     const removableIds = files.filter((file) => !failedIds.has(file.id)).map((file) => file.id);
-    const deletedRecords = store.deleteFileRecords(removableIds);
+    const deletedRecords = store.deleteFileRecords(removableIds, {
+      requiredRetentionStatus: 'expiry_claimed',
+      claimRequestedAt: now,
+      requireNoActiveLinks: true,
+      now,
+    });
     totals.files += deletedRecords;
     totals.deleted += removal.deleted;
     totals.failed += removal.failed.length;
@@ -61,11 +69,18 @@ export async function cleanupExpiredDownloads({ config, store, now = Date.now(),
       const protectedPaths = resolveProtectedStoredPaths(store, files, config.downloadDir);
       const removal = await removeStoredFiles(files, config, { protectedPaths });
       for (const failure of removal.failed) {
-        store.markFileDeletionFailed?.(failure.file.id, failure.error, now);
+        store.markFileDeletionFailed?.(failure.file.id, failure.error, now, {
+          expectedRetentionStatus: 'trash_claimed',
+          expectedRequestedAt: failure.file.delete_requested_at,
+        });
       }
       const failedIds = new Set(removal.failed.map((failure) => failure.file.id));
       const removableIds = files.filter((file) => !failedIds.has(file.id)).map((file) => file.id);
-      const deletedRecords = store.deleteFileRecords(removableIds);
+      const deletedRecords = store.deleteFileRecords(removableIds, {
+        requiredRetentionStatus: 'trash_claimed',
+        claimRequestedAt: now,
+        now,
+      });
       totals.files += deletedRecords;
       totals.deleted += removal.deleted;
       totals.failed += removal.failed.length;
@@ -101,10 +116,16 @@ export async function removeStoredFiles(files, config, { protectedPaths = new Se
   for (const [filePath, group] of byPath) {
     let error = null;
     try {
-      if (protectedResolvedPaths.has(path.resolve(filePath))) continue;
-      const paths = await resolveRelatedStoredDownloadPaths(filePath, group);
+      const primaryProtected = protectedResolvedPaths.has(path.resolve(filePath));
+      const explicitAssetPaths = new Set(group.flatMap((file) => parseRecordedAssetPaths(file))
+        .map((recordedPath) => resolveStoredDownloadPath(config.downloadDir, recordedPath))
+        .filter(Boolean)
+        .map((recordedPath) => path.resolve(recordedPath)));
+      const paths = await resolveRelatedStoredDownloadPaths(filePath, group, config.downloadDir);
       for (const relatedPath of paths) {
-        if (protectedResolvedPaths.has(path.resolve(relatedPath))) continue;
+        const resolvedRelatedPath = path.resolve(relatedPath);
+        if (protectedResolvedPaths.has(resolvedRelatedPath)) continue;
+        if (primaryProtected && !explicitAssetPaths.has(resolvedRelatedPath)) continue;
         await rm(relatedPath, { force: true });
         deleted += 1;
       }
@@ -120,9 +141,15 @@ export async function removeStoredFiles(files, config, { protectedPaths = new Se
   return { deleted, failed };
 }
 
-async function resolveRelatedStoredDownloadPaths(filePath, files = []) {
+async function resolveRelatedStoredDownloadPaths(filePath, files = [], downloadDir = '') {
   const resolved = path.resolve(filePath);
-  const paths = [resolved];
+  const paths = new Set([resolved]);
+  for (const file of files) {
+    for (const recordedPath of parseRecordedAssetPaths(file)) {
+      const relatedPath = resolveStoredDownloadPath(downloadDir, recordedPath);
+      if (relatedPath) paths.add(relatedPath);
+    }
+  }
   const dir = path.dirname(resolved);
   const extension = path.extname(resolved).toLowerCase();
   const stem = path.basename(resolved, extension);
@@ -143,12 +170,24 @@ async function resolveRelatedStoredDownloadPaths(filePath, files = []) {
         && entry.name.startsWith(galleryPrefix)
         && /\.(jpe?g|png|webp|gif|heic)$/i.test(entry.name);
       if (!isMediaSidecar && !isGalleryImage) continue;
-      paths.push(path.join(dir, entry.name));
+      paths.add(path.join(dir, entry.name));
     }
   } catch {
-    return paths;
+    return [...paths];
   }
-  return [...new Set(paths)];
+  return [...paths];
+}
+
+function parseRecordedAssetPaths(file) {
+  if (Array.isArray(file?.asset_paths)) return file.asset_paths.filter(Boolean);
+  const value = file?.asset_paths_json;
+  if (typeof value !== 'string' || !value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.filter((entry) => typeof entry === 'string' && entry) : [];
+  } catch {
+    return [];
+  }
 }
 
 function isKnownSidecar(filename, stem) {

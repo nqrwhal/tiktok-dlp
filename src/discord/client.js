@@ -9,9 +9,16 @@ import {
   Partials,
   PermissionFlagsBits,
 } from 'discord.js';
+import { stat } from 'node:fs/promises';
 import path from 'node:path';
 import { removeStoredFiles } from '../cleanup/downloads.js';
-import { extractTikTokUrls, normalizeUsername, shouldUploadToDiscord, makePublicFileUrl, randomToken } from '../util/files.js';
+import { resolveDownloadSource } from '../download/service.js';
+import {
+  extractSupportedPlatformUrls,
+  parseProfileReference,
+  profileReferenceKey,
+} from '../platforms/index.js';
+import { normalizeUsername, shouldUploadToDiscord, makePublicFileUrl, randomToken } from '../util/files.js';
 import {
   UI_COLORS,
   buildErrorPayload,
@@ -26,6 +33,9 @@ import {
 const LINK_BUTTON_PREFIX = 'link:';
 const DOWNLOADS_BUTTON_PREFIX = 'downloads:list:';
 const MONITOR_BUTTON_PREFIX = 'monitor:';
+const MAX_MESSAGE_DOWNLOAD_URLS = 3;
+const MAX_MESSAGE_URL_CANDIDATES = 25;
+const DISCORD_MESSAGE_ATTACHMENT_BUDGET_BYTES = 24 * 1024 * 1024;
 
 export async function startDiscordBot({ config, store, monitor, downloadOne, registerCommands, downloadService = null }) {
   if (config.registerCommandsOnStart) {
@@ -98,7 +108,7 @@ export async function handleInteraction({ interaction, config, store, monitor, d
 
   if (command === 'download') {
     await interaction.deferReply({ ephemeral: true });
-    const url = interaction.options.getString('url', true);
+    const url = normalizeDownloadPostUrl(interaction.options.getString('url', true));
     const delivery = interaction.options.getString('delivery') ?? 'auto';
     const result = await downloadOne(url, {
       delivery,
@@ -107,7 +117,13 @@ export async function handleInteraction({ interaction, config, store, monitor, d
       guildId: interaction.guildId ?? '',
       channelId: interaction.channelId ?? '',
     });
-    await interaction.editReply(await buildDeliveryPayload(result, config, delivery));
+    const payload = await buildDeliveryPayload(result, config, delivery);
+    await sendDeliveryWithLinkFallback({
+      send: (candidate) => interaction.editReply(candidate),
+      payload,
+      result,
+      config,
+    });
     return;
   }
 
@@ -148,6 +164,66 @@ export async function handleInteraction({ interaction, config, store, monitor, d
       }));
       return;
     }
+    if (subcommand === 'failures') {
+      const usernameInput = interaction.options.getString('username') ?? '';
+      const username = usernameInput ? normalizeUsername(usernameInput) : '';
+      const failures = store.listMonitorDownloadFailuresForScope?.({
+        ...scope,
+        username,
+        limit: 10,
+      }) ?? [];
+      await interaction.reply(buildNoticePayload({
+        title: username ? `Monitor Failures for @${username}` : 'Monitor Failures',
+        description: formatMonitorFailureList(failures),
+        color: failures.length ? UI_COLORS.warning : UI_COLORS.info,
+      }));
+      return;
+    }
+    if (subcommand === 'retry') {
+      const videoId = String(interaction.options.getString('post_id', true) ?? '').trim();
+      const failure = store.getMonitorDownloadFailure?.(videoId) ?? null;
+      if (!failure || !store.hasWatchSubscription?.(failure.username, scope)) {
+        await interaction.reply(buildNoticePayload({
+          title: 'Monitor Failure Not Found',
+          description: 'That post is not awaiting retry for a TikTok watch in this server or DM.',
+          color: UI_COLORS.error,
+        }));
+        return;
+      }
+
+      await interaction.deferReply({ ephemeral: true });
+      const result = await monitor.retryFailedVideo(videoId);
+      if (!result?.accepted) {
+        await interaction.editReply(buildNoticePayload({
+          title: 'Retry Not Available',
+          description: result?.reason === 'not_retryable'
+            ? `Post ${videoId} is no longer dead-lettered or another retry is already running.`
+            : `Post ${videoId} could not be queued for retry.`,
+          color: UI_COLORS.warning,
+          ephemeral: false,
+        }));
+        return;
+      }
+
+      if (result.completed) {
+        await interaction.editReply(buildNoticePayload({
+          title: 'Monitor Retry Succeeded',
+          description: `Downloaded TikTok post ${videoId} for @${failure.username} and delivered its current watch alerts.`,
+          color: UI_COLORS.success,
+          ephemeral: false,
+        }));
+        return;
+      }
+
+      const retryError = result.error || result.failure?.last_error || 'The retry did not complete.';
+      await interaction.editReply(buildNoticePayload({
+        title: 'Monitor Retry Failed',
+        description: `TikTok post ${videoId} remains available in \`/watch failures\`.\n${truncateText(retryError, 500)}`,
+        color: UI_COLORS.error,
+        ephemeral: false,
+      }));
+      return;
+    }
     if (subcommand === 'run') {
       await interaction.deferReply({ ephemeral: true });
       const username = normalizeUsername(interaction.options.getString('username', true));
@@ -162,8 +238,75 @@ export async function handleInteraction({ interaction, config, store, monitor, d
       const result = await monitor.pollUsername(username, { force: true });
       await interaction.editReply(buildNoticePayload({
         title: 'Watch Check Complete',
-        description: `Checked @${username}: ${result.newVideos ?? 0} new video(s), ${result.skipped ?? 0} already seen.`,
+        description: `Checked TikTok @${username}: ${result.newVideos ?? 0} new post(s), ${result.skipped ?? 0} already seen.`,
         ephemeral: false,
+      }));
+      return;
+    }
+  }
+
+  if (command === 'profiles') {
+    const subcommand = interaction.options.getSubcommand();
+    if (subcommand !== 'show' && !canManageProfiles(interaction, config)) {
+      await interaction.reply(buildNoticePayload({
+        title: 'Permission Required',
+        description: 'Profile links are archive-wide, so only the configured bot owner can change them.',
+        color: UI_COLORS.error,
+      }));
+      return;
+    }
+
+    if (subcommand === 'link') {
+      const primary = parseSupportedProfileUrl(interaction.options.getString('primary', true));
+      const secondary = parseSupportedProfileUrl(interaction.options.getString('secondary', true));
+      if (profileReferenceKey(primary) === profileReferenceKey(secondary)) {
+        throw new Error('Choose two different platform profiles to link.');
+      }
+
+      const profiles = [primary, secondary].map((reference) => store.upsertPlatformProfile(
+        storedProfileFromReference(reference),
+      ));
+      const groupName = String(interaction.options.getString('name') ?? '').trim();
+      const mergeGroups = interaction.options.getBoolean?.('merge') === true;
+      const group = store.linkCreatorProfiles(profiles.map((profile) => profile.id), {
+        mergeGroups,
+        ...(groupName ? { groupName } : {}),
+      });
+      const members = group.members ?? store.listCreatorGroupMembers(group.id);
+      await interaction.reply(buildNoticePayload({
+        title: 'Profiles Linked',
+        description: formatCreatorGroup(group, members),
+        color: UI_COLORS.success,
+      }));
+      return;
+    }
+
+    const reference = parseSupportedProfileUrl(interaction.options.getString('profile', true));
+    const lookup = profileLookupFromReference(reference);
+    if (subcommand === 'show') {
+      const group = store.getCreatorGroupForProfile(lookup);
+      if (!group) {
+        await interaction.reply(buildNoticePayload({
+          title: 'Profile Not Linked',
+          description: `${formatPlatformProfile(reference)} is not linked to a creator group. Matching handles are never linked automatically.`,
+        }));
+        return;
+      }
+      await interaction.reply(buildNoticePayload({
+        title: 'Linked Profiles',
+        description: formatCreatorGroup(group, store.listCreatorGroupMembers(group.id)),
+      }));
+      return;
+    }
+
+    if (subcommand === 'unlink') {
+      const unlinked = store.unlinkProfile(lookup);
+      await interaction.reply(buildNoticePayload({
+        title: unlinked ? 'Profile Unlinked' : 'Profile Not Linked',
+        description: unlinked
+          ? `Removed ${formatPlatformProfile(reference)} from its creator group. Saved media and TikTok watches were not changed.`
+          : `${formatPlatformProfile(reference)} was not linked to a creator group.`,
+        color: unlinked ? UI_COLORS.success : UI_COLORS.info,
       }));
       return;
     }
@@ -200,14 +343,14 @@ export async function handleMessageCreate({ message, config, downloadOne }) {
     return true;
   }
 
-  const urls = extractTikTokUrls(message.content, 3);
+  const urls = extractDownloadPostUrls(message.content, MAX_MESSAGE_DOWNLOAD_URLS);
   if (!urls.length) return false;
 
   const status = await message.reply(buildNoticePayload({
     title: 'Downloading',
     description: urls.length === 1
-      ? 'Downloading TikTok link...'
-      : `Downloading ${urls.length} TikTok links...`,
+      ? 'Downloading media link...'
+      : `Downloading ${urls.length} media links...`,
     color: UI_COLORS.warning,
     ephemeral: false,
   }));
@@ -216,23 +359,33 @@ export async function handleMessageCreate({ message, config, downloadOne }) {
     try {
       const result = await downloadOne(url, {
         delivery: 'auto',
-      type: 'message',
-      requestedBy: message.author?.id ?? '',
-      guildId: message.guildId ?? '',
-      channelId: message.channelId ?? '',
+        type: 'message',
+        requestedBy: message.author?.id ?? '',
+        guildId: message.guildId ?? '',
+        channelId: message.channelId ?? '',
       });
       const payload = await buildDeliveryPayload(result, config, 'auto');
 
       if (urls.length === 1) {
-        await status.edit(payload);
+        await sendDeliveryWithLinkFallback({
+          send: (candidate) => status.edit(candidate),
+          payload,
+          result,
+          config,
+        });
       } else {
         await status.edit(buildNoticePayload({
           title: 'Downloading',
-          description: `Downloaded ${index + 1}/${urls.length} TikTok links.`,
+          description: `Downloaded ${index + 1}/${urls.length} media links.`,
           color: UI_COLORS.warning,
           ephemeral: false,
         }));
-        await message.reply(payload);
+        await sendDeliveryWithLinkFallback({
+          send: (candidate) => message.reply(candidate),
+          payload,
+          result,
+          config,
+        });
       }
     } catch (error) {
       const payload = buildErrorPayload({
@@ -249,6 +402,42 @@ export async function handleMessageCreate({ message, config, downloadOne }) {
   }
 
   return true;
+}
+
+export function normalizeDownloadPostUrl(value) {
+  return resolveDownloadSource(value).canonicalUrl;
+}
+
+export function parseSupportedProfileUrl(value) {
+  const reference = parseProfileReference(value);
+  if (!reference) {
+    throw new Error('A credential-free HTTPS TikTok, Instagram, or X profile URL is required.');
+  }
+  return reference;
+}
+
+export function extractDownloadPostUrls(value, limit = MAX_MESSAGE_DOWNLOAD_URLS) {
+  const maximum = Math.max(0, Math.min(
+    MAX_MESSAGE_URL_CANDIDATES,
+    Number.isFinite(Number(limit)) ? Math.floor(Number(limit)) : MAX_MESSAGE_DOWNLOAD_URLS,
+  ));
+  if (maximum === 0) return [];
+
+  const urls = [];
+  const seen = new Set();
+  for (const candidate of extractSupportedPlatformUrls(value, MAX_MESSAGE_URL_CANDIDATES)) {
+    let source;
+    try {
+      source = resolveDownloadSource(candidate);
+    } catch {
+      continue;
+    }
+    if (seen.has(source.canonicalUrl)) continue;
+    seen.add(source.canonicalUrl);
+    urls.push(source.canonicalUrl);
+    if (urls.length >= maximum) break;
+  }
+  return urls;
 }
 
 export function shouldIgnoreMessage(message) {
@@ -268,10 +457,21 @@ export function shouldShowHelp(message) {
   if (!content) return false;
 
   const normalized = content.toLowerCase();
-  const directHelp = ['help', 'commands', 'tiktok help', '!tiktok help', 'tt help', '!tt help'].includes(normalized);
+  const directHelp = [
+    'help',
+    'commands',
+    'media help',
+    '!media help',
+    'download help',
+    '!download help',
+    'tiktok help',
+    '!tiktok help',
+    'tt help',
+    '!tt help',
+  ].includes(normalized);
   const inGuild = message?.inGuild?.() ?? Boolean(message?.guildId);
   if (!inGuild) return directHelp;
-  if (/^!?(tiktok|tt)\s+help$/i.test(content)) return true;
+  if (/^!?(media|download|tiktok|tt)\s+help$/i.test(content)) return true;
 
   const botId = message?.client?.user?.id;
   if (!botId) return false;
@@ -281,18 +481,19 @@ export function shouldShowHelp(message) {
 
 export function buildHelpMessage() {
   return buildNoticePayload({
-    title: 'TikTok Downloader Help',
+    title: 'Media Downloader Help',
     description: [
-      'Post a TikTok URL in any channel I can read, or DM it to me, and I will download it.',
+      'Post a TikTok, Instagram, or X post URL in any channel I can read, or DM it to me, and I will save its media.',
       '',
       'Slash commands:',
-      '`/download url:<tiktok-url> delivery:auto|file|link`',
+      '`/download url:<post-url> delivery:auto|file|link`',
       '`/downloads list`',
       '`/downloads purge scope:mine confirm:PURGE`',
-      '`/watch add|remove|list|run`',
+      '`/profiles link|show|unlink` (explicit cross-platform creator links)',
+      '`/watch add|remove|list|run|failures|retry` (TikTok profiles only for now)',
       '`/status` and `/history`',
       '',
-      'Help keywords: `tiktok help`, `!tiktok help`, or DM me `help`.',
+      'Help keywords: `media help`, `download help`, or DM me `help`.',
     ].join('\n'),
     ephemeral: false,
   });
@@ -319,7 +520,7 @@ export async function handleDownloadsInteraction({ interaction, config, store })
   }
 
   if (subcommand === 'purge') {
-    const scope = interaction.options.getString('scope') ?? 'mine';
+    const scope = interaction.options.getString('scope') === 'all' ? 'all' : 'mine';
     const confirm = interaction.options.getString('confirm', true);
 
     if (confirm !== 'PURGE') {
@@ -330,10 +531,10 @@ export async function handleDownloadsInteraction({ interaction, config, store })
       return;
     }
 
-    if (scope === 'all' && !canPurgeAll(interaction)) {
+    if (scope === 'all' && !canPurgeAll(interaction, config)) {
       await interaction.reply(buildNoticePayload({
         title: 'Permission Required',
-        description: 'Only members with Manage Server can purge all downloads.',
+        description: 'Only the configured bot owner can purge downloads across the entire archive.',
         color: UI_COLORS.error,
       }));
       return;
@@ -342,7 +543,8 @@ export async function handleDownloadsInteraction({ interaction, config, store })
     await interaction.deferReply({ ephemeral: true });
     const requestedBy = scope === 'mine' ? interaction.user?.id ?? '' : '';
     const files = store.listPurgePlan?.({ requestedBy }) ?? store.listFilesForPurge({ requestedBy });
-    const removal = await removeStoredFiles(files, config);
+    const protectedPaths = protectedDownloadPaths(store, files, config);
+    const removal = await removeStoredFiles(files, config, { protectedPaths });
     for (const failure of removal.failed) {
       store.markFileDeletionFailed?.(failure.file.id, failure.error);
     }
@@ -381,14 +583,25 @@ export function isDiscordEntityTooLarge(error) {
     || /entity too large|payload too large|file uploaded exceeds/i.test(message);
 }
 
-export async function sendVideoAlert({ client, config, store, result, video, watch }) {
+async function sendDeliveryWithLinkFallback({ send, payload, result, config }) {
+  try {
+    return await send(payload);
+  } catch (error) {
+    if (!isDiscordEntityTooLarge(error) || !payload.files?.length) throw error;
+    console.warn(
+      `[discord] Manual attachment payload was too large for ${result?.videoId || 'unknown'}; sending link-only.`,
+    );
+    return send(await buildDeliveryPayload(result, config, 'link'));
+  }
+}
+
+export async function sendVideoAlert({ client, config, result, video, watch }) {
   const channelId = watch?.channel_id || config.discordChannelId;
   const channel = await client.channels.fetch(channelId);
-  const now = Date.now();
   const payload = await buildMonitorAlertPayload(result, config, {
     video,
     watch,
-    now,
+    now: Date.now(),
   });
   try {
     await channel.send(payload);
@@ -398,15 +611,6 @@ export async function sendVideoAlert({ client, config, store, result, video, wat
       `[discord] Attachment too large for ${video?.id || result?.videoId || 'unknown'} (${Number(result?.sizeBytes || 0)} bytes); sending link-only.`,
     );
     await channel.send({ ...payload, files: [] });
-  }
-  if (video?.id) {
-    store.markVideoSeen({
-      videoId: video.id,
-      username: watch?.username || video.username || result.username,
-      sourceUrl: video.url || result.sourceUrl,
-      title: video.title || result.title,
-      alertedAt: now,
-    });
   }
 }
 
@@ -449,7 +653,7 @@ export async function sendUsernameChangeAlert({ client, config, change, watch })
 export async function buildMonitorAlertPayload(result, config, { video = {}, watch = {}, now = Date.now() } = {}) {
   const username = watch?.username || result?.username || video?.username || video?.uploader || 'unknown';
   const sourceUrl = result?.sourceUrl || video?.sourceUrl || video?.url || video?.webpage_url || '';
-  const attachments = planAttachments(result, config);
+  const attachments = await planAttachments(result, config);
   const fields = [
     {
       name: 'Type',
@@ -500,16 +704,17 @@ export async function buildMonitorAlertPayload(result, config, { video = {}, wat
 }
 
 export async function buildDeliveryPayload(result, config, requestedDelivery = 'auto', options = {}) {
-  const canUpload = shouldUploadToDiscord(result.sizeBytes, config);
+  const canUpload = await canUploadResult(result, config);
   const wantsFile = requestedDelivery === 'file' || (requestedDelivery === 'auto' && canUpload && !result.reused);
   const attachments = wantsFile
-    ? planAttachments(result, config)
+    ? await planAttachments(result, config)
     : {
       kind: 'none',
       reason: result.reused ? 'reused-auto' : 'link-only',
       files: [],
       mode: 'link',
       imageCount: Number(result.imageCount ?? 0),
+      assetCount: contentMediaAssets(result).length,
     };
   const embed = buildStandardDownloadEmbed(result, config, {
     video: options.video,
@@ -567,7 +772,11 @@ export async function handleMonitorButton({ interaction, config, store }) {
   }
 
   const deletion = store.planDeliveryDeletion?.(token);
-  const removal = deletion?.file ? await removeStoredFiles([deletion.file], config) : { deleted: 0, failed: [] };
+  const removal = deletion?.file
+    ? await removeStoredFiles([deletion.file], config, {
+      protectedPaths: protectedDownloadPaths(store, [deletion.file], config),
+    })
+    : { deleted: 0, failed: [] };
   if (removal.failed.length) {
     for (const failure of removal.failed) {
       store.markFileDeletionFailed?.(failure.file.id, failure.error);
@@ -802,10 +1011,11 @@ export function buildDownloadsListEmbed(links, { config, total, page, pageSize, 
     const ordinal = page * pageSize + index + 1;
     const title = truncateText(link.title || link.filename || link.source_url || 'download', 90);
     const user = link.username ? `@${truncateText(link.username, 32)}` : '@unknown';
+    const platform = archivePlatformLabel(link.platform);
     const url = makePublicFileUrl(config, link.token) || 'PUBLIC_BASE_URL is not configured.';
     const postId = link.video_id ? `post: ${truncateText(link.video_id, 64)}` : '';
     return {
-      name: truncateText(`${ordinal}. ${user} - ${title}`, 256),
+      name: truncateText(`${ordinal}. [${platform}] ${user} - ${title}`, 256),
       value: truncateText([
         url,
         [
@@ -834,11 +1044,12 @@ export function buildLinkHistoryEmbed(history, { config, now = Date.now() }) {
   embed.addFields(...history.slice(0, 10).map((entry, index) => {
     const title = truncateText(entry.title || entry.filename || entry.source_url || 'download', 90);
     const user = entry.username ? `@${truncateText(entry.username, 32)}` : '@unknown';
+    const platform = archivePlatformLabel(entry.platform);
     const url = makePublicFileUrl(config, entry.token) || 'PUBLIC_BASE_URL is not configured.';
     const status = entry.job_status ? `job: ${entry.job_status}` : '';
     const postId = entry.video_id ? `post: ${truncateText(entry.video_id, 64)}` : '';
     return {
-      name: truncateText(`${index + 1}. ${user} - ${title}`, 256),
+      name: truncateText(`${index + 1}. [${platform}] ${user} - ${title}`, 256),
       value: truncateText([
         url,
         [
@@ -853,6 +1064,14 @@ export function buildLinkHistoryEmbed(history, { config, now = Date.now() }) {
   }));
 
   return embed;
+}
+
+function archivePlatformLabel(value) {
+  const platform = String(value || 'tiktok').toLowerCase();
+  if (platform === 'instagram') return 'Instagram';
+  if (platform === 'x' || platform === 'twitter') return 'X';
+  if (platform === 'tiktok') return 'TikTok';
+  return 'Unknown';
 }
 
 function makeDownloadsListCustomId({ userId, limit, page, username = '' }) {
@@ -878,7 +1097,7 @@ function parseDownloadsListCustomId(customId) {
 }
 
 export function buildVideoEmbed(result, video = {}) {
-  const title = result.title || video.title || `TikTok ${mediaLabel(result)}`;
+  const title = result.title || video.title || `Downloaded ${mediaLabel(result)}`;
   const sourceUrl = result.sourceUrl || video.url;
   const embed = new EmbedBuilder()
     .setColor(UI_COLORS.info)
@@ -921,6 +1140,12 @@ function buildStandardDownloadEmbed(result, config, { video = {}, attachmentPlan
       value: formatStandardSlideshowNote(plan),
       inline: true,
     });
+  } else if (contentMediaAssets(result).length > 1) {
+    fields.push({
+      name: 'Media',
+      value: formatMultiAssetNote(plan),
+      inline: true,
+    });
   }
 
   const embed = new EmbedBuilder()
@@ -952,14 +1177,14 @@ function buildMonitorActionRows(result, config = {}) {
     components.push(
       new ButtonBuilder()
         .setCustomId(`${MONITOR_BUTTON_PREFIX}delete:${result.token}`)
-        .setLabel('Delete post')
+        .setLabel('Delete saved copy')
         .setStyle(ButtonStyle.Danger),
     );
   }
   return components.length ? [new ActionRowBuilder().addComponents(...components)] : [];
 }
 
-function planAttachments(result, config = {}) {
+async function planAttachments(result, config = {}) {
   if (!result?.filePath) {
     return { kind: 'none', reason: 'no-file', files: [], mode: 'link', imageCount: Number(result?.imageCount ?? 0) };
   }
@@ -970,7 +1195,12 @@ function planAttachments(result, config = {}) {
       ? result.slideshowImagePaths.filter(Boolean).slice(0, 10)
       : [];
     const hasCompleteGallery = imagePaths.length > 0 && (!imageCount || imagePaths.length >= imageCount);
-    if (imageCount <= 10 && hasCompleteGallery) {
+    const galleryAssets = attachmentAssetsForPaths(imagePaths, contentMediaAssets(result));
+    if (
+      imageCount <= 10
+      && hasCompleteGallery
+      && await attachmentSetFitsDiscord(galleryAssets, config)
+    ) {
       return {
         kind: 'gallery',
         files: imagePaths.map((filePath) => new AttachmentBuilder(filePath, { name: path.basename(filePath) })),
@@ -978,7 +1208,7 @@ function planAttachments(result, config = {}) {
         mode: 'gallery',
       };
     }
-    if (shouldUploadToDiscord(result.sizeBytes, config)) {
+    if (singleAttachmentFitsDiscord(result.sizeBytes, config)) {
       return {
         kind: 'upload',
         as: 'zip',
@@ -991,7 +1221,47 @@ function planAttachments(result, config = {}) {
     return { kind: 'none', reason: 'oversize', files: [], imageCount, mode: 'link' };
   }
 
-  if (!shouldUploadToDiscord(result.sizeBytes, config)) {
+  const assets = contentMediaAssets(result);
+  if (assets.length) {
+    const expectedCount = Math.max(assets.length, Number(result.assetCount ?? 0));
+    const complete = expectedCount === assets.length;
+    const uploadable = await attachmentSetFitsDiscord(assets, config, {
+      singleFallbackSize: result.sizeBytes,
+    });
+    if (complete && assets.length <= 10 && uploadable) {
+      return {
+        kind: assets.length > 1 ? 'gallery' : 'upload',
+        as: assets.length > 1 ? 'assets' : (assets[0].kind || 'media'),
+        files: assets.map((asset) => new AttachmentBuilder(asset.path, {
+          name: asset.filename || path.basename(asset.path),
+        })),
+        mode: assets.length > 1 ? 'gallery' : 'media',
+        assetCount: assets.length,
+        imageCount: assets.filter((asset) => asset.kind === 'image').length,
+      };
+    }
+    if (singleAttachmentFitsDiscord(result.sizeBytes, config)) {
+      return {
+        kind: 'upload',
+        as: 'zip',
+        why: assets.length > 10 ? 'over-10' : !complete ? 'incomplete-assets' : 'oversize-assets',
+        files: [new AttachmentBuilder(result.filePath, { name: result.filename || path.basename(result.filePath) })],
+        mode: 'zip',
+        assetCount: expectedCount,
+        imageCount: assets.filter((asset) => asset.kind === 'image').length,
+      };
+    }
+    return {
+      kind: 'none',
+      reason: assets.length > 10 ? 'over-10' : 'oversize',
+      files: [],
+      mode: 'link',
+      assetCount: expectedCount,
+      imageCount: assets.filter((asset) => asset.kind === 'image').length,
+    };
+  }
+
+  if (!singleAttachmentFitsDiscord(result.sizeBytes, config)) {
     return { kind: 'none', reason: 'oversize', files: [], mode: 'link', imageCount: 0 };
   }
   return {
@@ -1001,6 +1271,88 @@ function planAttachments(result, config = {}) {
     mode: 'video',
     imageCount: 0,
   };
+}
+
+function contentMediaAssets(result = {}) {
+  if (!Array.isArray(result.assets)) return [];
+  return result.assets
+    .filter((asset) => asset?.path && (!asset.role || asset.role === 'content'))
+    .slice()
+    .sort((left, right) => Number(left.position ?? 0) - Number(right.position ?? 0));
+}
+
+async function canUploadResult(result, config) {
+  const assets = contentMediaAssets(result);
+  if (assets.length && assets.length <= 10) {
+    const expectedCount = Math.max(assets.length, Number(result.assetCount ?? 0));
+    if (
+      expectedCount === assets.length
+      && await attachmentSetFitsDiscord(assets, config, { singleFallbackSize: result.sizeBytes })
+    ) {
+      return true;
+    }
+  }
+  if (result?.mediaType === 'slideshow') {
+    const imageCount = Number(result.imageCount ?? 0);
+    const imagePaths = Array.isArray(result.slideshowImagePaths)
+      ? result.slideshowImagePaths.filter(Boolean).slice(0, 10)
+      : [];
+    const hasCompleteGallery = imagePaths.length > 0 && (!imageCount || imagePaths.length >= imageCount);
+    if (
+      imageCount <= 10
+      && hasCompleteGallery
+      && await attachmentSetFitsDiscord(
+        attachmentAssetsForPaths(imagePaths, assets),
+        config,
+      )
+    ) {
+      return true;
+    }
+  }
+  return singleAttachmentFitsDiscord(result.sizeBytes, config);
+}
+
+function attachmentAssetsForPaths(paths, assets) {
+  const byPath = new Map(assets.map((asset) => [path.resolve(asset.path), asset]));
+  return paths.map((filePath) => ({
+    ...byPath.get(path.resolve(filePath)),
+    path: filePath,
+  }));
+}
+
+async function attachmentSetFitsDiscord(assets, config, { singleFallbackSize = 0 } = {}) {
+  if (!assets.length) return false;
+  let totalBytes = 0;
+  for (const asset of assets) {
+    let sizeBytes = Number(asset?.sizeBytes || 0);
+    if (!(sizeBytes > 0) && assets.length === 1) {
+      sizeBytes = Number(singleFallbackSize || 0);
+    }
+    if (!(sizeBytes > 0)) {
+      try {
+        const fileStats = await stat(asset.path);
+        if (!fileStats.isFile()) return false;
+        sizeBytes = fileStats.size;
+      } catch {
+        return false;
+      }
+    }
+    if (!shouldUploadToDiscord(sizeBytes, config)) return false;
+    totalBytes += sizeBytes;
+    if (totalBytes > discordMessageAttachmentBudget(config)) return false;
+  }
+  return true;
+}
+
+function singleAttachmentFitsDiscord(sizeBytes, config) {
+  return shouldUploadToDiscord(sizeBytes, config)
+    && Number(sizeBytes) <= discordMessageAttachmentBudget(config);
+}
+
+function discordMessageAttachmentBudget(config = {}) {
+  const configuredLimit = Number(config.discordUploadLimitBytes || 0);
+  if (!(configuredLimit > 0)) return 0;
+  return Math.min(configuredLimit, DISCORD_MESSAGE_ATTACHMENT_BUDGET_BYTES);
 }
 
 function formatSlideshowAlertNote(plan) {
@@ -1025,6 +1377,13 @@ function formatStandardSlideshowNote(plan) {
   }
   if (plan?.kind === 'none') return imageCount > 10 ? `Link (${imageCount} images)` : 'Link';
   return 'ZIP';
+}
+
+function formatMultiAssetNote(plan) {
+  const assetCount = Number(plan?.assetCount ?? 0);
+  if (plan?.kind === 'gallery') return `${assetCount} files attached`;
+  if (plan?.kind === 'upload' && plan.as === 'zip') return `ZIP (${assetCount} files)`;
+  return `Link (${assetCount} files)`;
 }
 
 function buildStandardDownloadTitle(username, result, video, now) {
@@ -1057,7 +1416,14 @@ function resolveUploadTimestampMs(result = {}, video = {}) {
     if (parsed) return parsed;
   }
 
-  for (const value of [result.created_at, video.created_at, result.uploadDate, video.uploadDate]) {
+  for (const value of [
+    result.publishedAt,
+    video.publishedAt,
+    result.created_at,
+    video.created_at,
+    result.uploadDate,
+    video.uploadDate,
+  ]) {
     const parsed = Date.parse(String(value ?? ''));
     if (Number.isFinite(parsed)) return parsed;
   }
@@ -1123,6 +1489,12 @@ export function canManageWatches(interaction, config = {}) {
   if (interaction.memberPermissions?.has?.(PermissionFlagsBits.ManageGuild)) return true;
   const roleId = String(config.watchManagerRoleId ?? '');
   return Boolean(roleId && interaction.member?.roles?.cache?.has?.(roleId));
+}
+
+function canManageProfiles(interaction, config = {}) {
+  const userId = String(interaction?.user?.id ?? '');
+  const ownerId = String(config.discordOwnerId ?? '');
+  return Boolean(userId && ownerId && userId === ownerId);
 }
 
 function canManageLink(record, interaction, config = {}) {
@@ -1251,6 +1623,78 @@ function formatWatchList(watches) {
   }).join('\n');
 }
 
+function formatMonitorFailureList(failures) {
+  if (!failures.length) return 'No monitored TikTok posts are awaiting manual retry in this server or DM.';
+  const rows = failures.map((failure, index) => {
+    const state = failure.status === 'retrying' ? 'retry running' : 'dead-lettered';
+    const error = truncateText(failure.last_error || 'Unknown extractor failure', 180);
+    return [
+      `${index + 1}. @${failure.username} — post \`${failure.video_id}\``,
+      `${state} after ${Number(failure.failure_count ?? 0)} failure(s), updated ${formatDate(failure.updated_at)}`,
+      error,
+    ].join('\n');
+  });
+  return `${rows.join('\n\n')}\n\nRetry with \`/watch retry post_id:<id>\`.`;
+}
+
+function storedProfileFromReference(reference) {
+  return {
+    platform: reference.platform,
+    remoteId: reference.remoteId,
+    handle: reference.handle,
+    profileUrl: reference.canonicalUrl,
+  };
+}
+
+function profileLookupFromReference(reference) {
+  return {
+    platform: reference.platform,
+    remoteId: reference.remoteId,
+    handle: reference.handle,
+  };
+}
+
+function formatCreatorGroup(group, members = []) {
+  const label = group?.name
+    ? `Creator: ${formatInlineCode(group.name)}`
+    : `Creator group #${Number(group?.id) || 'unknown'}`;
+  const profiles = members.length
+    ? members.map((profile) => `• ${formatPlatformProfile(profile)}`)
+    : ['• No profiles linked.'];
+  return [
+    label,
+    `Group ID: ${formatInlineCode(Number(group?.id) || 'unknown')}`,
+    '',
+    'Profiles:',
+    ...profiles,
+  ].join('\n');
+}
+
+function formatPlatformProfile(profile = {}) {
+  const platform = String(profile.platform ?? '').toLowerCase();
+  const displayPlatform = platform === 'x'
+    ? 'X'
+    : platform === 'instagram' ? 'Instagram' : 'TikTok';
+  const handle = String(profile.handle ?? '').replace(/^@/, '') || 'unknown';
+  const url = String(profile.profile_url ?? profile.canonicalUrl ?? '');
+  return `${displayPlatform} ${formatInlineCode(`@${handle}`)}${url ? ` — <${url}>` : ''}`;
+}
+
+function formatInlineCode(value) {
+  return `\`${String(value ?? '').replace(/[`\r\n]/g, "'")}\``;
+}
+
+function protectedDownloadPaths(store, files, config = {}) {
+  const fileIds = (Array.isArray(files) ? files : [])
+    .map((file) => Number(file?.id))
+    .filter((fileId) => Number.isInteger(fileId) && fileId > 0);
+  return new Set((store.listFilePathsReferencedOutside?.(fileIds) ?? []).map((filePath) => {
+    return path.isAbsolute(String(filePath ?? ''))
+      ? path.resolve(String(filePath))
+      : path.resolve(config.downloadDir, String(filePath ?? ''));
+  }));
+}
+
 function formatPurgeResult({ scope, counts, removal }) {
   const target = scope === 'all' ? 'all downloads' : 'your downloads';
   const failed = removal.failed.length
@@ -1259,8 +1703,10 @@ function formatPurgeResult({ scope, counts, removal }) {
   return `Purged ${target}: ${counts.files} file record(s), ${counts.links} link(s), ${counts.jobs} job(s). Removed ${removal.deleted} file(s) from disk.${failed}`;
 }
 
-function canPurgeAll(interaction) {
-  return Boolean(interaction.memberPermissions?.has?.(PermissionFlagsBits.ManageGuild));
+function canPurgeAll(interaction, config = {}) {
+  const userId = String(interaction?.user?.id ?? '');
+  const ownerId = String(config.discordOwnerId ?? '');
+  return Boolean(userId && ownerId && userId === ownerId);
 }
 
 function buildStatusEmbed(stats, monitorStatus, downloadStatus = null) {
@@ -1271,12 +1717,13 @@ function buildStatusEmbed(stats, monitorStatus, downloadStatus = null) {
   const downloadConcurrency = downloadStatus?.concurrency ?? monitorStatus.downloadConcurrency ?? 1;
   return new EmbedBuilder()
     .setColor(UI_COLORS.success)
-    .setTitle('TikTok downloader status')
+    .setTitle('Media downloader status')
     .addFields(
-      { name: 'Watched users', value: String(stats.watchCount), inline: true },
-      { name: 'Seen videos', value: String(stats.videoCount), inline: true },
+      { name: 'TikTok watches', value: String(stats.watchCount), inline: true },
+      { name: 'Seen TikTok posts', value: String(stats.videoCount), inline: true },
       { name: 'Files', value: String(stats.fileCount), inline: true },
-      { name: 'Monitor', value: monitorStatus.running ? 'running' : 'stopped', inline: true },
+      { name: 'DB schema', value: `v${stats.schemaVersion ?? 0}`, inline: true },
+      { name: 'TikTok monitor', value: monitorStatus.running ? 'running' : 'stopped', inline: true },
       { name: 'Last poll', value: monitorStatus.lastPollAt ? new Date(monitorStatus.lastPollAt).toISOString() : 'never', inline: true },
       { name: 'Interval', value: formatDurationMs(monitorStatus.pollIntervalMs), inline: true },
       { name: 'Scan window', value: `${monitorStatus.scanLimit ?? 5} / ${monitorStatus.burstScanLimit ?? 20} burst`, inline: true },
@@ -1284,6 +1731,7 @@ function buildStatusEmbed(stats, monitorStatus, downloadStatus = null) {
       { name: 'Download workers', value: String(downloadConcurrency), inline: true },
       { name: 'Download queue', value: `${activeDownloads} active / ${queuedDownloads} queued`, inline: true },
       { name: 'Deletion workers', value: `${monitorStatus.activeDeletionChecks ?? 0} active / ${monitorStatus.deletionQueueLength ?? 0} queued`, inline: true },
+      { name: 'Monitor dead letters', value: String(stats.deadLetterCount ?? 0), inline: true },
       { name: 'Download totals', value: `${metrics.totalCompletedDownloads ?? 0} ok / ${metrics.totalDownloadFailures ?? 0} failed`, inline: true },
       { name: 'Last cycle', value: formatMonitorCycle(metrics, lastSummary), inline: false },
     )
@@ -1328,8 +1776,8 @@ function mediaLabel(result = {}, fallback = {}) {
 
 function alertReadyText(result) {
   return result.reused
-    ? `New TikTok ${mediaLabel(result)} delivered from cache.`
-    : `New TikTok ${mediaLabel(result)} downloaded.`;
+    ? `Saved ${mediaLabel(result)} delivered from cache.`
+    : `New ${mediaLabel(result)} downloaded.`;
 }
 
 function downloadLinkTtlMs(config = {}) {

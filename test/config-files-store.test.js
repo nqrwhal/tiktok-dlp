@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { access, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { DatabaseSync } from 'node:sqlite';
 import os from 'node:os';
 import path from 'node:path';
@@ -17,7 +17,7 @@ import {
 import { createStore } from '../src/state/store.js';
 import { buildDeliveryPayload, canManageWatches, handleLinkButton, shouldIgnoreMessage, shouldShowHelp } from '../src/discord/client.js';
 import { buildNoticePayload, truncateText } from '../src/discord/ui.js';
-import { cleanupExpiredDownloads } from '../src/cleanup/downloads.js';
+import { cleanupExpiredDownloads, removeStoredFiles } from '../src/cleanup/downloads.js';
 
 test('loadEnvFile reads simple env files without overriding existing values', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-env-'));
@@ -31,6 +31,17 @@ test('loadEnvFile reads simple env files without overriding existing values', as
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('Docker build context excludes local secrets, sessions, and runtime data', async () => {
+  const entries = new Set((await readFile(path.resolve(import.meta.dirname, '..', '.dockerignore'), 'utf8'))
+    .split(/\r?\n/)
+    .map((entry) => entry.trim().replace(/\/$/, ''))
+    .filter(Boolean));
+  assert.equal(entries.has('.env'), true);
+  assert.equal(entries.has('.secrets'), true);
+  assert.equal(entries.has('cookies'), true);
+  assert.equal(entries.has('data'), true);
 });
 
 test('loadConfig resolves paths and upload limits', () => {
@@ -268,6 +279,182 @@ test('cleanup never removes a shared path while another asset row has an active 
   }
 });
 
+test('multi-asset cleanup removes explicitly recorded content paths with the delivery package', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'media-multi-asset-cleanup-'));
+  const packagePath = path.join(dir, 'instagram', 'post.zip');
+  const imagePath = path.join(dir, 'instagram', 'content', 'first.jpg');
+  const videoPath = path.join(dir, 'instagram', 'content', 'second.mp4');
+  try {
+    await mkdir(path.dirname(packagePath), { recursive: true });
+    await mkdir(path.dirname(imagePath), { recursive: true });
+    await writeFile(packagePath, 'package');
+    await writeFile(imagePath, 'image');
+    await writeFile(videoPath, 'video');
+
+    const result = await removeStoredFiles([{
+      id: 1,
+      path: packagePath,
+      video_id: 'AbC',
+      asset_paths_json: JSON.stringify([imagePath, videoPath]),
+    }], { downloadDir: dir });
+
+    assert.equal(result.failed.length, 0);
+    assert.equal(result.deleted, 3);
+    await assert.rejects(access(packagePath), { code: 'ENOENT' });
+    await assert.rejects(access(imagePath), { code: 'ENOENT' });
+    await assert.rejects(access(videoPath), { code: 'ENOENT' });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('multi-asset cleanup preserves a shared package while removing unshared content assets', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'media-shared-package-cleanup-'));
+  const packagePath = path.join(dir, 'instagram', 'post.zip');
+  const contentPath = path.join(dir, 'instagram', 'first.jpg');
+  try {
+    await mkdir(path.dirname(packagePath), { recursive: true });
+    await writeFile(packagePath, 'shared package');
+    await writeFile(contentPath, 'unshared content');
+
+    const result = await removeStoredFiles([{
+      id: 1,
+      path: packagePath,
+      video_id: 'AbC',
+      asset_paths: [contentPath, packagePath],
+    }], { downloadDir: dir }, { protectedPaths: new Set([packagePath]) });
+
+    assert.equal(result.failed.length, 0);
+    assert.equal(result.deleted, 1);
+    assert.equal((await readFile(packagePath)).toString(), 'shared package');
+    await assert.rejects(access(contentPath), { code: 'ENOENT' });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('expired cleanup loads recorded media assets from SQLite before deleting a multi-asset post', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'media-multi-asset-store-cleanup-'));
+  const store = createStore(path.join(dir, 'state.db'));
+  const packagePath = path.join(dir, 'downloads', 'x', 'post.zip');
+  const contentPath = path.join(dir, 'downloads', 'x', 'content-with-unrelated-name.jpg');
+  try {
+    await mkdir(path.dirname(packagePath), { recursive: true });
+    await writeFile(packagePath, 'package');
+    await writeFile(contentPath, 'content');
+    const fileId = store.createFileRecord({
+      platform: 'x',
+      videoId: '123',
+      sourceUrl: 'https://x.com/creator/status/123',
+      filePath: packagePath,
+      filename: 'post.zip',
+      sizeBytes: 7,
+    }, 1);
+    store.recordMediaDownload({
+      platform: 'x',
+      remoteId: '123',
+      fileId,
+      filePath: packagePath,
+      filename: 'post.zip',
+      sizeBytes: 7,
+      assets: [{ path: contentPath, filename: path.basename(contentPath), kind: 'image', sizeBytes: 7 }],
+    }, 1);
+    store.createLinkToken({ token: 'expired-multi', fileId, expiresAt: 10 }, 1);
+
+    const result = await cleanupExpiredDownloads({
+      config: { downloadDir: path.join(dir, 'downloads') },
+      store,
+      now: 100,
+      log: { warn() {} },
+    });
+
+    assert.equal(result.files, 1);
+    assert.equal(result.deleted, 2);
+    assert.equal(store.getLatestFileByPost('x', '123'), null);
+    assert.equal(store.getMediaPost('x', '123'), null);
+    assert.deepEqual(store.listMediaAssetsForFile(fileId), []);
+    await assert.rejects(access(packagePath), { code: 'ENOENT' });
+    await assert.rejects(access(contentPath), { code: 'ENOENT' });
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('media post metadata survives one file deletion and is pruned with its final asset', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'media-post-pruning-'));
+  const store = createStore(path.join(dir, 'state.db'));
+  try {
+    const createMediaFile = (filename, now) => {
+      const filePath = path.join(dir, filename);
+      const fileId = store.createFileRecord({
+        platform: 'x',
+        videoId: 'shared-post',
+        sourceUrl: 'https://x.com/creator/status/shared-post',
+        filePath,
+        filename,
+        sizeBytes: 1,
+      }, now);
+      store.recordMediaDownload({
+        platform: 'x',
+        remoteId: 'shared-post',
+        fileId,
+        filePath,
+        filename,
+        sizeBytes: 1,
+        assets: [{ path: filePath, filename, kind: 'image', sizeBytes: 1 }],
+      }, now);
+      return fileId;
+    };
+    const firstId = createMediaFile('first.jpg', 1000);
+    const secondId = createMediaFile('second.jpg', 1100);
+
+    assert.equal(store.deleteFileRecords([firstId]), 1);
+    assert.ok(store.getMediaPost('x', 'shared-post'));
+    assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM media_assets').get().count, 1);
+
+    assert.deepEqual(store.listPurgePlan({ now: 2000 }).map((file) => file.id), [secondId]);
+    assert.deepEqual(store.purgeDownloads({ removeFileIds: [secondId], now: 2000 }), {
+      files: 1,
+      links: 0,
+      jobs: 0,
+    });
+    assert.equal(store.getMediaPost('x', 'shared-post'), null);
+    assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM media_assets').get().count, 0);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('file and media persistence rolls back together when their identities disagree', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'media-atomic-persistence-'));
+  const store = createStore(path.join(dir, 'state.db'));
+  try {
+    assert.throws(() => store.createFileWithMedia({
+      file: {
+        platform: 'x',
+        videoId: '123',
+        sourceUrl: 'https://x.com/creator/status/123',
+        filePath: path.join(dir, '123.mp4'),
+        filename: '123.mp4',
+        sizeBytes: 5,
+      },
+      media: {
+        platform: 'instagram',
+        remoteId: '123',
+      },
+    }, 1_000), /identity must match/i);
+
+    assert.equal(store.stats().fileCount, 0);
+    assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM media_posts').get().count, 0);
+    assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM media_assets').get().count, 0);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('cleanup gives newly materialized unlinked files time to receive a delivery token', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-orphan-grace-'));
   const store = createStore(path.join(dir, 'state.db'));
@@ -323,6 +510,111 @@ test('cleanup records failed disk deletions as retryable trash state', async () 
     state = store.db.prepare('SELECT delete_requested_at, delete_error FROM files WHERE id = ?').get(fileId);
     assert.equal(state.delete_requested_at, null);
     assert.equal(state.delete_error, null);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('an expiry claim blocks delivery revival until the claimed deletion fails', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'retention-claim-revival-'));
+  const dbPath = path.join(dir, 'state.db');
+  const cleanupStore = createStore(dbPath);
+  const deliveryStore = createStore(dbPath);
+  try {
+    const fileId = cleanupStore.createFileRecord({
+      videoId: 'claimed',
+      sourceUrl: 'https://example.test/claimed',
+      filePath: path.join(dir, 'claimed.mp4'),
+      filename: 'claimed.mp4',
+      sizeBytes: 1,
+    }, 1000);
+    cleanupStore.createLinkToken({ token: 'expired-claim', fileId, expiresAt: 2000 }, 1000);
+
+    const [claimed] = cleanupStore.claimFilesForDeletion(3000, 1, 3000);
+    assert.equal(claimed.id, fileId);
+    assert.equal(claimed.retention_status, 'expiry_claimed');
+    assert.throws(
+      () => deliveryStore.createLinkToken({ token: 'racing-link', fileId, expiresAt: 0 }, 3100),
+      /claimed for deletion/i,
+    );
+    assert.equal(deliveryStore.extendLinkToken('expired-claim', 10_000, 3100), null);
+    assert.equal(deliveryStore.setLinkTokenPermanent('expired-claim'), null);
+    assert.equal(deliveryStore.trashFile(fileId, 3100), null);
+
+    assert.equal(cleanupStore.markFileDeletionFailed(fileId, new Error('disk busy'), 3200, {
+      expectedRetentionStatus: 'expiry_claimed',
+      expectedRequestedAt: 3000,
+    }), true);
+    deliveryStore.createLinkToken({ token: 'revived-after-failure', fileId, expiresAt: 0 }, 3300);
+    const revived = cleanupStore.db.prepare(`
+      SELECT retention_status, delete_requested_at, delete_error FROM files WHERE id = ?
+    `).get(fileId);
+    assert.equal(revived.retention_status, 'active');
+    assert.equal(revived.delete_requested_at, null);
+    assert.equal(revived.delete_error, null);
+  } finally {
+    deliveryStore.close();
+    cleanupStore.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('claimed cleanup and purge finalizers never cascade a newer active delivery', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'retention-finalize-race-'));
+  const store = createStore(path.join(dir, 'state.db'));
+  try {
+    const expiryId = store.createFileRecord({
+      videoId: 'expiry-race',
+      sourceUrl: 'https://example.test/expiry-race',
+      filePath: path.join(dir, 'expiry-race.mp4'),
+      filename: 'expiry-race.mp4',
+      sizeBytes: 1,
+    }, 1000);
+    assert.equal(store.claimFilesForDeletion(3000, 1, 3000)[0].id, expiryId);
+    store.db.prepare(`
+      INSERT INTO link_tokens (token, file_id, owner_id, scope_id, delivery_type, expires_at, created_at)
+      VALUES ('new-active-expiry', ?, 'user-1', '', 'manual', 0, 3100)
+    `).run(expiryId);
+    assert.equal(store.deleteFileRecords([expiryId], {
+      requiredRetentionStatus: 'expiry_claimed',
+      claimRequestedAt: 3000,
+      requireNoActiveLinks: true,
+      now: 3200,
+    }), 0);
+    assert.ok(store.getToken('new-active-expiry'));
+    assert.ok(store.db.prepare('SELECT 1 FROM files WHERE id = ?').get(expiryId));
+
+    const purgeId = store.createFileRecord({
+      videoId: 'purge-race',
+      requestedBy: 'user-1',
+      sourceUrl: 'https://example.test/purge-race',
+      filePath: path.join(dir, 'purge-race.mp4'),
+      filename: 'purge-race.mp4',
+      sizeBytes: 1,
+    }, 1000);
+    store.createLinkToken({ token: 'purge-original', fileId: purgeId, ownerId: 'user-1', expiresAt: 0 }, 1000);
+    assert.deepEqual(store.listPurgePlan({ requestedBy: 'user-1', now: 4000 }).map((file) => file.id), [purgeId]);
+    assert.throws(
+      () => store.createLinkToken({ token: 'purge-supported-race', fileId: purgeId, expiresAt: 0 }, 4100),
+      /claimed for deletion/i,
+    );
+    store.db.prepare(`
+      INSERT INTO link_tokens (token, file_id, owner_id, scope_id, delivery_type, expires_at, created_at)
+      VALUES ('purge-newer', ?, 'user-1', '', 'manual', 0, 4100)
+    `).run(purgeId);
+
+    assert.deepEqual(store.purgeDownloads({
+      requestedBy: 'user-1',
+      removeFileIds: [purgeId],
+      now: 4200,
+    }), { files: 0, links: 1, jobs: 0 });
+    assert.ok(store.getToken('purge-newer'));
+    assert.equal(store.getToken('purge-original'), null);
+    assert.equal(
+      store.db.prepare('SELECT retention_status FROM files WHERE id = ?').get(purgeId).retention_status,
+      'expiry_failed',
+    );
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -496,6 +788,111 @@ test('trash cleanup preserves shared bytes and sidecars referenced by an active 
   }
 });
 
+test('trash cleanup purges a multi-platform package and ordered assets while preserving shared media', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'media-trash-retention-'));
+  const downloadDir = path.join(dir, 'downloads');
+  const store = createStore(path.join(dir, 'state.db'));
+  const day = 24 * 60 * 60 * 1000;
+  const now = 100 * day;
+  try {
+    const packagePath = path.join(downloadDir, 'instagram', 'carousel.zip');
+    const uniquePath = path.join(downloadDir, 'instagram', 'carousel__001.jpg');
+    const sharedPath = path.join(downloadDir, 'shared', 'cross-post.jpg');
+    const activePath = path.join(downloadDir, 'x', 'active.zip');
+    await Promise.all([
+      mkdir(path.dirname(packagePath), { recursive: true }),
+      mkdir(path.dirname(sharedPath), { recursive: true }),
+      mkdir(path.dirname(activePath), { recursive: true }),
+    ]);
+    await Promise.all([
+      writeFile(packagePath, 'instagram package'),
+      writeFile(uniquePath, 'unique image'),
+      writeFile(sharedPath, 'shared image'),
+      writeFile(activePath, 'active package'),
+    ]);
+
+    const { fileId: trashedId } = store.createFileWithMedia({
+      file: {
+        platform: 'instagram',
+        videoId: 'carousel',
+        username: 'creator',
+        sourceUrl: 'https://www.instagram.com/p/carousel/',
+        filePath: packagePath,
+        filename: 'carousel.zip',
+        sizeBytes: 17,
+      },
+      media: {
+        platform: 'instagram',
+        remoteId: 'carousel',
+        mediaType: 'gallery',
+        filePath: packagePath,
+        filename: 'carousel.zip',
+        sizeBytes: 17,
+        assets: [
+          { position: 1, path: uniquePath, filename: 'carousel__001.jpg', kind: 'image', sizeBytes: 12 },
+          { position: 2, path: sharedPath, filename: 'cross-post.jpg', kind: 'image', sizeBytes: 12 },
+        ],
+      },
+    }, now - 50 * day);
+    const { fileId: activeId } = store.createFileWithMedia({
+      file: {
+        platform: 'x',
+        videoId: 'active',
+        username: 'creator',
+        sourceUrl: 'https://x.com/creator/status/active',
+        filePath: activePath,
+        filename: 'active.zip',
+        sizeBytes: 14,
+      },
+      media: {
+        platform: 'x',
+        remoteId: 'active',
+        mediaType: 'image',
+        filePath: activePath,
+        filename: 'active.zip',
+        sizeBytes: 14,
+        assets: [
+          { position: 1, path: sharedPath, filename: 'cross-post.jpg', kind: 'image', sizeBytes: 12 },
+        ],
+      },
+    }, now - 10 * day);
+    store.createLinkToken({ token: 'instagram-permanent', fileId: trashedId, expiresAt: 0 }, now - 50 * day);
+    store.createLinkToken({ token: 'x-permanent', fileId: activeId, expiresAt: 0 }, now - 10 * day);
+    assert.equal(store.setMediaFileBookmark(trashedId, true, now - 45 * day), true);
+    assert.equal(store.trashMediaFile(trashedId, now - 40 * day)?.platform, 'instagram');
+    assert.equal(store.getTrashedFile(trashedId), null);
+    assert.deepEqual(store.listTrashedFiles(), []);
+
+    const result = await cleanupExpiredDownloads({
+      config: { downloadDir, archiveTrashRetentionDays: 30 },
+      store,
+      now,
+      log: { warn() {} },
+    });
+
+    assert.equal(result.trashFiles, 1);
+    assert.equal(result.trashDeleted, 2);
+    await assert.rejects(access(packagePath), { code: 'ENOENT' });
+    await assert.rejects(access(uniquePath), { code: 'ENOENT' });
+    await access(sharedPath);
+    await access(activePath);
+    assert.equal(store.getTrashedMediaFile(trashedId), null);
+    assert.equal(store.getMediaPost('instagram', 'carousel'), null);
+    assert.deepEqual(store.listMediaAssetsForFile(trashedId), []);
+    assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM bookmarks WHERE file_id = ?').get(trashedId).count, 0);
+    assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM link_tokens WHERE file_id = ?').get(trashedId).count, 0);
+    assert.equal(store.getLatestFileByPost('x', 'active')?.id, activeId);
+    assert.equal(store.getMediaPost('x', 'active')?.platform, 'x');
+    assert.deepEqual(
+      store.listMediaAssetsForFile(activeId).filter((asset) => asset.role === 'content').map((asset) => asset.path),
+      [sharedPath],
+    );
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('store migrates older databases before creating indexes for new columns', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-migration-'));
   const dbPath = path.join(dir, 'state.db');
@@ -575,6 +972,8 @@ test('store migrates older databases before creating indexes for new columns', a
     const importColumns = store.db.prepare('PRAGMA table_info(creator_imports)').all().map((column) => column.name);
     const importItemColumns = store.db.prepare('PRAGMA table_info(creator_import_items)').all().map((column) => column.name);
     const bookmarkColumns = store.db.prepare('PRAGMA table_info(bookmarks)').all().map((column) => column.name);
+    const alertDeliveryColumns = store.db.prepare('PRAGMA table_info(alert_deliveries)').all().map((column) => column.name);
+    const migrationColumns = store.db.prepare('PRAGMA table_info(schema_migrations)').all().map((column) => column.name);
     const indexes = store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all().map((index) => index.name);
     assert.ok(watchColumns.includes('creator_id'));
     assert.ok(watchColumns.includes('has_story'));
@@ -588,8 +987,13 @@ test('store migrates older databases before creating indexes for new columns', a
     assert.ok(linkColumns.includes('owner_id'));
     assert.ok(linkColumns.includes('job_id'));
     assert.ok(indexes.includes('idx_link_tokens_file_id_expires_at'));
+    assert.ok(indexes.includes('idx_link_tokens_monitor_file_scope_created_at'));
     assert.ok(indexes.includes('idx_jobs_file_id'));
     assert.ok(indexes.includes('idx_files_trashed_at'));
+    assert.ok(indexes.includes('idx_files_rewind_active_created'));
+    assert.ok(indexes.includes('idx_files_rewind_active_username_created'));
+    assert.ok(indexes.includes('idx_files_rewind_media_active_created'));
+    assert.ok(indexes.includes('idx_files_rewind_media_platform_username_created'));
     assert.ok(importColumns.includes('skipped_unknown_duration_count'));
     assert.ok(importColumns.includes('cancel_requested_at'));
     assert.ok(importColumns.includes('retry_count'));
@@ -599,6 +1003,25 @@ test('store migrates older databases before creating indexes for new columns', a
     assert.ok(indexes.includes('idx_creator_import_items_import_status_position'));
     assert.deepEqual(bookmarkColumns, ['file_id', 'created_at']);
     assert.ok(indexes.includes('idx_bookmarks_created_at'));
+    assert.deepEqual(alertDeliveryColumns, [
+      'video_id',
+      'subscription_id',
+      'event_type',
+      'status',
+      'attempt_count',
+      'last_attempt_at',
+      'delivered_at',
+      'last_error',
+    ]);
+    assert.ok(indexes.includes('idx_alert_deliveries_subscription_event'));
+    assert.deepEqual(migrationColumns, ['version', 'name', 'applied_at']);
+    assert.equal(store.getSchemaVersion(), 4);
+    assert.deepEqual(store.listSchemaMigrations().map(({ version, name }) => ({ version, name })), [
+      { version: 1, name: 'legacy-schema-bootstrap' },
+      { version: 2, name: 'monitor-download-dead-letters' },
+      { version: 3, name: 'rewind-read-indexes' },
+      { version: 4, name: 'rewind-media-read-indexes' },
+    ]);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -630,6 +1053,84 @@ test('bookmarks persist on the server and hide while their file is trashed', asy
     assert.deepEqual(store.listBookmarkedFileIds(), [secondId, firstId]);
     assert.equal(store.setFileBookmark(firstId, false), true);
     assert.deepEqual(store.listBookmarkedFileIds(), [secondId]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('legacy Rewind Store operations act only on TikTok while download lists preserve platform identity', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'media-archive-rewind-platform-'));
+  const store = createStore(path.join(dir, 'state.db'));
+  try {
+    const createFile = (platform, id, now) => store.createFileRecord({
+      platform,
+      videoId: id,
+      requestedBy: 'user-1',
+      username: 'same-handle',
+      sourceUrl: platform === 'tiktok'
+        ? `https://www.tiktok.com/@same-handle/video/${id}`
+        : platform === 'instagram'
+          ? `https://www.instagram.com/p/${id}/`
+          : `https://x.com/same-handle/status/${id}`,
+      filePath: path.join(dir, `${platform}-${id}.mp4`),
+      filename: `${platform}-${id}.mp4`,
+      sizeBytes: 1,
+    }, now);
+    const tiktokId = createFile('tiktok', 'shared', 1000);
+    const xId = createFile('x', 'shared', 1100);
+    const instagramId = createFile('instagram', 'shared', 1200);
+    store.createLinkToken({ token: 'tt-link', fileId: tiktokId, ownerId: 'user-1', expiresAt: 0 }, 1000);
+    store.createLinkToken({ token: 'x-link', fileId: xId, ownerId: 'user-1', expiresAt: 0 }, 1100);
+    store.createLinkToken({ token: 'ig-link', fileId: instagramId, ownerId: 'user-1', expiresAt: 0 }, 1200);
+
+    assert.deepEqual(
+      store.listDownloadLinksByRequester('user-1').map((row) => row.platform),
+      ['instagram', 'x', 'tiktok'],
+    );
+    assert.deepEqual(
+      store.listPermanentDownloadsByRequester('user-1').map((row) => row.platform),
+      ['instagram', 'x', 'tiktok'],
+    );
+    assert.deepEqual(
+      store.listLinkHistoryByRequester('user-1').map((row) => row.platform),
+      ['instagram', 'x', 'tiktok'],
+    );
+
+    assert.equal(store.setFileBookmark(tiktokId, true, 2000), true);
+    assert.equal(store.setFileBookmark(xId, true, 2100), false);
+    assert.deepEqual(store.addFileBookmarks([instagramId, xId], 2200), [tiktokId]);
+    store.db.prepare('INSERT INTO bookmarks (file_id, created_at) VALUES (?, ?)').run(xId, 2300);
+    assert.equal(store.setFileBookmark(xId, false), true);
+    assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM bookmarks WHERE file_id = ?').get(xId).count, 1);
+    assert.deepEqual(store.listBookmarkedFileIds(), [tiktokId]);
+
+    assert.equal(store.getVideoFilePurgePlan(tiktokId)?.id, tiktokId);
+    assert.equal(store.getVideoFilePurgePlan(xId), null);
+    assert.equal(store.getVideoFilePurgePlan(instagramId), null);
+    assert.equal(store.trashFile(xId, 3000), null);
+    assert.equal(store.db.prepare('SELECT retention_status FROM files WHERE id = ?').get(xId).retention_status, 'active');
+    assert.equal(store.trashFile(tiktokId, 3000)?.id, tiktokId);
+
+    store.db.prepare(`
+      UPDATE files
+      SET trashed_at = 3000, retention_status = 'trashed'
+      WHERE id IN (?, ?)
+    `).run(xId, instagramId);
+    assert.deepEqual(store.listTrashedFiles().map((row) => row.id), [tiktokId]);
+    assert.equal(store.getTrashedFile(xId), null);
+    assert.equal(store.restoreTrashedFile(xId), null);
+    assert.equal(store.claimTrashedFileForDeletion(instagramId, 4000), null);
+    assert.deepEqual(store.claimAllTrashedFilesForDeletion(4000).map((row) => row.id), [tiktokId]);
+    assert.deepEqual(
+      store.db.prepare('SELECT platform, retention_status FROM files WHERE id IN (?, ?) ORDER BY platform')
+        .all(xId, instagramId)
+        .map((row) => [row.platform, row.retention_status]),
+      [
+        ['instagram', 'trashed'],
+        ['x', 'trashed'],
+      ],
+    );
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
@@ -796,6 +1297,44 @@ test('watch subscriptions keep guild destinations independent while sharing one 
     assert.equal(store.getWatch('creator'), null);
     assert.equal(store.getWatch('renamed.creator')?.username, 'renamed.creator');
     assert.equal(store.getWatchSubscription('renamed.creator', { guildId: 'guild-2' })?.channel_id, 'channel-2');
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('alert deliveries persist success and failure independently per subscription and event', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-alert-deliveries-'));
+  const dbPath = path.join(dir, 'state.db');
+  let store = createStore(dbPath);
+  try {
+    store.addWatch('creator', { guildId: 'guild-1', channelId: 'channel-1' }, 1000);
+    store.addWatch('creator', { guildId: 'guild-2', channelId: 'channel-2' }, 1000);
+    const [first, second] = store.listWatchSubscriptions('creator');
+    const firstKey = { videoId: 'post-1', subscriptionId: first.id, eventType: 'new_post' };
+    const secondKey = { videoId: 'post-1', subscriptionId: second.id, eventType: 'new_post' };
+
+    store.markAlertDelivered(firstKey, 2000);
+    store.markAlertDeliveryFailed({ ...secondKey, error: new Error('Discord unavailable') }, 2100);
+    store.markAlertDelivered({ ...firstKey, eventType: 'deletion' }, 2200);
+
+    assert.equal(store.isAlertDelivered(firstKey), true);
+    assert.equal(store.isAlertDelivered(secondKey), false);
+    assert.equal(store.getAlertDelivery(firstKey).attempt_count, 1);
+    assert.equal(store.getAlertDelivery(secondKey).status, 'failed');
+    assert.equal(store.getAlertDelivery(secondKey).last_error, 'Discord unavailable');
+    assert.equal(store.isAlertDelivered({ ...firstKey, eventType: 'deletion' }), true);
+
+    store.close();
+    store = createStore(dbPath);
+    assert.equal(store.isAlertDelivered(firstKey), true);
+    assert.equal(store.getAlertDelivery(secondKey).status, 'failed');
+
+    store.markAlertDelivered(secondKey, 2300);
+    assert.equal(store.isAlertDelivered(secondKey), true);
+    assert.equal(store.getAlertDelivery(secondKey).attempt_count, 2);
+    assert.equal(store.getAlertDelivery(secondKey).last_error, null);
+    assert.equal(store.getAlertDelivery(secondKey).delivered_at, 2300);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });

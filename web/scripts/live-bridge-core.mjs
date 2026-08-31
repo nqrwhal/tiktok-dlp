@@ -2,58 +2,57 @@ import path from "node:path";
 
 export const MAX_LEGACY_VIDEO_LIMIT = 5_000;
 export const MAX_PAGINATED_VIDEO_LIMIT = 100;
+export const MAX_PAGINATED_POST_LIMIT = 100;
 
-export function buildVideoSql({
+export function buildRewindVideoReadPath({
   username = "",
   fileId = 0,
   limit = 500,
   cursor = null,
   bookmarkedOnly = false,
 } = {}) {
-  const boundedLimit = Math.min(MAX_LEGACY_VIDEO_LIMIT, positiveInteger(limit, 500));
-  const creatorClause = username
-    ? `AND files.username = ${sqliteString(username)} COLLATE NOCASE`
-    : "";
-  const fileClause = fileId ? `AND files.id = ${positiveInteger(fileId, 0)}` : "";
-  const cursorClause = cursor
-    ? `AND (files.created_at < ${cursor.createdAt}
-        OR (files.created_at = ${cursor.createdAt} AND files.id < ${cursor.fileId}))`
-    : "";
-  const bookmarkClause = bookmarkedOnly
-    ? "AND EXISTS (SELECT 1 FROM bookmarks WHERE bookmarks.file_id = files.id)"
-    : "";
-  return `
-    SELECT
-      files.id,
-      files.video_id,
-      files.username,
-      files.source_url,
-      files.path,
-      files.filename,
-      files.size_bytes,
-      files.created_at,
-      COALESCE(
-        (
-          SELECT jobs.title
-          FROM jobs
-          WHERE jobs.file_id = files.id
-            AND jobs.title IS NOT NULL
-            AND jobs.title <> ''
-          ORDER BY jobs.created_at DESC, jobs.id DESC
-          LIMIT 1
-        ),
-        files.filename
-      ) AS title
-    FROM files
-    WHERE lower(files.filename) LIKE '%.mp4'
-      AND files.trashed_at IS NULL
-      ${creatorClause}
-      ${fileClause}
-      ${cursorClause}
-      ${bookmarkClause}
-    ORDER BY files.created_at DESC, files.id DESC
-    LIMIT ${boundedLimit};
-  `;
+  const params = new URLSearchParams({
+    limit: String(Math.min(MAX_LEGACY_VIDEO_LIMIT + 1, positiveInteger(limit, 500))),
+  });
+  const normalizedUsername = String(username || "").trim();
+  if (normalizedUsername) params.set("username", normalizedUsername);
+  if (fileId) params.set("fileId", String(positiveSafeInteger(fileId, "fileId")));
+  if (cursor) {
+    params.set("beforeCreatedAt", String(nonNegativeSafeInteger(cursor.createdAt, "createdAt")));
+    params.set("beforeFileId", String(positiveSafeInteger(cursor.fileId, "fileId")));
+  }
+  if (bookmarkedOnly) params.set("bookmarked", "1");
+  return `/api/rewind/videos?${params}`;
+}
+
+export function buildRewindPostReadPath({
+  platform = "",
+  username = "",
+  profileId = 0,
+  groupId = 0,
+  fileId = 0,
+  limit = MAX_PAGINATED_POST_LIMIT,
+  cursor = null,
+  bookmarkedOnly = false,
+  trashedOnly = false,
+} = {}) {
+  const params = new URLSearchParams({
+    limit: String(Math.min(MAX_PAGINATED_POST_LIMIT + 1, positiveInteger(limit, MAX_PAGINATED_POST_LIMIT))),
+  });
+  const normalizedPlatform = String(platform || "").trim().toLowerCase();
+  const normalizedUsername = String(username || "").trim();
+  if (normalizedPlatform) params.set("platform", normalizedPlatform);
+  if (normalizedUsername) params.set("username", normalizedUsername);
+  if (profileId) params.set("profileId", String(positiveSafeInteger(profileId, "profileId")));
+  if (groupId) params.set("groupId", String(positiveSafeInteger(groupId, "groupId")));
+  if (fileId) params.set("fileId", String(positiveSafeInteger(fileId, "fileId")));
+  if (cursor) {
+    params.set("beforeCreatedAt", String(nonNegativeSafeInteger(cursor.createdAt, "createdAt")));
+    params.set("beforeFileId", String(positiveSafeInteger(cursor.fileId, "fileId")));
+  }
+  if (bookmarkedOnly) params.set("bookmarked", "1");
+  if (trashedOnly) params.set("trashed", "1");
+  return `/api/rewind/posts?${params}`;
 }
 
 export function encodeVideoCursor(row) {
@@ -110,7 +109,7 @@ export function thumbnailSidecarCandidates(storedPath, roots) {
 }
 
 export function isTrashSchemaMigrationError(error) {
-  return /no such column:\s*(?:files\.)?trashed_at/i.test(
+  return /no such column:\s*(?:files\.)?(?:trashed_at|platform)/i.test(
     error instanceof Error ? error.message : String(error),
   );
 }
@@ -138,6 +137,83 @@ export function matchCreatorMonitoringProxyRoute(pathname, method) {
   return { allowed: String(method || "").toUpperCase() === "DELETE" };
 }
 
+export function matchProfileGroupsProxyRoute(pathname, method) {
+  const normalizedPath = String(pathname || "");
+  const normalizedMethod = String(method || "").toUpperCase();
+  if (normalizedPath === "/api/profile-groups") {
+    return {
+      allowed: normalizedMethod === "GET" || normalizedMethod === "POST",
+      readsBody: normalizedMethod === "POST",
+    };
+  }
+  if (/^\/api\/profile-groups\/\d+$/.test(normalizedPath)) {
+    return {
+      allowed: normalizedMethod === "PATCH",
+      readsBody: normalizedMethod === "PATCH",
+    };
+  }
+  if (/^\/api\/profile-groups\/\d+\/profiles\/\d+$/.test(normalizedPath)) {
+    return { allowed: normalizedMethod === "DELETE", readsBody: false };
+  }
+  return null;
+}
+
+export function matchPostBookmarkProxyRoute(pathname, method) {
+  const match = String(pathname || "").match(/^\/api\/post-bookmarks\/(\d+)$/);
+  if (!match) return null;
+  const normalizedMethod = String(method || "").toUpperCase();
+  return {
+    allowed: normalizedMethod === "PUT" || normalizedMethod === "DELETE",
+    fileId: Number(match[1]),
+  };
+}
+
+export function matchMediaPostMutationProxyRoute(pathname, method) {
+  const normalizedPath = String(pathname || "");
+  const normalizedMethod = String(method || "").toUpperCase();
+  const restore = normalizedPath.match(/^\/api\/media-posts\/(\d+)\/restore$/);
+  if (restore) {
+    return {
+      allowed: normalizedMethod === "POST",
+      fileId: Number(restore[1]),
+      readsBody: normalizedMethod === "POST",
+    };
+  }
+  const trash = normalizedPath.match(/^\/api\/media-posts\/(\d+)$/);
+  if (trash) {
+    return {
+      allowed: normalizedMethod === "DELETE",
+      fileId: Number(trash[1]),
+      readsBody: normalizedMethod === "DELETE",
+    };
+  }
+  return null;
+}
+
+export function isAllowedCorsOrigin(origin, { publicBaseUrl = "", allowLoopback = true } = {}) {
+  const value = String(origin || "").trim();
+  if (!value) return true;
+  let requestedOrigin;
+  try {
+    requestedOrigin = new URL(value).origin;
+  } catch {
+    return false;
+  }
+  if (requestedOrigin !== value.replace(/\/$/, "")) return false;
+
+  if (publicBaseUrl) {
+    try {
+      if (requestedOrigin === new URL(publicBaseUrl).origin) return true;
+    } catch {
+      // An invalid configured public URL does not broaden CORS access.
+    }
+  }
+  if (!allowLoopback) return false;
+  const parsed = new URL(requestedOrigin);
+  return (parsed.protocol === "http:" || parsed.protocol === "https:")
+    && ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname);
+}
+
 export function createActiveFileTracker() {
   const refCounts = new Map();
   return {
@@ -159,24 +235,43 @@ export function createActiveFileTracker() {
   };
 }
 
-export function createBoundedRowCache(maxEntries = 10_000) {
+export function createBoundedRowCache(maxEntries = 10_000, { ttlMs = Infinity, now = Date.now } = {}) {
   const limit = positiveInteger(maxEntries, 10_000);
+  const parsedTtl = Number(ttlMs);
+  const maxAgeMs = Number.isFinite(parsedTtl) ? Math.max(0, parsedTtl) : Infinity;
+  const currentTime = typeof now === "function" ? now : Date.now;
   const rowsById = new Map();
+  function isExpired(entry, timestamp = currentTime()) {
+    return timestamp - entry.cachedAt >= maxAgeMs;
+  }
+  function pruneExpired() {
+    if (maxAgeMs === Infinity) return;
+    const timestamp = currentTime();
+    for (const [key, entry] of rowsById) {
+      if (isExpired(entry, timestamp)) rowsById.delete(key);
+    }
+  }
   return {
     get(fileId) {
       const key = String(fileId);
-      const row = rowsById.get(key);
-      if (!row) return undefined;
+      const entry = rowsById.get(key);
+      if (!entry) return undefined;
+      if (isExpired(entry)) {
+        rowsById.delete(key);
+        return undefined;
+      }
       rowsById.delete(key);
-      rowsById.set(key, row);
-      return row;
+      rowsById.set(key, entry);
+      return entry.row;
     },
     add(rows) {
+      pruneExpired();
+      const cachedAt = currentTime();
       for (const row of rows || []) {
         if (row?.id === undefined || row?.id === null) continue;
         const key = String(row.id);
         rowsById.delete(key);
-        rowsById.set(key, row);
+        rowsById.set(key, { row, cachedAt });
         while (rowsById.size > limit) rowsById.delete(rowsById.keys().next().value);
       }
     },
@@ -187,6 +282,7 @@ export function createBoundedRowCache(maxEntries = 10_000) {
       rowsById.clear();
     },
     get size() {
+      pruneExpired();
       return rowsById.size;
     },
   };
@@ -275,10 +371,6 @@ function normalizedAbsolutePath(value, label) {
 
 function isWithinRoot(candidate, root) {
   return candidate === root || candidate.startsWith(`${root}/`);
-}
-
-function sqliteString(value) {
-  return `'${String(value).replaceAll("'", "''")}'`;
 }
 
 function positiveInteger(value, fallback) {

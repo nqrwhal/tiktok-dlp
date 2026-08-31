@@ -1,5 +1,16 @@
 import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
+import { createProfileReference, normalizePlatform } from '../platforms/references.js';
+import { listAppliedMigrations, runMigrations } from './migrations.js';
+import {
+  getMediaPost as findMediaPost,
+  listMediaAssetPathsForFiles as findMediaAssetPathsForFiles,
+  listMediaAssetsForFile as findMediaAssetsForFile,
+  migrateMediaSchema,
+  recordMediaDownload as persistMediaDownload,
+} from './media.js';
+
+const DEFAULT_DELETION_CLAIM_LEASE_MS = 10 * 60 * 1000;
 
 export class Store {
   constructor(dbPath) {
@@ -15,6 +26,32 @@ export class Store {
   }
 
   migrate() {
+    this.migrationState = runMigrations(this.db, [
+      {
+        version: 1,
+        name: 'legacy-schema-bootstrap',
+        up: () => this.migrateLegacySchema(),
+      },
+      {
+        version: 2,
+        name: 'monitor-download-dead-letters',
+        up: () => this.migrateMonitorDownloadFailuresSchema(),
+      },
+      {
+        version: 3,
+        name: 'rewind-read-indexes',
+        up: () => this.migrateRewindReadIndexes(),
+      },
+      {
+        version: 4,
+        name: 'rewind-media-read-indexes',
+        up: () => this.migrateRewindMediaReadIndexes(),
+      },
+    ]);
+    this.recoverInterruptedMonitorDownloadRetries();
+  }
+
+  migrateLegacySchema() {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS watched_users (
         username TEXT PRIMARY KEY,
@@ -62,6 +99,7 @@ export class Store {
 
       CREATE TABLE IF NOT EXISTS jobs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        platform TEXT NOT NULL DEFAULT 'tiktok',
         type TEXT NOT NULL,
         status TEXT NOT NULL,
         requested_by TEXT NOT NULL DEFAULT '',
@@ -79,6 +117,7 @@ export class Store {
 
       CREATE TABLE IF NOT EXISTS files (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        platform TEXT NOT NULL DEFAULT 'tiktok',
         video_id TEXT,
         username TEXT,
         requested_by TEXT NOT NULL DEFAULT '',
@@ -113,6 +152,18 @@ export class Store {
         created_by TEXT NOT NULL DEFAULT '',
         created_at INTEGER NOT NULL,
         UNIQUE(username, guild_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS alert_deliveries (
+        video_id TEXT NOT NULL,
+        subscription_id INTEGER NOT NULL REFERENCES watch_subscriptions(id) ON DELETE CASCADE,
+        event_type TEXT NOT NULL,
+        status TEXT NOT NULL,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_attempt_at INTEGER NOT NULL,
+        delivered_at INTEGER,
+        last_error TEXT,
+        PRIMARY KEY(video_id, subscription_id, event_type)
       );
 
       CREATE TABLE IF NOT EXISTS creator_imports (
@@ -160,6 +211,30 @@ export class Store {
         UNIQUE(import_id, item_key)
       );
 
+      CREATE TABLE IF NOT EXISTS platform_profiles (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        platform TEXT NOT NULL,
+        remote_id TEXT,
+        handle TEXT NOT NULL,
+        display_name TEXT NOT NULL DEFAULT '',
+        profile_url TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS creator_groups (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS creator_group_memberships (
+        profile_id INTEGER PRIMARY KEY REFERENCES platform_profiles(id) ON DELETE CASCADE,
+        group_id INTEGER NOT NULL REFERENCES creator_groups(id) ON DELETE CASCADE,
+        linked_at INTEGER NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS bookmarks (
         file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
         created_at INTEGER NOT NULL
@@ -169,6 +244,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_files_video_id ON files(video_id);
       CREATE INDEX IF NOT EXISTS idx_link_tokens_expires_at ON link_tokens(expires_at);
     `);
+    migrateMediaSchema(this.db);
     this.ensureColumn('watched_users', 'creator_id', 'TEXT');
     this.ensureColumn('watched_users', 'sec_uid', 'TEXT');
     this.ensureColumn('watched_users', 'author_id', 'TEXT');
@@ -188,7 +264,9 @@ export class Store {
     this.ensureColumn('jobs', 'requested_by', "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn('jobs', 'guild_id', "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn('jobs', 'channel_id', "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn('jobs', 'platform', "TEXT NOT NULL DEFAULT 'tiktok'");
     this.ensureColumn('files', 'requested_by', "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn('files', 'platform', "TEXT NOT NULL DEFAULT 'tiktok'");
     this.ensureColumn('files', 'trashed_at', 'INTEGER');
     this.ensureColumn('files', 'delete_requested_at', 'INTEGER');
     this.ensureColumn('files', 'delete_attempts', 'INTEGER NOT NULL DEFAULT 0');
@@ -228,6 +306,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_jobs_file_id ON jobs(file_id);
       CREATE INDEX IF NOT EXISTS idx_jobs_updated_at_id ON jobs(updated_at, id);
       CREATE INDEX IF NOT EXISTS idx_files_requested_by ON files(requested_by);
+      CREATE INDEX IF NOT EXISTS idx_files_platform_video_id ON files(platform, video_id);
       CREATE INDEX IF NOT EXISTS idx_files_trashed_at ON files(trashed_at);
       CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
       CREATE INDEX IF NOT EXISTS idx_files_delete_requested_at ON files(delete_requested_at);
@@ -237,18 +316,104 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_link_tokens_owner_id_created_at ON link_tokens(owner_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_link_tokens_scope_id_created_at ON link_tokens(scope_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_link_tokens_job_id ON link_tokens(job_id);
+      CREATE INDEX IF NOT EXISTS idx_link_tokens_monitor_file_scope_created_at
+        ON link_tokens(file_id, scope_id, created_at DESC)
+        WHERE delivery_type = 'monitor' AND expires_at = 0;
       CREATE INDEX IF NOT EXISTS idx_seen_videos_next_deletion_check_at ON seen_videos(next_deletion_check_at);
       CREATE INDEX IF NOT EXISTS idx_watched_users_next_check_at ON watched_users(next_check_at);
       CREATE INDEX IF NOT EXISTS idx_watch_username_history_detected_at ON watch_username_history(detected_at DESC);
       CREATE INDEX IF NOT EXISTS idx_watch_subscriptions_guild_id_username ON watch_subscriptions(guild_id, username);
+      CREATE INDEX IF NOT EXISTS idx_alert_deliveries_subscription_event
+        ON alert_deliveries(subscription_id, event_type, status);
       CREATE INDEX IF NOT EXISTS idx_creator_imports_created_at ON creator_imports(created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_creator_imports_username_status ON creator_imports(username, status);
       CREATE INDEX IF NOT EXISTS idx_creator_import_items_import_status_position
         ON creator_import_items(import_id, status, position, id);
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_platform_profiles_platform_remote_id
+        ON platform_profiles(platform, remote_id)
+        WHERE remote_id IS NOT NULL AND remote_id <> '';
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_platform_profiles_platform_handle
+        ON platform_profiles(platform, handle COLLATE NOCASE);
+      CREATE INDEX IF NOT EXISTS idx_platform_profiles_updated_at
+        ON platform_profiles(updated_at DESC, id DESC);
+      CREATE INDEX IF NOT EXISTS idx_creator_group_memberships_group_id
+        ON creator_group_memberships(group_id, linked_at, profile_id);
+      CREATE INDEX IF NOT EXISTS idx_creator_groups_updated_at
+        ON creator_groups(updated_at DESC, id DESC);
       CREATE INDEX IF NOT EXISTS idx_bookmarks_created_at ON bookmarks(created_at DESC);
     `);
     this.migrateLegacyDeliveryOwnership();
     this.migrateLegacyWatchSubscriptions();
+  }
+
+  migrateRewindReadIndexes() {
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_files_rewind_active_created
+      ON files(created_at DESC, id DESC)
+      WHERE platform = 'tiktok' AND trashed_at IS NULL;
+
+      CREATE INDEX IF NOT EXISTS idx_files_rewind_active_username_created
+      ON files(username COLLATE NOCASE, created_at DESC, id DESC)
+      WHERE platform = 'tiktok' AND trashed_at IS NULL;
+    `);
+  }
+
+  migrateRewindMediaReadIndexes() {
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_files_rewind_media_active_created
+      ON files(created_at DESC, id DESC)
+      WHERE trashed_at IS NULL;
+
+      CREATE INDEX IF NOT EXISTS idx_files_rewind_media_platform_username_created
+      ON files(platform, username COLLATE NOCASE, created_at DESC, id DESC)
+      WHERE trashed_at IS NULL;
+    `);
+  }
+
+  migrateMonitorDownloadFailuresSchema() {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS monitor_download_failures (
+        video_id TEXT PRIMARY KEY,
+        username TEXT NOT NULL,
+        source_url TEXT NOT NULL,
+        title TEXT NOT NULL DEFAULT '',
+        media_type TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'retryable',
+        failure_count INTEGER NOT NULL DEFAULT 0,
+        retry_count INTEGER NOT NULL DEFAULT 0,
+        first_failed_at INTEGER NOT NULL,
+        last_failed_at INTEGER NOT NULL,
+        last_error TEXT NOT NULL DEFAULT '',
+        dead_lettered_at INTEGER,
+        last_retry_at INTEGER,
+        resolved_at INTEGER,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_monitor_download_failures_status_updated
+        ON monitor_download_failures(status, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_monitor_download_failures_username_status
+        ON monitor_download_failures(username COLLATE NOCASE, status, updated_at DESC);
+    `);
+  }
+
+  recoverInterruptedMonitorDownloadRetries(now = Date.now()) {
+    return this.db.prepare(`
+      UPDATE monitor_download_failures
+      SET
+        status = 'dead_letter',
+        updated_at = ?,
+        dead_lettered_at = COALESCE(dead_lettered_at, updated_at)
+      WHERE status = 'retrying'
+    `).run(now).changes;
+  }
+
+  listSchemaMigrations() {
+    return listAppliedMigrations(this.db);
+  }
+
+  getSchemaVersion() {
+    return Number(this.db.prepare('PRAGMA user_version').get()?.user_version ?? 0);
   }
 
   ensureColumn(table, column, definition) {
@@ -316,6 +481,476 @@ export class Store {
           WHERE watch_subscriptions.username = watched_users.username
         );
     `);
+  }
+
+  upsertPlatformProfile(input = {}, now = Date.now()) {
+    const normalized = normalizeStoredPlatformProfile(input);
+    const hasDisplayName = hasOwn(input, 'displayName') || hasOwn(input, 'display_name');
+    const displayName = hasDisplayName
+      ? String(input.displayName ?? input.display_name ?? '').trim().slice(0, 200)
+      : '';
+    const timestamp = normalizeStoreTimestamp(now);
+    let profileId;
+
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const byRemoteId = normalized.remoteId
+        ? this.db.prepare(`
+          SELECT * FROM platform_profiles WHERE platform = ? AND remote_id = ?
+        `).get(normalized.platform, normalized.remoteId) ?? null
+        : null;
+      const byHandle = this.db.prepare(`
+        SELECT *
+        FROM platform_profiles
+        WHERE platform = ? AND handle = ? COLLATE NOCASE
+      `).get(normalized.platform, normalized.handle) ?? null;
+
+      if (byRemoteId && byHandle && byRemoteId.id !== byHandle.id) {
+        if (byHandle.remote_id && byHandle.remote_id !== normalized.remoteId) {
+          throw new Error('That handle belongs to a different stable platform profile.');
+        }
+        this.reconcilePlatformProfiles(byRemoteId.id, byHandle.id, timestamp);
+      }
+      if (
+        !byRemoteId
+        && byHandle?.remote_id
+        && normalized.remoteId
+        && byHandle.remote_id !== normalized.remoteId
+      ) {
+        throw new Error('That handle belongs to a different stable platform profile.');
+      }
+
+      const existing = byRemoteId ?? byHandle;
+      if (existing) {
+        profileId = Number(existing.id);
+        this.db.prepare(`
+          UPDATE platform_profiles
+          SET
+            remote_id = COALESCE(?, remote_id),
+            handle = ?,
+            display_name = CASE WHEN ? = 1 THEN ? ELSE display_name END,
+            profile_url = ?,
+            updated_at = ?
+          WHERE id = ?
+        `).run(
+          normalized.remoteId,
+          normalized.handle,
+          hasDisplayName ? 1 : 0,
+          displayName,
+          normalized.profileUrl,
+          timestamp,
+          profileId,
+        );
+      } else {
+        const result = this.db.prepare(`
+          INSERT INTO platform_profiles (
+            platform, remote_id, handle, display_name, profile_url, created_at, updated_at
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          normalized.platform,
+          normalized.remoteId,
+          normalized.handle,
+          displayName,
+          normalized.profileUrl,
+          timestamp,
+          timestamp,
+        );
+        profileId = Number(result.lastInsertRowid);
+      }
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+    return this.getPlatformProfile(profileId);
+  }
+
+  reconcilePlatformProfiles(survivorProfileId, duplicateProfileId, now = Date.now()) {
+    const survivorId = normalizePositiveId(survivorProfileId, 'platform profile');
+    const duplicateId = normalizePositiveId(duplicateProfileId, 'platform profile');
+    if (survivorId === duplicateId) return;
+    const timestamp = normalizeStoreTimestamp(now);
+
+    const survivorMembership = this.db.prepare(`
+      SELECT group_id FROM creator_group_memberships WHERE profile_id = ?
+    `).get(survivorId) ?? null;
+    const duplicateMembership = this.db.prepare(`
+      SELECT group_id FROM creator_group_memberships WHERE profile_id = ?
+    `).get(duplicateId) ?? null;
+
+    if (!survivorMembership && duplicateMembership) {
+      this.db.prepare(`
+        UPDATE creator_group_memberships
+        SET profile_id = ?, linked_at = ?
+        WHERE profile_id = ?
+      `).run(survivorId, timestamp, duplicateId);
+      this.db.prepare('UPDATE creator_groups SET updated_at = ? WHERE id = ?')
+        .run(timestamp, duplicateMembership.group_id);
+    } else if (
+      survivorMembership
+      && duplicateMembership
+      && survivorMembership.group_id !== duplicateMembership.group_id
+    ) {
+      const targetGroupId = Number(survivorMembership.group_id);
+      const sourceGroupId = Number(duplicateMembership.group_id);
+      this.db.prepare(`
+        UPDATE creator_group_memberships
+        SET group_id = ?, linked_at = ?
+        WHERE group_id = ?
+      `).run(targetGroupId, timestamp, sourceGroupId);
+      this.db.prepare('DELETE FROM creator_groups WHERE id = ?').run(sourceGroupId);
+      this.db.prepare('UPDATE creator_groups SET updated_at = ? WHERE id = ?')
+        .run(timestamp, targetGroupId);
+    } else if (survivorMembership && duplicateMembership) {
+      this.db.prepare('UPDATE creator_groups SET updated_at = ? WHERE id = ?')
+        .run(timestamp, survivorMembership.group_id);
+    }
+
+    this.db.prepare(`
+      UPDATE platform_profiles
+      SET display_name = CASE
+        WHEN display_name = '' THEN COALESCE((
+          SELECT display_name FROM platform_profiles WHERE id = ?
+        ), '')
+        ELSE display_name
+      END
+      WHERE id = ?
+    `).run(duplicateId, survivorId);
+    this.db.prepare('UPDATE media_posts SET profile_id = ? WHERE profile_id = ?')
+      .run(survivorId, duplicateId);
+    this.db.prepare('DELETE FROM platform_profiles WHERE id = ?').run(duplicateId);
+  }
+
+  getPlatformProfile(reference, remoteId = undefined) {
+    const lookup = normalizePlatformProfileLookup(reference, remoteId);
+    if (!lookup) return null;
+    const select = `
+      SELECT platform_profiles.*, creator_group_memberships.group_id,
+        creator_group_memberships.linked_at
+      FROM platform_profiles
+      LEFT JOIN creator_group_memberships
+        ON creator_group_memberships.profile_id = platform_profiles.id
+    `;
+    if (lookup.id) {
+      return this.db.prepare(`${select} WHERE platform_profiles.id = ?`).get(lookup.id) ?? null;
+    }
+    if (lookup.remoteId) {
+      return this.db.prepare(`
+        ${select}
+        WHERE platform_profiles.platform = ? AND platform_profiles.remote_id = ?
+      `).get(lookup.platform, lookup.remoteId) ?? null;
+    }
+    return this.db.prepare(`
+      ${select}
+      WHERE platform_profiles.platform = ?
+        AND platform_profiles.handle = ? COLLATE NOCASE
+      ORDER BY platform_profiles.updated_at DESC, platform_profiles.id DESC
+      LIMIT 1
+    `).get(lookup.platform, lookup.handle) ?? null;
+  }
+
+  listPlatformProfiles({ platform = '', groupId = null, unlinkedOnly = false } = {}) {
+    const clauses = [];
+    const params = [];
+    if (platform) {
+      clauses.push('platform_profiles.platform = ?');
+      params.push(normalizePlatform(platform));
+    }
+    if (groupId != null && groupId !== '') {
+      const normalizedGroupId = normalizePositiveId(groupId, 'creator group');
+      clauses.push('creator_group_memberships.group_id = ?');
+      params.push(normalizedGroupId);
+    }
+    if (unlinkedOnly) clauses.push('creator_group_memberships.group_id IS NULL');
+
+    return this.db.prepare(`
+      SELECT platform_profiles.*, creator_group_memberships.group_id,
+        creator_group_memberships.linked_at
+      FROM platform_profiles
+      LEFT JOIN creator_group_memberships
+        ON creator_group_memberships.profile_id = platform_profiles.id
+      ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''}
+      ORDER BY platform_profiles.platform, platform_profiles.handle COLLATE NOCASE,
+        platform_profiles.id
+    `).all(...params);
+  }
+
+  createCreatorGroup(options = {}, now = Date.now()) {
+    const name = normalizeCreatorGroupName(typeof options === 'string' ? options : options?.name);
+    const timestamp = normalizeStoreTimestamp(now);
+    const result = this.db.prepare(`
+      INSERT INTO creator_groups (name, created_at, updated_at)
+      VALUES (?, ?, ?)
+    `).run(name, timestamp, timestamp);
+    return this.getCreatorGroup(Number(result.lastInsertRowid));
+  }
+
+  getCreatorGroup(groupId) {
+    const id = normalizePositiveId(groupId, 'creator group', false);
+    if (!id) return null;
+    return this.db.prepare(`
+      SELECT creator_groups.*, COUNT(creator_group_memberships.profile_id) AS member_count
+      FROM creator_groups
+      LEFT JOIN creator_group_memberships
+        ON creator_group_memberships.group_id = creator_groups.id
+      WHERE creator_groups.id = ?
+      GROUP BY creator_groups.id
+    `).get(id) ?? null;
+  }
+
+  listCreatorGroups({ includeEmpty = true } = {}) {
+    return this.db.prepare(`
+      SELECT creator_groups.*, COUNT(creator_group_memberships.profile_id) AS member_count
+      FROM creator_groups
+      LEFT JOIN creator_group_memberships
+        ON creator_group_memberships.group_id = creator_groups.id
+      GROUP BY creator_groups.id
+      ${includeEmpty ? '' : 'HAVING COUNT(creator_group_memberships.profile_id) > 0'}
+      ORDER BY creator_groups.updated_at DESC, creator_groups.id DESC
+    `).all();
+  }
+
+  renameCreatorGroup(groupId, name, now = Date.now()) {
+    const id = normalizePositiveId(groupId, 'creator group');
+    const groupName = normalizeCreatorGroupName(name);
+    const timestamp = normalizeStoreTimestamp(now);
+    const result = this.db.prepare(`
+      UPDATE creator_groups
+      SET name = ?, updated_at = ?
+      WHERE id = ?
+    `).run(groupName, timestamp, id);
+    if (!result.changes) return null;
+    return {
+      ...this.getCreatorGroup(id),
+      members: this.listCreatorGroupMembers(id),
+    };
+  }
+
+  getCreatorGroupForProfile(profile) {
+    const profileId = this.resolvePlatformProfileId(profile);
+    if (!profileId) return null;
+    return this.db.prepare(`
+      SELECT creator_groups.*, creator_group_memberships.linked_at,
+        (SELECT COUNT(*) FROM creator_group_memberships AS members
+          WHERE members.group_id = creator_groups.id) AS member_count
+      FROM creator_group_memberships
+      JOIN creator_groups ON creator_groups.id = creator_group_memberships.group_id
+      WHERE creator_group_memberships.profile_id = ?
+    `).get(profileId) ?? null;
+  }
+
+  getCreatorGroupMember(groupId, profile) {
+    const id = normalizePositiveId(groupId, 'creator group', false);
+    const profileId = this.resolvePlatformProfileId(profile);
+    if (!id || !profileId) return null;
+    return this.db.prepare(`
+      SELECT platform_profiles.*, creator_group_memberships.group_id,
+        creator_group_memberships.linked_at
+      FROM creator_group_memberships
+      JOIN platform_profiles ON platform_profiles.id = creator_group_memberships.profile_id
+      WHERE creator_group_memberships.group_id = ?
+        AND creator_group_memberships.profile_id = ?
+    `).get(id, profileId) ?? null;
+  }
+
+  listCreatorGroupMembers(groupId) {
+    const id = normalizePositiveId(groupId, 'creator group', false);
+    if (!id) return [];
+    return this.db.prepare(`
+      SELECT platform_profiles.*, creator_group_memberships.group_id,
+        creator_group_memberships.linked_at
+      FROM creator_group_memberships
+      JOIN platform_profiles ON platform_profiles.id = creator_group_memberships.profile_id
+      WHERE creator_group_memberships.group_id = ?
+      ORDER BY platform_profiles.platform, platform_profiles.handle COLLATE NOCASE,
+        platform_profiles.id
+    `).all(id);
+  }
+
+  getCreatorGroupMembers(groupId) {
+    return this.listCreatorGroupMembers(groupId);
+  }
+
+  linkCreatorProfiles(profiles, options = {}, now = Date.now()) {
+    const requestedProfiles = Array.isArray(profiles) ? profiles : [profiles];
+    const profileIds = [...new Set(requestedProfiles.map((profile) => {
+      const id = this.resolvePlatformProfileId(profile);
+      if (!id) throw new Error('Every linked profile must already exist.');
+      return id;
+    }))];
+    if (!profileIds.length) throw new Error('At least one platform profile is required.');
+
+    const requestedGroupId = options?.groupId ?? options?.group_id ?? null;
+    const mergeGroups = options?.mergeGroups === true || options?.merge === true;
+    const hasGroupName = hasOwn(options, 'groupName') || hasOwn(options, 'name');
+    const groupName = normalizeCreatorGroupName(options?.groupName ?? options?.name);
+    const timestamp = normalizeStoreTimestamp(now);
+    let targetGroupId = requestedGroupId == null || requestedGroupId === ''
+      ? null
+      : normalizePositiveId(requestedGroupId, 'creator group');
+
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      if (targetGroupId && !this.db.prepare('SELECT 1 FROM creator_groups WHERE id = ?').get(targetGroupId)) {
+        throw new Error(`Creator group ${targetGroupId} does not exist.`);
+      }
+
+      const placeholders = profileIds.map(() => '?').join(', ');
+      const currentGroupIds = this.db.prepare(`
+        SELECT DISTINCT group_id
+        FROM creator_group_memberships
+        WHERE profile_id IN (${placeholders})
+        ORDER BY group_id
+      `).all(...profileIds).map((row) => Number(row.group_id));
+
+      if (!targetGroupId) {
+        if (currentGroupIds.length > 1 && !mergeGroups) {
+          throw new Error('The selected profiles belong to different creator groups; set mergeGroups to merge them explicitly.');
+        }
+        targetGroupId = currentGroupIds[0] ?? null;
+      }
+
+      if (!targetGroupId) {
+        const created = this.db.prepare(`
+          INSERT INTO creator_groups (name, created_at, updated_at)
+          VALUES (?, ?, ?)
+        `).run(groupName, timestamp, timestamp);
+        targetGroupId = Number(created.lastInsertRowid);
+      }
+
+      const sourceGroupIds = currentGroupIds.filter((id) => id !== targetGroupId);
+      if (sourceGroupIds.length && !mergeGroups) {
+        throw new Error('A selected profile already belongs to another creator group; set mergeGroups to merge it explicitly.');
+      }
+
+      if (sourceGroupIds.length) {
+        const sourcePlaceholders = sourceGroupIds.map(() => '?').join(', ');
+        this.db.prepare(`
+          UPDATE creator_group_memberships
+          SET group_id = ?, linked_at = ?
+          WHERE group_id IN (${sourcePlaceholders})
+        `).run(targetGroupId, timestamp, ...sourceGroupIds);
+        this.db.prepare(`DELETE FROM creator_groups WHERE id IN (${sourcePlaceholders})`).run(...sourceGroupIds);
+      }
+
+      const link = this.db.prepare(`
+        INSERT INTO creator_group_memberships (profile_id, group_id, linked_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(profile_id) DO UPDATE SET
+          group_id = excluded.group_id,
+          linked_at = CASE
+            WHEN creator_group_memberships.group_id = excluded.group_id
+              THEN creator_group_memberships.linked_at
+            ELSE excluded.linked_at
+          END
+      `);
+      for (const profileId of profileIds) link.run(profileId, targetGroupId, timestamp);
+      this.db.prepare(`
+        UPDATE creator_groups
+        SET name = CASE WHEN ? = 1 THEN ? ELSE name END, updated_at = ?
+        WHERE id = ?
+      `).run(hasGroupName ? 1 : 0, groupName, timestamp, targetGroupId);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+
+    return {
+      ...this.getCreatorGroup(targetGroupId),
+      members: this.listCreatorGroupMembers(targetGroupId),
+    };
+  }
+
+  linkProfileToCreatorGroup(profile, groupId, options = {}, now = Date.now()) {
+    return this.linkCreatorProfiles([profile], { ...options, groupId }, now);
+  }
+
+  unlinkProfileFromCreatorGroup(profile, now = Date.now()) {
+    const profileId = this.resolvePlatformProfileId(profile);
+    if (!profileId) return false;
+    const membership = this.db.prepare(`
+      SELECT group_id FROM creator_group_memberships WHERE profile_id = ?
+    `).get(profileId);
+    if (!membership) return false;
+
+    const timestamp = normalizeStoreTimestamp(now);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const result = this.db.prepare('DELETE FROM creator_group_memberships WHERE profile_id = ?').run(profileId);
+      this.db.prepare('UPDATE creator_groups SET updated_at = ? WHERE id = ?').run(timestamp, membership.group_id);
+      this.db.exec('COMMIT');
+      return result.changes > 0;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  unlinkProfile(profile, now = Date.now()) {
+    return this.unlinkProfileFromCreatorGroup(profile, now);
+  }
+
+  resolvePlatformProfileId(reference) {
+    if (Number.isInteger(reference) && reference > 0) {
+      return this.db.prepare('SELECT id FROM platform_profiles WHERE id = ?').get(reference)?.id ?? null;
+    }
+    const profile = this.getPlatformProfile(reference);
+    return profile?.id ?? null;
+  }
+
+  recordMediaDownload(input = {}, now = Date.now()) {
+    return persistMediaDownload(this.db, input, now);
+  }
+
+  createFileWithMedia({ file = {}, media = {} } = {}, now = Date.now()) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const fileId = this.createFileRecord(file, now);
+      const persisted = persistMediaDownload(this.db, {
+        ...media,
+        fileId,
+        platform: media.platform ?? file.platform ?? 'tiktok',
+        remoteId: media.remoteId ?? media.videoId ?? file.videoId,
+        filePath: media.filePath ?? file.filePath,
+        filename: media.filename ?? file.filename,
+        sizeBytes: media.sizeBytes ?? file.sizeBytes,
+      }, now, { manageTransaction: false });
+      this.db.exec('COMMIT');
+      return { fileId, ...persisted };
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  getMediaPost(platform, remoteId) {
+    return findMediaPost(this.db, platform, remoteId);
+  }
+
+  listMediaAssetsForFile(fileId) {
+    return findMediaAssetsForFile(this.db, fileId);
+  }
+
+  listMediaAssetPathsForFiles(fileIds) {
+    return findMediaAssetPathsForFiles(this.db, fileIds);
+  }
+
+  withMediaAssetPaths(records = []) {
+    const files = Array.isArray(records) ? records : [];
+    if (!files.length) return [];
+    const byFile = new Map();
+    for (const asset of this.listMediaAssetPathsForFiles(files.map((file) => file.id))) {
+      const fileId = Number(asset.file_id);
+      const paths = byFile.get(fileId) ?? [];
+      paths.push(asset.path);
+      byFile.set(fileId, paths);
+    }
+    return files.map((file) => ({
+      ...file,
+      asset_paths: byFile.get(Number(file.id)) ?? [],
+    }));
   }
 
   addWatch(username, channelOrOptions, now = Date.now()) {
@@ -431,6 +1066,268 @@ export class Store {
     `).all(String(username));
   }
 
+  getAlertDelivery({ videoId, subscriptionId, eventType = 'new_post' } = {}) {
+    const key = normalizeAlertDeliveryKey({ videoId, subscriptionId, eventType });
+    if (!key) return null;
+    return this.db.prepare(`
+      SELECT *
+      FROM alert_deliveries
+      WHERE video_id = ? AND subscription_id = ? AND event_type = ?
+    `).get(key.videoId, key.subscriptionId, key.eventType) ?? null;
+  }
+
+  isAlertDelivered(options = {}) {
+    return this.getAlertDelivery(options)?.status === 'delivered';
+  }
+
+  markAlertDelivered(options = {}, now = Date.now()) {
+    const key = normalizeAlertDeliveryKey(options);
+    if (!key) throw new Error('An alert delivery requires a video, subscription, and event type.');
+    this.db.prepare(`
+      INSERT INTO alert_deliveries (
+        video_id, subscription_id, event_type, status, attempt_count,
+        last_attempt_at, delivered_at, last_error
+      )
+      VALUES (?, ?, ?, 'delivered', 1, ?, ?, NULL)
+      ON CONFLICT(video_id, subscription_id, event_type) DO UPDATE SET
+        status = 'delivered',
+        attempt_count = alert_deliveries.attempt_count + 1,
+        last_attempt_at = excluded.last_attempt_at,
+        delivered_at = COALESCE(alert_deliveries.delivered_at, excluded.delivered_at),
+        last_error = NULL
+    `).run(key.videoId, key.subscriptionId, key.eventType, now, now);
+    return this.getAlertDelivery(key);
+  }
+
+  markAlertDeliveryFailed({ error = '', ...options } = {}, now = Date.now()) {
+    const key = normalizeAlertDeliveryKey(options);
+    if (!key) throw new Error('An alert delivery requires a video, subscription, and event type.');
+    const lastError = String(error?.message ?? error ?? '').slice(0, 500);
+    this.db.prepare(`
+      INSERT INTO alert_deliveries (
+        video_id, subscription_id, event_type, status, attempt_count,
+        last_attempt_at, delivered_at, last_error
+      )
+      VALUES (?, ?, ?, 'failed', 1, ?, NULL, ?)
+      ON CONFLICT(video_id, subscription_id, event_type) DO UPDATE SET
+        status = CASE
+          WHEN alert_deliveries.status = 'delivered' THEN 'delivered'
+          ELSE 'failed'
+        END,
+        attempt_count = alert_deliveries.attempt_count + 1,
+        last_attempt_at = excluded.last_attempt_at,
+        last_error = CASE
+          WHEN alert_deliveries.status = 'delivered' THEN alert_deliveries.last_error
+          ELSE excluded.last_error
+        END
+    `).run(key.videoId, key.subscriptionId, key.eventType, now, lastError);
+    return this.getAlertDelivery(key);
+  }
+
+  getMonitorDownloadFailure(videoId) {
+    const id = String(videoId ?? '').trim();
+    if (!id) return null;
+    return this.db.prepare(`
+      SELECT *
+      FROM monitor_download_failures
+      WHERE video_id = ?
+    `).get(id) ?? null;
+  }
+
+  isMonitorDownloadDeadLettered(videoId) {
+    return this.getMonitorDownloadFailure(videoId)?.status === 'dead_letter';
+  }
+
+  recordMonitorDownloadFailure({
+    videoId,
+    username = '',
+    sourceUrl = '',
+    title = '',
+    mediaType = '',
+    error = '',
+  } = {}, deadLetterAfter = 5, now = Date.now()) {
+    const id = String(videoId ?? '').trim();
+    if (!id) throw new Error('A monitor download failure requires a post ID.');
+    const threshold = Math.max(1, Number(deadLetterAfter) || 1);
+    const lastError = String(error?.message ?? error ?? '').slice(0, 500);
+
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const existing = this.getMonitorDownloadFailure(id);
+      if (existing?.status === 'dead_letter') {
+        this.db.exec('COMMIT');
+        return existing;
+      }
+
+      const failureCount = Number(existing?.failure_count ?? 0) + 1;
+      const status = failureCount >= threshold ? 'dead_letter' : 'retryable';
+      const deadLetteredAt = status === 'dead_letter'
+        ? Number(existing?.dead_lettered_at ?? 0) || now
+        : null;
+      this.db.prepare(`
+        INSERT INTO monitor_download_failures (
+          video_id, username, source_url, title, media_type, status,
+          failure_count, retry_count, first_failed_at, last_failed_at,
+          last_error, dead_lettered_at, last_retry_at, resolved_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+        ON CONFLICT(video_id) DO UPDATE SET
+          username = excluded.username,
+          source_url = excluded.source_url,
+          title = excluded.title,
+          media_type = excluded.media_type,
+          status = excluded.status,
+          failure_count = excluded.failure_count,
+          last_failed_at = excluded.last_failed_at,
+          last_error = excluded.last_error,
+          dead_lettered_at = excluded.dead_lettered_at,
+          resolved_at = NULL,
+          updated_at = excluded.updated_at
+      `).run(
+        id,
+        String(username || existing?.username || ''),
+        String(sourceUrl || existing?.source_url || ''),
+        String(title || existing?.title || ''),
+        String(mediaType || existing?.media_type || ''),
+        status,
+        failureCount,
+        Number(existing?.retry_count ?? 0),
+        Number(existing?.first_failed_at ?? 0) || now,
+        now,
+        lastError,
+        deadLetteredAt,
+        existing?.last_retry_at ?? null,
+        now,
+      );
+      const failure = this.getMonitorDownloadFailure(id);
+      this.db.exec('COMMIT');
+      return failure;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  markMonitorDownloadFailureResolved(videoId, now = Date.now()) {
+    const id = String(videoId ?? '').trim();
+    if (!id) return null;
+    this.db.prepare(`
+      UPDATE monitor_download_failures
+      SET
+        status = 'resolved',
+        failure_count = 0,
+        resolved_at = ?,
+        dead_lettered_at = NULL,
+        updated_at = ?
+      WHERE video_id = ? AND status <> 'resolved'
+    `).run(now, now, id);
+    return this.getMonitorDownloadFailure(id);
+  }
+
+  retryMonitorDownloadFailure(videoId, now = Date.now()) {
+    const id = String(videoId ?? '').trim();
+    if (!id) return { accepted: false, reason: 'not_found', failure: null };
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const failure = this.getMonitorDownloadFailure(id);
+      if (!failure) {
+        this.db.exec('COMMIT');
+        return { accepted: false, reason: 'not_found', failure: null };
+      }
+      if (failure.status !== 'dead_letter') {
+        this.db.exec('COMMIT');
+        return { accepted: false, reason: 'not_retryable', failure };
+      }
+      this.db.prepare(`
+        UPDATE monitor_download_failures
+        SET
+          status = 'retrying',
+          retry_count = retry_count + 1,
+          last_retry_at = ?,
+          resolved_at = NULL,
+          updated_at = ?
+        WHERE video_id = ? AND status = 'dead_letter'
+      `).run(now, now, id);
+      const claimed = this.getMonitorDownloadFailure(id);
+      this.db.exec('COMMIT');
+      return { accepted: true, failure: claimed };
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  releaseMonitorDownloadRetry(videoId, now = Date.now()) {
+    const id = String(videoId ?? '').trim();
+    if (!id) return null;
+    this.db.prepare(`
+      UPDATE monitor_download_failures
+      SET
+        status = 'dead_letter',
+        dead_lettered_at = COALESCE(dead_lettered_at, ?),
+        updated_at = ?
+      WHERE video_id = ? AND status = 'retrying'
+    `).run(now, now, id);
+    return this.getMonitorDownloadFailure(id);
+  }
+
+  listMonitorDownloadFailures({ username = '', statuses = ['dead_letter', 'retrying'], limit = 25 } = {}) {
+    const allowedStatuses = new Set(['retryable', 'dead_letter', 'retrying', 'resolved']);
+    const normalizedStatuses = [...new Set((Array.isArray(statuses) ? statuses : [statuses])
+      .map((status) => String(status ?? '').trim())
+      .filter((status) => allowedStatuses.has(status)))];
+    if (!normalizedStatuses.length) return [];
+    const boundedLimit = Math.max(1, Math.min(100, Number(limit) || 25));
+    const placeholders = normalizedStatuses.map(() => '?').join(', ');
+    const normalizedUsername = String(username ?? '').trim();
+    return this.db.prepare(`
+      SELECT *
+      FROM monitor_download_failures
+      WHERE status IN (${placeholders})
+        AND (? = '' OR username = ? COLLATE NOCASE)
+      ORDER BY updated_at DESC, video_id
+      LIMIT ?
+    `).all(...normalizedStatuses, normalizedUsername, normalizedUsername, boundedLimit);
+  }
+
+  listMonitorDownloadFailuresForScope({
+    guildId = '',
+    channelId = '',
+    username = '',
+    limit = 25,
+  } = {}) {
+    const boundedLimit = Math.max(1, Math.min(100, Number(limit) || 25));
+    const normalizedGuildId = String(guildId ?? '');
+    const normalizedChannelId = String(channelId ?? '');
+    const normalizedUsername = String(username ?? '').trim();
+    return this.db.prepare(`
+      SELECT monitor_download_failures.*
+      FROM monitor_download_failures
+      WHERE monitor_download_failures.status IN ('dead_letter', 'retrying')
+        AND (? = '' OR monitor_download_failures.username = ? COLLATE NOCASE)
+        AND EXISTS (
+          SELECT 1
+          FROM watch_subscriptions
+          WHERE watch_subscriptions.username = monitor_download_failures.username
+            AND (
+              watch_subscriptions.guild_id = ?
+              OR (
+                watch_subscriptions.guild_id = ''
+                AND watch_subscriptions.channel_id = ?
+              )
+            )
+        )
+      ORDER BY monitor_download_failures.updated_at DESC, monitor_download_failures.video_id
+      LIMIT ?
+    `).all(
+      normalizedUsername,
+      normalizedUsername,
+      normalizedGuildId,
+      normalizedChannelId,
+      boundedLimit,
+    );
+  }
+
   recordWatchIdentity(username, {
     creatorId = '',
     currentUsername = '',
@@ -525,6 +1422,11 @@ export class Store {
     }
 
     this.moveWatchSubscriptions(previousUsername, nextUsername);
+    this.db.prepare(`
+      UPDATE monitor_download_failures
+      SET username = ?, updated_at = ?
+      WHERE username = ? COLLATE NOCASE
+    `).run(nextUsername, now, previousUsername);
 
     return {
       changed: true,
@@ -627,7 +1529,8 @@ export class Store {
           SELECT 1
           FROM files
           JOIN link_tokens ON link_tokens.file_id = files.id
-          WHERE files.video_id = seen_videos.video_id
+          WHERE files.platform = 'tiktok'
+            AND files.video_id = seen_videos.video_id
             AND files.trashed_at IS NULL
             AND link_tokens.expires_at = 0
         )
@@ -642,7 +1545,8 @@ export class Store {
           SELECT link_tokens.token
           FROM files
           JOIN link_tokens ON link_tokens.file_id = files.id
-          WHERE files.video_id = seen_videos.video_id
+          WHERE files.platform = 'tiktok'
+            AND files.video_id = seen_videos.video_id
             AND files.trashed_at IS NULL
             AND link_tokens.expires_at = 0
           ORDER BY link_tokens.created_at DESC
@@ -651,7 +1555,8 @@ export class Store {
         (
           SELECT files.filename
           FROM files
-          WHERE files.video_id = seen_videos.video_id
+          WHERE files.platform = 'tiktok'
+            AND files.video_id = seen_videos.video_id
             AND files.trashed_at IS NULL
           ORDER BY files.created_at DESC
           LIMIT 1
@@ -665,6 +1570,15 @@ export class Store {
           SELECT 1
           FROM watch_subscriptions
           WHERE watch_subscriptions.username = seen_videos.username COLLATE NOCASE
+        )
+        AND EXISTS (
+          SELECT 1
+          FROM files
+          JOIN link_tokens ON link_tokens.file_id = files.id
+          WHERE files.platform = 'tiktok'
+            AND files.video_id = seen_videos.video_id
+            AND files.trashed_at IS NULL
+            AND link_tokens.expires_at = 0
         )
         AND (deletion_check_claimed_at IS NULL OR deletion_check_claimed_at <= ?)
       ORDER BY next_deletion_check_at ASC
@@ -759,6 +1673,7 @@ export class Store {
   }
 
   createJob({
+    platform = 'tiktok',
     type,
     status = 'queued',
     requestedBy = '',
@@ -770,9 +1685,10 @@ export class Store {
     title = '',
   }, now = Date.now()) {
     const result = this.db.prepare(`
-      INSERT INTO jobs (type, status, requested_by, guild_id, channel_id, username, source_url, video_id, title, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO jobs (platform, type, status, requested_by, guild_id, channel_id, username, source_url, video_id, title, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
+      normalizePlatform(platform),
       type,
       status,
       String(requestedBy ?? ''),
@@ -789,8 +1705,10 @@ export class Store {
   }
 
   updateJob(id, changes, now = Date.now()) {
-    const allowed = ['status', 'requested_by', 'guild_id', 'channel_id', 'username', 'source_url', 'video_id', 'title', 'file_id', 'error'];
-    const entries = Object.entries(changes).filter(([key]) => allowed.includes(key));
+    const allowed = ['platform', 'status', 'requested_by', 'guild_id', 'channel_id', 'username', 'source_url', 'video_id', 'title', 'file_id', 'error'];
+    const entries = Object.entries(changes)
+      .filter(([key]) => allowed.includes(key))
+      .map(([key, value]) => [key, key === 'platform' ? normalizePlatform(value) : value]);
     if (!entries.length) return;
     const assignments = entries.map(([key]) => `${key} = ?`).join(', ');
     this.db.prepare(`UPDATE jobs SET ${assignments}, updated_at = ? WHERE id = ?`)
@@ -1266,24 +2184,29 @@ export class Store {
     );
   }
 
-  createFileRecord({ videoId = '', username = '', requestedBy = '', sourceUrl, filePath, filename, sizeBytes }, now = Date.now()) {
+  createFileRecord({ platform = 'tiktok', videoId = '', username = '', requestedBy = '', sourceUrl, filePath, filename, sizeBytes }, now = Date.now()) {
     const result = this.db.prepare(`
-      INSERT INTO files (video_id, username, requested_by, source_url, path, filename, size_bytes, created_at, retention_status)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')
-    `).run(videoId, username, String(requestedBy ?? ''), sourceUrl, filePath, filename, sizeBytes, now);
+      INSERT INTO files (platform, video_id, username, requested_by, source_url, path, filename, size_bytes, created_at, retention_status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
+    `).run(normalizePlatform(platform), videoId, username, String(requestedBy ?? ''), sourceUrl, filePath, filename, sizeBytes, now);
     return Number(result.lastInsertRowid);
   }
 
   getLatestFileByVideoId(videoId, { includeTrashed = false } = {}) {
-    if (!videoId) return null;
+    return this.getLatestFileByPost('tiktok', videoId, { includeTrashed });
+  }
+
+  getLatestFileByPost(platform, postId, { includeTrashed = false } = {}) {
+    if (!postId) return null;
     return this.db.prepare(`
       SELECT *
       FROM files
-      WHERE video_id = ?
+      WHERE platform = ?
+        AND video_id = ?
         ${includeTrashed ? '' : "AND retention_status = 'active'"}
       ORDER BY created_at DESC, id DESC
       LIMIT 1
-    `).get(String(videoId)) ?? null;
+    `).get(normalizePlatform(platform), String(postId)) ?? null;
   }
 
   createLinkToken({
@@ -1295,50 +2218,69 @@ export class Store {
     deliveryType = 'manual',
     expiresAt,
   }, now = Date.now()) {
-    const fileRecord = this.db.prepare('SELECT requested_by, trashed_at FROM files WHERE id = ?').get(fileId);
-    if (!fileRecord || fileRecord.trashed_at != null) {
-      throw new Error('Cannot create a delivery for a missing or trashed archive file.');
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const fileRecord = this.db.prepare(`
+        SELECT requested_by, trashed_at, retention_status
+        FROM files
+        WHERE id = ?
+      `).get(fileId);
+      if (
+        !fileRecord
+        || fileRecord.trashed_at != null
+        || ['trashed', 'trash_claimed', 'trash_failed'].includes(fileRecord.retention_status)
+      ) {
+        throw new Error('Cannot create a delivery for a missing or trashed archive file.');
+      }
+      if (!['active', 'expiry_failed'].includes(fileRecord.retention_status)) {
+        throw new Error('Cannot create a delivery while the archive file is claimed for deletion.');
+      }
+      let resolvedJobId = jobId == null ? null : Number(jobId);
+      let linkedJob = null;
+      if (resolvedJobId == null) {
+        linkedJob = this.db.prepare(`
+          SELECT id, type, requested_by
+          FROM jobs
+          WHERE file_id = ?
+          ORDER BY created_at DESC, id DESC
+          LIMIT 1
+        `).get(fileId) ?? null;
+        resolvedJobId = linkedJob ? Number(linkedJob.id) : null;
+      } else {
+        linkedJob = this.db.prepare('SELECT id, type, requested_by FROM jobs WHERE id = ?').get(resolvedJobId) ?? null;
+      }
+      const legacyOwner = fileRecord.requested_by ?? '';
+      const resolvedOwnerId = String(ownerId || linkedJob?.requested_by || legacyOwner || '');
+      const resolvedDeliveryType = deliveryType === 'manual' && linkedJob?.type === 'monitor'
+        ? 'monitor'
+        : String(deliveryType ?? 'manual');
+      this.db.prepare(`
+        INSERT INTO link_tokens (token, file_id, job_id, owner_id, scope_id, delivery_type, expires_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        token,
+        fileId,
+        resolvedJobId,
+        resolvedOwnerId,
+        String(scopeId ?? ''),
+        resolvedDeliveryType,
+        expiresAt,
+        now,
+      );
+      // A failed deletion remains retryable until a new delivery revives it.
+      // Claimed files are deliberately excluded so cleanup owns the bytes until
+      // it either finalizes the deletion or records a failure.
+      this.db.prepare(`
+        UPDATE files
+        SET delete_requested_at = NULL, delete_error = NULL, retention_status = 'active'
+        WHERE id = ?
+          AND retention_status IN ('active', 'expiry_failed')
+      `).run(fileId);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
     }
-    let resolvedJobId = jobId == null ? null : Number(jobId);
-    let linkedJob = null;
-    if (resolvedJobId == null) {
-      linkedJob = this.db.prepare(`
-        SELECT id, type, requested_by
-        FROM jobs
-        WHERE file_id = ?
-        ORDER BY created_at DESC, id DESC
-        LIMIT 1
-      `).get(fileId) ?? null;
-      resolvedJobId = linkedJob ? Number(linkedJob.id) : null;
-    } else {
-      linkedJob = this.db.prepare('SELECT id, type, requested_by FROM jobs WHERE id = ?').get(resolvedJobId) ?? null;
-    }
-    const legacyOwner = fileRecord.requested_by ?? '';
-    const resolvedOwnerId = String(ownerId || linkedJob?.requested_by || legacyOwner || '');
-    const resolvedDeliveryType = deliveryType === 'manual' && linkedJob?.type === 'monitor'
-      ? 'monitor'
-      : String(deliveryType ?? 'manual');
-    this.db.prepare(`
-      INSERT INTO link_tokens (token, file_id, job_id, owner_id, scope_id, delivery_type, expires_at, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      token,
-      fileId,
-      resolvedJobId,
-      resolvedOwnerId,
-      String(scopeId ?? ''),
-      resolvedDeliveryType,
-      expiresAt,
-      now,
-    );
-    // A new delivery revives an asset that an earlier cleanup pass had marked
-    // for deletion. Its historical attempt count remains useful for diagnosis.
-    this.db.prepare(`
-      UPDATE files
-      SET delete_requested_at = NULL, delete_error = NULL, retention_status = 'active'
-      WHERE id = ?
-        AND retention_status IN ('active', 'expiry_claimed', 'expiry_failed')
-    `).run(fileId);
   }
 
   buildRequesterClause(includeMonitored, scopeId = '') {
@@ -1393,13 +2335,40 @@ export class Store {
     `).get(String(token ?? '')) ?? null;
   }
 
+  getPermanentMonitorDeliveryForFile(fileId, { scopeId = '' } = {}) {
+    const numericFileId = Number(fileId);
+    if (!Number.isInteger(numericFileId) || numericFileId <= 0) return null;
+    return this.db.prepare(`
+      SELECT
+        link_tokens.token,
+        link_tokens.job_id,
+        link_tokens.owner_id,
+        link_tokens.scope_id,
+        link_tokens.delivery_type,
+        link_tokens.expires_at,
+        link_tokens.created_at AS token_created_at,
+        files.*,
+        files.id AS file_id
+      FROM link_tokens
+      JOIN files ON files.id = link_tokens.file_id
+      WHERE link_tokens.file_id = ?
+        AND files.trashed_at IS NULL
+        AND link_tokens.delivery_type = 'monitor'
+        AND link_tokens.expires_at = 0
+        AND link_tokens.scope_id = ?
+      ORDER BY link_tokens.created_at DESC, link_tokens.token DESC
+      LIMIT 1
+    `).get(numericFileId, String(scopeId ?? '')) ?? null;
+  }
+
   getLatestPermanentTokenForVideo(videoId, { scopeId = '' } = {}) {
     if (!videoId) return '';
     const row = this.db.prepare(`
       SELECT link_tokens.token
       FROM link_tokens
       JOIN files ON files.id = link_tokens.file_id
-      WHERE files.video_id = ?
+      WHERE files.platform = 'tiktok'
+        AND files.video_id = ?
         AND files.trashed_at IS NULL
         AND link_tokens.delivery_type = 'monitor'
         AND link_tokens.expires_at = 0
@@ -1431,27 +2400,67 @@ export class Store {
 
   extendLinkToken(token, additionalMs, now = Date.now()) {
     const newExpiry = now + additionalMs;
-    const result = this.db.prepare(`
-      UPDATE link_tokens
-      SET expires_at = CASE
-        WHEN expires_at = 0 THEN 0
-        WHEN expires_at > ? THEN expires_at + ?
-        ELSE ?
-      END
-      WHERE token = ?
-        AND file_id IN (SELECT id FROM files WHERE trashed_at IS NULL)
-    `).run(now, additionalMs, newExpiry, token);
-    return result.changes > 0 ? this.getToken(token) : null;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const result = this.db.prepare(`
+        UPDATE link_tokens
+        SET expires_at = CASE
+          WHEN expires_at = 0 THEN 0
+          WHEN expires_at > ? THEN expires_at + ?
+          ELSE ?
+        END
+        WHERE token = ?
+          AND file_id IN (
+            SELECT id
+            FROM files
+            WHERE trashed_at IS NULL
+              AND retention_status IN ('active', 'expiry_failed')
+          )
+      `).run(now, additionalMs, newExpiry, token);
+      if (result.changes > 0) {
+        this.db.prepare(`
+          UPDATE files
+          SET delete_requested_at = NULL, delete_error = NULL, retention_status = 'active'
+          WHERE id = (SELECT file_id FROM link_tokens WHERE token = ?)
+            AND retention_status = 'expiry_failed'
+        `).run(token);
+      }
+      this.db.exec('COMMIT');
+      return result.changes > 0 ? this.getToken(token) : null;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   setLinkTokenPermanent(token) {
-    const result = this.db.prepare(`
-      UPDATE link_tokens
-      SET expires_at = 0
-      WHERE token = ?
-        AND file_id IN (SELECT id FROM files WHERE trashed_at IS NULL)
-    `).run(token);
-    return result.changes > 0 ? this.getToken(token) : null;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const result = this.db.prepare(`
+        UPDATE link_tokens
+        SET expires_at = 0
+        WHERE token = ?
+          AND file_id IN (
+            SELECT id
+            FROM files
+            WHERE trashed_at IS NULL
+              AND retention_status IN ('active', 'expiry_failed')
+          )
+      `).run(token);
+      if (result.changes > 0) {
+        this.db.prepare(`
+          UPDATE files
+          SET delete_requested_at = NULL, delete_error = NULL, retention_status = 'active'
+          WHERE id = (SELECT file_id FROM link_tokens WHERE token = ?)
+            AND retention_status = 'expiry_failed'
+        `).run(token);
+      }
+      this.db.exec('COMMIT');
+      return result.changes > 0 ? this.getToken(token) : null;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   deleteExpiredTokens(now = Date.now()) {
@@ -1459,7 +2468,7 @@ export class Store {
   }
 
   listFilesWithoutActiveLinks(now = Date.now(), limit = 100, createdBefore = now) {
-    return this.db.prepare(`
+    const files = this.db.prepare(`
       SELECT files.id, files.path, files.filename, files.video_id
       FROM files
       WHERE files.trashed_at IS NULL
@@ -1481,16 +2490,31 @@ export class Store {
       ORDER BY files.created_at ASC
       LIMIT ?
     `).all(createdBefore, now, now, Math.max(1, Math.min(1_000, Number(limit) || 100)));
+    return this.withMediaAssetPaths(files);
   }
 
-  claimFilesForDeletion(now = Date.now(), limit = 100, createdBefore = now) {
+  claimFilesForDeletion(
+    now = Date.now(),
+    limit = 100,
+    createdBefore = now,
+    leaseMs = DEFAULT_DELETION_CLAIM_LEASE_MS,
+  ) {
     const boundedLimit = Math.max(1, Math.min(1_000, Number(limit) || 100));
+    const claimAt = Math.max(0, Number(now) || 0);
+    const staleClaimBefore = claimAt - Math.max(1, Number(leaseMs) || DEFAULT_DELETION_CLAIM_LEASE_MS);
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const files = this.db.prepare(`
         SELECT files.id, files.path, files.filename, files.video_id
         FROM files
         WHERE files.trashed_at IS NULL
+          AND (
+            files.retention_status IN ('active', 'expiry_failed')
+            OR (
+              files.retention_status = 'expiry_claimed'
+              AND files.delete_requested_at <= ?
+            )
+          )
           AND (files.delete_requested_at IS NOT NULL OR files.created_at <= ?)
           AND NOT EXISTS (
             SELECT 1
@@ -1511,7 +2535,7 @@ export class Store {
           files.created_at ASC,
           files.id ASC
         LIMIT ?
-      `).all(createdBefore, now, now, boundedLimit);
+      `).all(staleClaimBefore, createdBefore, claimAt, claimAt, boundedLimit);
       if (files.length) {
         const ids = files.map((file) => Number(file.id));
         const placeholders = ids.map(() => '?').join(', ');
@@ -1523,18 +2547,39 @@ export class Store {
             delete_error = NULL,
             retention_status = 'expiry_claimed'
           WHERE id IN (${placeholders})
-        `).run(now, ...ids);
+            AND (
+              retention_status IN ('active', 'expiry_failed')
+              OR (retention_status = 'expiry_claimed' AND delete_requested_at <= ?)
+            )
+        `).run(claimAt, ...ids, staleClaimBefore);
       }
       this.db.exec('COMMIT');
-      return files;
+      return this.withMediaAssetPaths(files.map((file) => ({
+        ...file,
+        delete_requested_at: claimAt,
+        retention_status: 'expiry_claimed',
+      })));
     } catch (error) {
       this.db.exec('ROLLBACK');
       throw error;
     }
   }
 
-  markFileDeletionFailed(fileId, error, now = Date.now()) {
+  markFileDeletionFailed(fileId, error, now = Date.now(), {
+    expectedRetentionStatus = '',
+    expectedRequestedAt = null,
+  } = {}) {
     const message = String(error?.message ?? error ?? 'Unknown disk deletion failure').slice(0, 500);
+    const clauses = ['id = ?'];
+    const params = [now, message, Number(fileId)];
+    if (expectedRetentionStatus) {
+      clauses.push('retention_status = ?');
+      params.push(String(expectedRetentionStatus));
+    }
+    if (expectedRequestedAt != null) {
+      clauses.push('delete_requested_at = ?');
+      params.push(Number(expectedRequestedAt));
+    }
     const result = this.db.prepare(`
       UPDATE files
       SET
@@ -1545,9 +2590,322 @@ export class Store {
           WHEN trashed_at IS NOT NULL OR retention_status IN ('trashed', 'trash_claimed', 'trash_failed') THEN 'trash_failed'
           ELSE 'expiry_failed'
         END
-      WHERE id = ?
-    `).run(now, message, Number(fileId));
+      WHERE ${clauses.join(' AND ')}
+    `).run(...params);
     return result.changes > 0;
+  }
+
+  listRewindCreators() {
+    return this.db.prepare(`
+      WITH saved AS (
+        SELECT
+          lower(username) AS username_key,
+          username,
+          COUNT(*) AS video_count,
+          SUM(size_bytes) AS size_bytes,
+          MAX(created_at) AS latest_created_at
+        FROM files
+        WHERE files.platform = 'tiktok'
+          AND username IS NOT NULL
+          AND username <> ''
+          AND lower(filename) LIKE '%.mp4'
+          AND trashed_at IS NULL
+        GROUP BY lower(username)
+      )
+      SELECT
+        watched_users.username,
+        COALESCE(saved.video_count, 0) AS video_count,
+        COALESCE(saved.size_bytes, 0) AS size_bytes,
+        COALESCE(saved.latest_created_at, watched_users.last_success_at, watched_users.created_at) AS latest_at,
+        watched_users.failure_count,
+        1 AS enabled
+      FROM watched_users
+      LEFT JOIN saved ON saved.username_key = lower(watched_users.username)
+      UNION ALL
+      SELECT
+        saved.username,
+        saved.video_count,
+        saved.size_bytes,
+        saved.latest_created_at AS latest_at,
+        0 AS failure_count,
+        0 AS enabled
+      FROM saved
+      WHERE NOT EXISTS (
+        SELECT 1 FROM watched_users WHERE lower(watched_users.username) = saved.username_key
+      )
+      ORDER BY video_count DESC, username ASC
+    `).all();
+  }
+
+  listRewindVideos({
+    username = '',
+    fileId = null,
+    limit = 500,
+    cursor = null,
+    bookmarkedOnly = false,
+  } = {}) {
+    const clauses = [
+      "files.platform = 'tiktok'",
+      "lower(files.filename) LIKE '%.mp4'",
+      'files.trashed_at IS NULL',
+    ];
+    const params = [];
+    const normalizedUsername = String(username ?? '').trim();
+    if (normalizedUsername) {
+      clauses.push('files.username = ? COLLATE NOCASE');
+      params.push(normalizedUsername);
+    }
+    if (fileId != null && fileId !== '') {
+      clauses.push('files.id = ?');
+      params.push(normalizePositiveId(fileId, 'file'));
+    }
+    if (cursor != null) {
+      const createdAt = Number(cursor?.createdAt ?? cursor?.created_at);
+      const cursorFileId = Number(cursor?.fileId ?? cursor?.file_id);
+      if (!Number.isSafeInteger(createdAt) || createdAt < 0) {
+        throw new Error('A valid Rewind cursor timestamp is required.');
+      }
+      if (!Number.isSafeInteger(cursorFileId) || cursorFileId <= 0) {
+        throw new Error('A valid Rewind cursor file ID is required.');
+      }
+      clauses.push('(files.created_at < ? OR (files.created_at = ? AND files.id < ?))');
+      params.push(createdAt, createdAt, cursorFileId);
+    }
+    if (bookmarkedOnly) {
+      clauses.push(`EXISTS (
+        SELECT 1 FROM bookmarks WHERE bookmarks.file_id = files.id
+      )`);
+    }
+    const boundedLimit = Math.max(1, Math.min(5_001, Math.trunc(Number(limit) || 500)));
+    params.push(boundedLimit);
+
+    return this.db.prepare(`
+      SELECT
+        files.id,
+        files.video_id,
+        files.username,
+        files.source_url,
+        files.path,
+        files.filename,
+        files.size_bytes,
+        files.created_at,
+        COALESCE(
+          (
+            SELECT jobs.title
+            FROM jobs
+            WHERE jobs.file_id = files.id
+              AND jobs.title IS NOT NULL
+              AND jobs.title <> ''
+            ORDER BY jobs.created_at DESC, jobs.id DESC
+            LIMIT 1
+          ),
+          files.filename
+        ) AS title
+      FROM files
+      WHERE ${clauses.join('\n        AND ')}
+      ORDER BY files.created_at DESC, files.id DESC
+      LIMIT ?
+    `).all(...params);
+  }
+
+  listRewindMediaPosts({
+    platform = '',
+    username = '',
+    profileId = null,
+    groupId = null,
+    fileId = null,
+    limit = 100,
+    cursor = null,
+    bookmarkedOnly = false,
+    trashedOnly = false,
+  } = {}) {
+    const clauses = [trashedOnly
+      ? "files.retention_status IN ('trashed', 'trash_claimed', 'trash_failed')"
+      : 'files.trashed_at IS NULL'];
+    const params = [];
+    const normalizedPlatform = String(platform ?? '').trim();
+    if (normalizedPlatform) {
+      clauses.push('files.platform = ?');
+      params.push(normalizePlatform(normalizedPlatform));
+    }
+    const normalizedUsername = String(username ?? '').trim().replace(/^@/, '');
+    if (normalizedUsername) {
+      clauses.push(`COALESCE(NULLIF(media_posts.creator_handle, ''), files.username, '') = ? COLLATE NOCASE`);
+      params.push(normalizedUsername);
+    }
+    if (profileId != null && profileId !== '') {
+      clauses.push('media_posts.profile_id = ?');
+      params.push(normalizePositiveId(profileId, 'profile'));
+    }
+    if (groupId != null && groupId !== '') {
+      clauses.push('creator_group_memberships.group_id = ?');
+      params.push(normalizePositiveId(groupId, 'creator group'));
+    }
+    if (fileId != null && fileId !== '') {
+      clauses.push('files.id = ?');
+      params.push(normalizePositiveId(fileId, 'file'));
+    }
+    if (cursor != null) {
+      const createdAt = Number(cursor?.createdAt ?? cursor?.created_at);
+      const cursorFileId = Number(cursor?.fileId ?? cursor?.file_id);
+      if (!Number.isSafeInteger(createdAt) || createdAt < 0) {
+        throw new Error('A valid Rewind media cursor timestamp is required.');
+      }
+      if (!Number.isSafeInteger(cursorFileId) || cursorFileId <= 0) {
+        throw new Error('A valid Rewind media cursor file ID is required.');
+      }
+      clauses.push('(files.created_at < ? OR (files.created_at = ? AND files.id < ?))');
+      params.push(createdAt, createdAt, cursorFileId);
+    }
+    if (bookmarkedOnly) {
+      clauses.push('EXISTS (SELECT 1 FROM bookmarks WHERE bookmarks.file_id = files.id)');
+    }
+    const boundedLimit = Math.max(1, Math.min(501, Math.trunc(Number(limit) || 100)));
+    params.push(boundedLimit);
+
+    const rows = this.db.prepare(`
+      SELECT
+        files.id,
+        files.platform,
+        files.video_id AS remote_id,
+        files.username,
+        files.source_url,
+        files.path,
+        files.filename,
+        files.size_bytes,
+        files.created_at,
+        files.trashed_at,
+        files.retention_status,
+        media_posts.id AS post_id,
+        media_posts.profile_id,
+        COALESCE(NULLIF(media_posts.creator_handle, ''), files.username, '') AS creator_handle,
+        COALESCE(media_posts.creator_remote_id, '') AS creator_remote_id,
+        COALESCE(NULLIF(platform_profiles.display_name, ''), '') AS creator_display_name,
+        COALESCE(platform_profiles.profile_url, '') AS creator_profile_url,
+        creator_group_memberships.group_id AS creator_group_id,
+        COALESCE(creator_groups.name, '') AS creator_group_name,
+        COALESCE(NULLIF(media_posts.canonical_url, ''), files.source_url) AS canonical_url,
+        COALESCE(NULLIF(media_posts.title, ''), (
+          SELECT jobs.title
+          FROM jobs
+          WHERE jobs.file_id = files.id
+            AND jobs.title IS NOT NULL
+            AND jobs.title <> ''
+          ORDER BY jobs.created_at DESC, jobs.id DESC
+          LIMIT 1
+        ), files.filename) AS title,
+        COALESCE(media_posts.description, '') AS description,
+        COALESCE(NULLIF(media_posts.media_type, ''), '') AS media_type,
+        media_posts.published_at,
+        media_posts.duration_seconds,
+        CASE WHEN EXISTS (
+          SELECT 1 FROM bookmarks WHERE bookmarks.file_id = files.id
+        ) THEN 1 ELSE 0 END AS bookmarked
+      FROM files
+      LEFT JOIN media_posts
+        ON media_posts.platform = files.platform
+       AND media_posts.remote_id = files.video_id
+      LEFT JOIN platform_profiles ON platform_profiles.id = media_posts.profile_id
+      LEFT JOIN creator_group_memberships
+        ON creator_group_memberships.profile_id = media_posts.profile_id
+      LEFT JOIN creator_groups ON creator_groups.id = creator_group_memberships.group_id
+      WHERE ${clauses.join('\n        AND ')}
+      ORDER BY files.created_at DESC, files.id DESC
+      LIMIT ?
+    `).all(...params);
+    if (!rows.length) return [];
+
+    const fileIds = rows.map((row) => Number(row.id));
+    const placeholders = fileIds.map(() => '?').join(', ');
+    const storedAssets = this.db.prepare(`
+      SELECT
+        id,
+        post_id,
+        file_id,
+        position,
+        role,
+        remote_id,
+        kind,
+        mime_type,
+        path,
+        filename,
+        size_bytes,
+        width,
+        height,
+        duration_seconds
+      FROM media_assets
+      WHERE file_id IN (${placeholders})
+      ORDER BY file_id,
+        CASE role WHEN 'content' THEN 0 WHEN 'primary' THEN 1 WHEN 'package' THEN 2 ELSE 3 END,
+        position,
+        id
+    `).all(...fileIds);
+    const assetsByFile = new Map();
+    for (const asset of storedAssets) {
+      const assets = assetsByFile.get(Number(asset.file_id)) ?? [];
+      assets.push(asset);
+      assetsByFile.set(Number(asset.file_id), assets);
+    }
+    return rows.map((row) => {
+      const assets = assetsByFile.get(Number(row.id)) ?? [rewindFallbackAsset(row)];
+      return {
+        ...row,
+        asset_count: assets.filter((asset) => asset.role === 'content' || asset.role === 'primary').length,
+        assets,
+      };
+    });
+  }
+
+  getRewindStats(now = Date.now()) {
+    const timestamp = Math.max(0, Math.trunc(Number(now) || 0));
+    const current = new Date(timestamp);
+    const startOfUtcDay = Date.UTC(
+      current.getUTCFullYear(),
+      current.getUTCMonth(),
+      current.getUTCDate(),
+    );
+    return this.db.prepare(`
+      SELECT
+        (
+          SELECT COUNT(*)
+          FROM (
+            SELECT lower(username) AS username_key FROM watched_users
+            UNION
+            SELECT lower(username) AS username_key
+            FROM files
+            WHERE files.platform = 'tiktok'
+              AND username <> ''
+              AND lower(filename) LIKE '%.mp4'
+              AND trashed_at IS NULL
+          )
+        ) AS creator_count,
+        (
+          SELECT COUNT(*) FROM files
+          WHERE files.platform = 'tiktok'
+            AND lower(filename) LIKE '%.mp4' AND trashed_at IS NULL
+        ) AS video_count,
+        (
+          SELECT COALESCE(SUM(size_bytes), 0) FROM files
+          WHERE files.platform = 'tiktok'
+            AND lower(filename) LIKE '%.mp4' AND trashed_at IS NULL
+        ) AS size_bytes,
+        (
+          SELECT COUNT(*)
+          FROM files
+          WHERE files.platform = 'tiktok'
+            AND lower(filename) LIKE '%.mp4'
+            AND trashed_at IS NULL
+            AND created_at >= ?
+        ) AS new_this_week,
+        (
+          SELECT COUNT(*)
+          FROM files
+          WHERE files.platform = 'tiktok'
+            AND lower(filename) LIKE '%.mp4'
+            AND trashed_at IS NULL
+            AND created_at >= ?
+        ) AS added_today
+    `).get(timestamp - 7 * 24 * 60 * 60 * 1_000, startOfUtcDay);
   }
 
   listBookmarkedFileIds() {
@@ -1555,7 +2913,8 @@ export class Store {
       SELECT bookmarks.file_id
       FROM bookmarks
       JOIN files ON files.id = bookmarks.file_id
-      WHERE files.trashed_at IS NULL
+      WHERE files.platform = 'tiktok'
+        AND files.trashed_at IS NULL
         AND lower(files.filename) LIKE '%.mp4'
       ORDER BY bookmarks.created_at DESC, bookmarks.file_id DESC
     `).all().map((row) => Number(row.file_id));
@@ -1565,7 +2924,16 @@ export class Store {
     const numericId = Number(fileId);
     if (!Number.isInteger(numericId) || numericId <= 0) return false;
     if (!bookmarked) {
-      this.db.prepare('DELETE FROM bookmarks WHERE file_id = ?').run(numericId);
+      this.db.prepare(`
+        DELETE FROM bookmarks
+        WHERE file_id = ?
+          AND EXISTS (
+            SELECT 1
+            FROM files
+            WHERE files.id = bookmarks.file_id
+              AND files.platform = 'tiktok'
+          )
+      `).run(numericId);
       return true;
     }
     const result = this.db.prepare(`
@@ -1573,6 +2941,7 @@ export class Store {
       SELECT id, ?
       FROM files
       WHERE id = ?
+        AND platform = 'tiktok'
         AND trashed_at IS NULL
         AND lower(filename) LIKE '%.mp4'
       ON CONFLICT(file_id) DO NOTHING
@@ -1583,8 +2952,77 @@ export class Store {
       FROM bookmarks
       JOIN files ON files.id = bookmarks.file_id
       WHERE bookmarks.file_id = ?
+        AND files.platform = 'tiktok'
         AND files.trashed_at IS NULL
     `).get(numericId));
+  }
+
+  setMediaFileBookmark(fileId, bookmarked, now = Date.now()) {
+    const numericId = Number(fileId);
+    if (!Number.isInteger(numericId) || numericId <= 0) return false;
+    const active = this.db.prepare(`
+      SELECT 1
+      FROM files
+      WHERE id = ?
+        AND trashed_at IS NULL
+    `).get(numericId);
+    if (!active) return false;
+    if (!bookmarked) {
+      this.db.prepare('DELETE FROM bookmarks WHERE file_id = ?').run(numericId);
+      return true;
+    }
+    this.db.prepare(`
+      INSERT INTO bookmarks (file_id, created_at)
+      VALUES (?, ?)
+      ON CONFLICT(file_id) DO NOTHING
+    `).run(numericId, now);
+    return true;
+  }
+
+  trashMediaFile(fileId, now = Date.now()) {
+    const numericId = Number(fileId);
+    if (!Number.isInteger(numericId) || numericId <= 0) return null;
+    const result = this.db.prepare(`
+      UPDATE files
+      SET
+        trashed_at = ?,
+        delete_requested_at = NULL,
+        delete_error = NULL,
+        retention_status = 'trashed'
+      WHERE id = ?
+        AND trashed_at IS NULL
+        AND retention_status IN ('active', 'expiry_failed')
+    `).run(now, numericId);
+    if (!result.changes) return null;
+    return this.getTrashedMediaFile(numericId);
+  }
+
+  getTrashedMediaFile(fileId) {
+    const numericId = Number(fileId);
+    if (!Number.isInteger(numericId) || numericId <= 0) return null;
+    const file = this.db.prepare(`
+      SELECT *
+      FROM files
+      WHERE id = ?
+        AND retention_status IN ('trashed', 'trash_claimed', 'trash_failed')
+    `).get(numericId);
+    return file ? this.withMediaAssetPaths([file])[0] : null;
+  }
+
+  restoreTrashedMediaFile(fileId) {
+    const numericId = Number(fileId);
+    if (!Number.isInteger(numericId) || numericId <= 0) return null;
+    const result = this.db.prepare(`
+      UPDATE files
+      SET
+        trashed_at = NULL,
+        delete_requested_at = NULL,
+        delete_error = NULL,
+        retention_status = 'active'
+      WHERE id = ?
+        AND retention_status IN ('trashed', 'trash_failed')
+    `).run(numericId);
+    return result.changes > 0 ? this.db.prepare('SELECT * FROM files WHERE id = ?').get(numericId) : null;
   }
 
   addFileBookmarks(fileIds, now = Date.now()) {
@@ -1595,6 +3033,7 @@ export class Store {
       SELECT id, ?
       FROM files
       WHERE id = ?
+        AND platform = 'tiktok'
         AND trashed_at IS NULL
         AND lower(filename) LIKE '%.mp4'
       ON CONFLICT(file_id) DO NOTHING
@@ -1621,7 +3060,8 @@ export class Store {
         delete_error = NULL,
         retention_status = 'trashed'
       WHERE id = ?
-        AND retention_status IN ('active', 'expiry_claimed', 'expiry_failed')
+        AND platform = 'tiktok'
+        AND retention_status IN ('active', 'expiry_failed')
     `).run(now, numericId);
     if (!result.changes) return null;
     return this.getTrashedFile(numericId);
@@ -1633,9 +3073,11 @@ export class Store {
     const files = this.db.prepare(`
       SELECT id
       FROM files
-      WHERE lower(username) = lower(?)
+      WHERE platform = 'tiktok'
+        AND lower(username) = lower(?)
         AND lower(filename) LIKE '%.mp4'
         AND trashed_at IS NULL
+        AND retention_status IN ('active', 'expiry_failed')
       ORDER BY created_at ASC, id ASC
     `).all(normalized);
     if (!files.length) return [];
@@ -1649,7 +3091,7 @@ export class Store {
         delete_error = NULL,
         retention_status = 'trashed'
       WHERE id IN (${placeholders})
-        AND retention_status IN ('active', 'expiry_claimed', 'expiry_failed')
+        AND retention_status IN ('active', 'expiry_failed')
     `).run(now, ...ids);
     return ids;
   }
@@ -1661,15 +3103,17 @@ export class Store {
       SELECT *
       FROM files
       WHERE id = ?
+        AND platform = 'tiktok'
         AND retention_status IN ('trashed', 'trash_claimed', 'trash_failed')
     `).get(numericId) ?? null;
   }
 
   listTrashedFiles(limit = 100) {
     return this.db.prepare(`
-      SELECT id, video_id, username, source_url, path, filename, size_bytes, created_at, trashed_at, retention_status
+      SELECT id, platform, video_id, username, source_url, path, filename, size_bytes, created_at, trashed_at, retention_status
       FROM files
-      WHERE retention_status IN ('trashed', 'trash_claimed', 'trash_failed')
+      WHERE platform = 'tiktok'
+        AND retention_status IN ('trashed', 'trash_claimed', 'trash_failed')
       ORDER BY trashed_at DESC, id DESC
       LIMIT ?
     `).all(Math.max(1, Math.min(1_000, Number(limit) || 100)));
@@ -1686,13 +3130,21 @@ export class Store {
         delete_error = NULL,
         retention_status = 'active'
       WHERE id = ?
+        AND platform = 'tiktok'
         AND retention_status IN ('trashed', 'trash_failed')
     `).run(numericId);
     return result.changes > 0 ? this.db.prepare('SELECT * FROM files WHERE id = ?').get(numericId) : null;
   }
 
-  claimTrashedFilesForDeletion(trashedBefore, now = Date.now(), limit = 100) {
+  claimTrashedFilesForDeletion(
+    trashedBefore,
+    now = Date.now(),
+    limit = 100,
+    leaseMs = DEFAULT_DELETION_CLAIM_LEASE_MS,
+  ) {
     const boundedLimit = Math.max(1, Math.min(1_000, Number(limit) || 100));
+    const claimAt = Math.max(0, Number(now) || 0);
+    const staleClaimBefore = claimAt - Math.max(1, Number(leaseMs) || DEFAULT_DELETION_CLAIM_LEASE_MS);
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const files = this.db.prepare(`
@@ -1700,12 +3152,16 @@ export class Store {
         FROM files
         WHERE trashed_at IS NOT NULL
           AND trashed_at <= ?
+          AND (
+            retention_status IN ('trashed', 'trash_failed')
+            OR (retention_status = 'trash_claimed' AND delete_requested_at <= ?)
+          )
         ORDER BY
           CASE WHEN delete_requested_at IS NULL THEN 0 ELSE 1 END,
           trashed_at ASC,
           id ASC
         LIMIT ?
-      `).all(Number(trashedBefore), boundedLimit);
+      `).all(Number(trashedBefore), staleClaimBefore, boundedLimit);
       if (files.length) {
         const ids = files.map((file) => Number(file.id));
         const placeholders = ids.map(() => '?').join(', ');
@@ -1717,11 +3173,18 @@ export class Store {
             delete_error = NULL,
             retention_status = 'trash_claimed'
           WHERE id IN (${placeholders})
-            AND retention_status IN ('trashed', 'trash_failed', 'trash_claimed')
-        `).run(now, ...ids);
+            AND (
+              retention_status IN ('trashed', 'trash_failed')
+              OR (retention_status = 'trash_claimed' AND delete_requested_at <= ?)
+            )
+        `).run(claimAt, ...ids, staleClaimBefore);
       }
       this.db.exec('COMMIT');
-      return files;
+      return this.withMediaAssetPaths(files.map((file) => ({
+        ...file,
+        delete_requested_at: claimAt,
+        retention_status: 'trash_claimed',
+      })));
     } catch (error) {
       this.db.exec('ROLLBACK');
       throw error;
@@ -1731,12 +3194,14 @@ export class Store {
   claimTrashedFileForDeletion(fileId, now = Date.now()) {
     const numericId = Number(fileId);
     if (!Number.isInteger(numericId) || numericId <= 0) return null;
+    const claimAt = Math.max(0, Number(now) || 0);
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const file = this.db.prepare(`
         SELECT id, path, filename, video_id, username, trashed_at
         FROM files
         WHERE id = ?
+          AND platform = 'tiktok'
           AND retention_status IN ('trashed', 'trash_failed')
       `).get(numericId);
       if (!file) {
@@ -1752,9 +3217,13 @@ export class Store {
           retention_status = 'trash_claimed'
         WHERE id = ?
           AND retention_status IN ('trashed', 'trash_failed')
-      `).run(Number(now), numericId);
+      `).run(claimAt, numericId);
       this.db.exec('COMMIT');
-      return claimed.changes > 0 ? file : null;
+      return claimed.changes > 0 ? this.withMediaAssetPaths([{
+        ...file,
+        delete_requested_at: claimAt,
+        retention_status: 'trash_claimed',
+      }])[0] : null;
     } catch (error) {
       this.db.exec('ROLLBACK');
       throw error;
@@ -1762,12 +3231,14 @@ export class Store {
   }
 
   claimAllTrashedFilesForDeletion(now = Date.now()) {
+    const claimAt = Math.max(0, Number(now) || 0);
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const files = this.db.prepare(`
         SELECT id, path, filename, video_id, username, trashed_at
         FROM files
-        WHERE retention_status IN ('trashed', 'trash_failed')
+        WHERE platform = 'tiktok'
+          AND retention_status IN ('trashed', 'trash_failed')
         ORDER BY trashed_at ASC, id ASC
       `).all();
       if (files.length) {
@@ -1782,10 +3253,14 @@ export class Store {
             retention_status = 'trash_claimed'
           WHERE id IN (${placeholders})
             AND retention_status IN ('trashed', 'trash_failed')
-        `).run(Number(now), ...ids);
+        `).run(claimAt, ...ids);
       }
       this.db.exec('COMMIT');
-      return files;
+      return this.withMediaAssetPaths(files.map((file) => ({
+        ...file,
+        delete_requested_at: claimAt,
+        retention_status: 'trash_claimed',
+      })));
     } catch (error) {
       this.db.exec('ROLLBACK');
       throw error;
@@ -1797,28 +3272,78 @@ export class Store {
     if (!ids.length) return [];
     const placeholders = ids.map(() => '?').join(', ');
     return this.db.prepare(`
-      SELECT DISTINCT path
-      FROM files
-      WHERE id NOT IN (${placeholders})
-        AND path IN (
-          SELECT path
-          FROM files
-          WHERE id IN (${placeholders})
-        )
-    `).all(...ids, ...ids).map((row) => row.path);
+      WITH selected_paths(path) AS (
+        SELECT path FROM files WHERE id IN (${placeholders})
+        UNION
+        SELECT path FROM media_assets WHERE file_id IN (${placeholders})
+      ),
+      outside_paths(path) AS (
+        SELECT path FROM files WHERE id NOT IN (${placeholders})
+        UNION
+        SELECT path FROM media_assets WHERE file_id NOT IN (${placeholders})
+      )
+      SELECT DISTINCT outside_paths.path
+      FROM outside_paths
+      JOIN selected_paths ON selected_paths.path = outside_paths.path
+    `).all(...ids, ...ids, ...ids, ...ids).map((row) => row.path);
   }
 
-  deleteFileRecords(ids = []) {
+  deleteFileRecords(ids = [], {
+    requiredRetentionStatus = '',
+    claimRequestedAt = null,
+    requireNoActiveLinks = false,
+    now = Date.now(),
+  } = {}) {
     const uniqueIds = normalizeIds(ids);
     if (!uniqueIds.length) return 0;
-    const placeholders = uniqueIds.map(() => '?').join(', ');
-    const files = this.db.prepare(`SELECT id, video_id FROM files WHERE id IN (${placeholders})`).all(...uniqueIds);
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      this.db.prepare(`DELETE FROM jobs WHERE file_id IN (${placeholders})`).run(...uniqueIds);
-      const deleted = this.db.prepare(`DELETE FROM files WHERE id IN (${placeholders})`).run(...uniqueIds).changes;
+      const idPlaceholders = uniqueIds.map(() => '?').join(', ');
+      const clauses = [`files.id IN (${idPlaceholders})`];
+      const params = [...uniqueIds];
+      const requiredStatuses = (Array.isArray(requiredRetentionStatus)
+        ? requiredRetentionStatus
+        : [requiredRetentionStatus])
+        .map((status) => String(status ?? '').trim())
+        .filter(Boolean);
+      if (requiredStatuses.length) {
+        clauses.push(`files.retention_status IN (${requiredStatuses.map(() => '?').join(', ')})`);
+        params.push(...requiredStatuses);
+      }
+      if (claimRequestedAt != null) {
+        clauses.push('files.delete_requested_at = ?');
+        params.push(Number(claimRequestedAt));
+      }
+      if (requireNoActiveLinks) {
+        clauses.push(`NOT EXISTS (
+          SELECT 1
+          FROM link_tokens
+          WHERE link_tokens.file_id = files.id
+            AND (link_tokens.expires_at = 0 OR link_tokens.expires_at > ?)
+        )`);
+        params.push(Number(now));
+      }
+      const files = this.db.prepare(`
+        SELECT files.id, files.platform, files.video_id
+        FROM files
+        WHERE ${clauses.join('\n          AND ')}
+      `).all(...params);
+      if (!files.length) {
+        this.db.exec('COMMIT');
+        return 0;
+      }
+      const removableIds = files.map((file) => Number(file.id));
+      const placeholders = removableIds.map(() => '?').join(', ');
+      const mediaPostIds = this.db.prepare(`
+        SELECT DISTINCT post_id
+        FROM media_assets
+        WHERE file_id IN (${placeholders})
+      `).all(...removableIds).map((row) => Number(row.post_id));
+      this.db.prepare(`DELETE FROM jobs WHERE file_id IN (${placeholders})`).run(...removableIds);
+      const deleted = this.db.prepare(`DELETE FROM files WHERE id IN (${placeholders})`).run(...removableIds).changes;
+      this.pruneMediaPostsWithoutAssets(mediaPostIds);
       for (const file of files) {
-        if (file.video_id) {
+        if (file.platform === 'tiktok' && file.video_id) {
           this.db.prepare('UPDATE seen_videos SET next_deletion_check_at = NULL WHERE video_id = ?').run(file.video_id);
         }
       }
@@ -1830,41 +3355,107 @@ export class Store {
     }
   }
 
-  planDeliveryDeletion(token, now = Date.now()) {
-    const record = this.getToken(token);
-    if (!record) return null;
-    const hasOtherActiveLinks = Boolean(this.db.prepare(`
-      SELECT 1
-      FROM files AS shared_files
-      JOIN link_tokens AS shared_links ON shared_links.file_id = shared_files.id
-      WHERE shared_files.path = ?
-        AND (
-          shared_files.id <> ?
-          OR shared_links.token <> ?
+  pruneMediaPostsWithoutAssets(postIds = []) {
+    const ids = normalizeIds(postIds);
+    if (!ids.length) return 0;
+    const placeholders = ids.map(() => '?').join(', ');
+    return this.db.prepare(`
+      DELETE FROM media_posts
+      WHERE id IN (${placeholders})
+        AND NOT EXISTS (
+          SELECT 1
+          FROM media_assets
+          WHERE media_assets.post_id = media_posts.id
         )
-        AND (shared_links.expires_at = 0 OR shared_links.expires_at > ?)
-      LIMIT 1
-    `).get(record.path, record.id, String(token), now));
-    return {
-      record,
-      file: hasOtherActiveLinks ? null : {
-        id: record.id,
-        path: record.path,
-        filename: record.filename,
-        video_id: record.video_id,
-      },
-    };
+    `).run(...ids).changes;
+  }
+
+  planDeliveryDeletion(token, now = Date.now()) {
+    const claimAt = Math.max(0, Number(now) || 0);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const record = this.getToken(token);
+      if (!record) {
+        this.db.exec('COMMIT');
+        return null;
+      }
+      const hasOtherActiveLinks = Boolean(this.db.prepare(`
+        SELECT 1
+        FROM files AS shared_files
+        JOIN link_tokens AS shared_links ON shared_links.file_id = shared_files.id
+        WHERE shared_files.path = ?
+          AND (
+            shared_files.id <> ?
+            OR shared_links.token <> ?
+          )
+          AND (shared_links.expires_at = 0 OR shared_links.expires_at > ?)
+        LIMIT 1
+      `).get(record.path, record.id, String(token), claimAt));
+      let deletionFile = null;
+      if (!hasOtherActiveLinks) {
+        const claimed = this.db.prepare(`
+          UPDATE files
+          SET
+            delete_requested_at = ?,
+            delete_attempts = delete_attempts + 1,
+            delete_error = NULL,
+            retention_status = 'expiry_claimed'
+          WHERE id = ?
+            AND trashed_at IS NULL
+            AND retention_status IN ('active', 'expiry_failed')
+        `).run(claimAt, record.id);
+        if (claimed.changes > 0) {
+          deletionFile = this.withMediaAssetPaths([{
+            id: record.id,
+            path: record.path,
+            filename: record.filename,
+            video_id: record.video_id,
+            delete_requested_at: claimAt,
+            retention_status: 'expiry_claimed',
+          }])[0];
+        }
+      }
+      this.db.exec('COMMIT');
+      return { record, file: deletionFile };
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   deleteDeliveryToken(token, { deleteFile = false, now = Date.now() } = {}) {
-    const record = this.getToken(token);
-    if (!record) return { files: 0, links: 0, jobs: 0 };
-    const fileId = Number(record.id);
-    const jobId = Number(record.job_id);
-    let files = 0;
-    let jobs = 0;
+    const timestamp = Math.max(0, Number(now) || 0);
     this.db.exec('BEGIN IMMEDIATE');
     try {
+      const record = this.getToken(token);
+      if (!record) {
+        this.db.exec('COMMIT');
+        return { files: 0, links: 0, jobs: 0 };
+      }
+      const fileId = Number(record.id);
+      const jobId = Number(record.job_id);
+      let files = 0;
+      let jobs = 0;
+      if (deleteFile) {
+        this.db.prepare(`
+          UPDATE files
+          SET
+            delete_requested_at = ?,
+            delete_attempts = delete_attempts + 1,
+            delete_error = NULL,
+            retention_status = 'expiry_claimed'
+          WHERE id = ?
+            AND trashed_at IS NULL
+            AND retention_status IN ('active', 'expiry_failed')
+            AND NOT EXISTS (
+              SELECT 1
+              FROM link_tokens
+              WHERE link_tokens.file_id = files.id
+                AND link_tokens.token <> ?
+                AND (link_tokens.expires_at = 0 OR link_tokens.expires_at > ?)
+            )
+        `).run(timestamp, fileId, String(token), timestamp);
+      }
       let links = this.db.prepare('DELETE FROM link_tokens WHERE token = ?').run(String(token)).changes;
       if (Number.isFinite(jobId)) {
         const remainingJobLinks = this.db.prepare('SELECT 1 FROM link_tokens WHERE job_id = ? LIMIT 1').get(jobId);
@@ -1878,15 +3469,44 @@ export class Store {
           WHERE file_id = ?
             AND expires_at > 0
             AND expires_at <= ?
-        `).run(fileId, now).changes;
+        `).run(fileId, timestamp).changes;
       }
-      if (deleteFile && !this.db.prepare('SELECT 1 FROM link_tokens WHERE file_id = ? LIMIT 1').get(fileId)) {
-        const file = this.db.prepare('SELECT video_id FROM files WHERE id = ?').get(fileId);
+      const hasActiveLinks = Boolean(this.db.prepare(`
+        SELECT 1
+        FROM link_tokens
+        WHERE file_id = ?
+          AND (expires_at = 0 OR expires_at > ?)
+        LIMIT 1
+      `).get(fileId, timestamp));
+      const file = deleteFile
+        ? this.db.prepare('SELECT platform, video_id, retention_status FROM files WHERE id = ?').get(fileId)
+        : null;
+      if (deleteFile && file?.retention_status === 'expiry_claimed' && !hasActiveLinks) {
+        const mediaPostIds = this.db.prepare(`
+          SELECT DISTINCT post_id FROM media_assets WHERE file_id = ?
+        `).all(fileId).map((row) => Number(row.post_id));
         jobs += this.db.prepare('DELETE FROM jobs WHERE file_id = ?').run(fileId).changes;
-        files = this.db.prepare('DELETE FROM files WHERE id = ?').run(fileId).changes;
-        if (file?.video_id) {
+        files = this.db.prepare(`
+          DELETE FROM files
+          WHERE id = ?
+            AND retention_status = 'expiry_claimed'
+            AND NOT EXISTS (
+              SELECT 1
+              FROM link_tokens
+              WHERE link_tokens.file_id = files.id
+                AND (link_tokens.expires_at = 0 OR link_tokens.expires_at > ?)
+            )
+        `).run(fileId, timestamp).changes;
+        this.pruneMediaPostsWithoutAssets(mediaPostIds);
+        if (file?.platform === 'tiktok' && file.video_id) {
           this.db.prepare('UPDATE seen_videos SET next_deletion_check_at = NULL WHERE video_id = ?').run(file.video_id);
         }
+      } else if (deleteFile && file?.retention_status === 'expiry_claimed' && hasActiveLinks) {
+        this.db.prepare(`
+          UPDATE files
+          SET delete_requested_at = NULL, delete_error = NULL, retention_status = 'active'
+          WHERE id = ? AND retention_status = 'expiry_claimed'
+        `).run(fileId);
       }
       this.db.exec('COMMIT');
       return { files, links, jobs };
@@ -1925,6 +3545,7 @@ export class Store {
         link_tokens.expires_at,
         link_tokens.created_at AS token_created_at,
         files.id AS file_id,
+        files.platform,
         files.video_id,
         files.username,
         files.source_url,
@@ -1997,6 +3618,7 @@ export class Store {
           link_tokens.expires_at,
           link_tokens.created_at AS token_created_at,
           files.id AS file_id,
+          files.platform,
           files.video_id,
           files.username,
           files.source_url,
@@ -2022,6 +3644,7 @@ export class Store {
         expires_at,
         token_created_at,
         file_id,
+        platform,
         video_id,
         username,
         source_url,
@@ -2090,6 +3713,7 @@ export class Store {
         link_tokens.expires_at,
         link_tokens.created_at AS token_created_at,
         files.id AS file_id,
+        files.platform,
         files.video_id,
         files.username,
         files.source_url,
@@ -2113,11 +3737,43 @@ export class Store {
   }
 
   listPurgePlan({ requestedBy = '', now = Date.now() } = {}) {
+    const claimAt = Math.max(0, Number(now) || 0);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const files = this.queryPurgePlan({ requestedBy, now: claimAt });
+      if (files.length) {
+        const ids = files.map((file) => Number(file.id));
+        const placeholders = ids.map(() => '?').join(', ');
+        this.db.prepare(`
+          UPDATE files
+          SET
+            delete_requested_at = ?,
+            delete_attempts = delete_attempts + 1,
+            delete_error = NULL,
+            retention_status = 'expiry_claimed'
+          WHERE id IN (${placeholders})
+            AND retention_status IN ('active', 'expiry_failed')
+        `).run(claimAt, ...ids);
+      }
+      this.db.exec('COMMIT');
+      return this.withMediaAssetPaths(files.map((file) => ({
+        ...file,
+        delete_requested_at: claimAt,
+        retention_status: 'expiry_claimed',
+      })));
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  queryPurgePlan({ requestedBy = '', now = Date.now() } = {}) {
     if (!requestedBy) {
       return this.db.prepare(`
         SELECT id, path, filename, video_id
         FROM files
         WHERE trashed_at IS NULL
+          AND retention_status IN ('active', 'expiry_failed')
         ORDER BY created_at ASC
       `).all();
     }
@@ -2125,12 +3781,13 @@ export class Store {
       SELECT files.id, files.path, files.filename, files.video_id
       FROM files
       WHERE files.trashed_at IS NULL
+        AND files.retention_status IN ('active', 'expiry_failed')
         AND EXISTS (
-        SELECT 1
-        FROM link_tokens
-        WHERE link_tokens.file_id = files.id
-          AND link_tokens.owner_id = ?
-      )
+          SELECT 1
+          FROM link_tokens
+          WHERE link_tokens.file_id = files.id
+            AND link_tokens.owner_id = ?
+        )
         AND NOT EXISTS (
           SELECT 1
           FROM link_tokens
@@ -2150,10 +3807,10 @@ export class Store {
     `).all(String(requestedBy), String(requestedBy), now, now);
   }
 
-  // Kept as a compatibility alias for callers that need to remove bytes before
-  // committing a purge. New callers should use listPurgePlan() explicitly.
+  // Compatibility callers can inspect candidates without acquiring the
+  // deletion claim. Destructive callers must use listPurgePlan().
   listFilesForPurge(options = {}) {
-    return this.listPurgePlan(options);
+    return this.withMediaAssetPaths(this.queryPurgePlan(options));
   }
 
   listCreatorVideoPurgePlan(username) {
@@ -2172,11 +3829,13 @@ export class Store {
             AND shared_files.id <> files.id
             AND (
               lower(COALESCE(shared_files.username, '')) <> lower(?)
+              OR shared_files.platform <> 'tiktok'
               OR lower(shared_files.filename) NOT LIKE '%.mp4'
             )
         ) AS has_external_path_ref
       FROM files
-      WHERE lower(files.username) = lower(?)
+      WHERE files.platform = 'tiktok'
+        AND lower(files.username) = lower(?)
         AND lower(files.filename) LIKE '%.mp4'
         AND files.trashed_at IS NULL
       ORDER BY files.created_at ASC, files.id ASC
@@ -2201,6 +3860,7 @@ export class Store {
         ) AS has_other_path_ref
       FROM files
       WHERE files.id = ?
+        AND files.platform = 'tiktok'
         AND lower(files.filename) LIKE '%.mp4'
         AND files.trashed_at IS NULL
     `).get(numericId) ?? null;
@@ -2209,23 +3869,64 @@ export class Store {
   purgeDownloads({ requestedBy = '', removeFileIds = null, now = Date.now() } = {}) {
     const scoped = Boolean(requestedBy);
     const requestedIds = normalizeIds(removeFileIds ?? this.listPurgePlan({ requestedBy, now }).map((file) => file.id));
-    const removableIds = scoped
-      ? this.filterRemovablePurgeFileIds(requestedIds, String(requestedBy), now)
-      : requestedIds;
     const counts = { files: 0, links: 0, jobs: 0 };
-    const placeholders = removableIds.map(() => '?').join(', ');
-    const files = removableIds.length
-      ? this.db.prepare(`SELECT id, video_id FROM files WHERE id IN (${placeholders})`).all(...removableIds)
-      : [];
+    const timestamp = Math.max(0, Number(now) || 0);
 
     this.db.exec('BEGIN IMMEDIATE');
     try {
+      if (requestedIds.length) {
+        const requestedPlaceholders = requestedIds.map(() => '?').join(', ');
+        this.db.prepare(`
+          UPDATE files
+          SET
+            delete_requested_at = ?,
+            delete_attempts = delete_attempts + 1,
+            delete_error = NULL,
+            retention_status = 'expiry_claimed'
+          WHERE id IN (${requestedPlaceholders})
+            AND trashed_at IS NULL
+            AND retention_status IN ('active', 'expiry_failed')
+        `).run(timestamp, ...requestedIds);
+      }
+      const removableIds = scoped
+        ? this.filterRemovablePurgeFileIds(requestedIds, String(requestedBy), timestamp)
+        : requestedIds;
+      const claimedIds = removableIds.length
+        ? this.db.prepare(`
+          SELECT id
+          FROM files
+          WHERE id IN (${removableIds.map(() => '?').join(', ')})
+            AND trashed_at IS NULL
+            AND retention_status = 'expiry_claimed'
+        `).all(...removableIds).map((file) => Number(file.id))
+        : [];
+      const claimedPlaceholders = claimedIds.map(() => '?').join(', ');
+
       if (scoped) {
-        counts.links += this.db.prepare(`
-          DELETE FROM link_tokens
-          WHERE owner_id = ?
-            AND file_id IN (SELECT id FROM files WHERE trashed_at IS NULL)
-        `).run(String(requestedBy)).changes;
+        if (claimedIds.length) {
+          counts.links += this.db.prepare(`
+            DELETE FROM link_tokens
+            WHERE owner_id = ?
+              AND file_id IN (
+                SELECT id
+                FROM files
+                WHERE trashed_at IS NULL
+                  AND retention_status IN ('active', 'expiry_failed')
+              )
+              AND file_id NOT IN (${claimedPlaceholders})
+          `).run(String(requestedBy), ...claimedIds).changes;
+        } else {
+          counts.links += this.db.prepare(`
+            DELETE FROM link_tokens
+            WHERE owner_id = ?
+              AND file_id IN (
+                SELECT id
+                FROM files
+                WHERE trashed_at IS NULL
+                  AND retention_status IN ('active', 'expiry_failed')
+              )
+          `).run(String(requestedBy)).changes;
+        }
         counts.jobs += this.db.prepare(`
           DELETE FROM jobs
           WHERE requested_by = ?
@@ -2238,15 +3939,73 @@ export class Store {
         counts.jobs += this.db.prepare('DELETE FROM jobs WHERE file_id IS NULL').run().changes;
       }
 
-      if (removableIds.length) {
-        counts.links += this.db.prepare(`DELETE FROM link_tokens WHERE file_id IN (${placeholders})`).run(...removableIds).changes;
-        counts.jobs += this.db.prepare(`DELETE FROM jobs WHERE file_id IN (${placeholders})`).run(...removableIds).changes;
-        counts.files = this.db.prepare(`DELETE FROM files WHERE id IN (${placeholders})`).run(...removableIds).changes;
+      if (claimedIds.length) {
+        // Only deliveries that existed when each file was claimed belong to
+        // this purge. A newer active delivery blocks finalization instead of
+        // being silently cascaded by the file deletion.
+        counts.links += this.db.prepare(`
+          DELETE FROM link_tokens
+          WHERE file_id IN (${claimedPlaceholders})
+            AND created_at <= (
+              SELECT delete_requested_at
+              FROM files
+              WHERE files.id = link_tokens.file_id
+            )
+        `).run(...claimedIds).changes;
+        const files = this.db.prepare(`
+          SELECT id, platform, video_id
+          FROM files
+          WHERE id IN (${claimedPlaceholders})
+            AND retention_status = 'expiry_claimed'
+            AND NOT EXISTS (
+              SELECT 1
+              FROM link_tokens
+              WHERE link_tokens.file_id = files.id
+                AND (link_tokens.expires_at = 0 OR link_tokens.expires_at > ?)
+            )
+        `).all(...claimedIds, timestamp);
+        const finalIds = files.map((file) => Number(file.id));
+        if (finalIds.length) {
+          const placeholders = finalIds.map(() => '?').join(', ');
+          const mediaPostIds = this.db.prepare(`
+            SELECT DISTINCT post_id
+            FROM media_assets
+            WHERE file_id IN (${placeholders})
+          `).all(...finalIds).map((row) => Number(row.post_id));
+          counts.jobs += this.db.prepare(`DELETE FROM jobs WHERE file_id IN (${placeholders})`).run(...finalIds).changes;
+          counts.files = this.db.prepare(`
+            DELETE FROM files
+            WHERE id IN (${placeholders})
+              AND retention_status = 'expiry_claimed'
+              AND NOT EXISTS (
+                SELECT 1
+                FROM link_tokens
+                WHERE link_tokens.file_id = files.id
+                  AND (link_tokens.expires_at = 0 OR link_tokens.expires_at > ?)
+              )
+          `).run(...finalIds, timestamp).changes;
+          this.pruneMediaPostsWithoutAssets(mediaPostIds);
+        }
         for (const file of files) {
-          if (file.video_id) {
+          if (file.platform === 'tiktok' && file.video_id) {
             this.db.prepare('UPDATE seen_videos SET next_deletion_check_at = NULL WHERE video_id = ?').run(file.video_id);
           }
         }
+        this.db.prepare(`
+          UPDATE files
+          SET
+            delete_requested_at = NULL,
+            delete_error = 'Deletion claim was superseded by a newer active delivery.',
+            retention_status = 'expiry_failed'
+          WHERE id IN (${claimedPlaceholders})
+            AND retention_status = 'expiry_claimed'
+            AND EXISTS (
+              SELECT 1
+              FROM link_tokens
+              WHERE link_tokens.file_id = files.id
+                AND (link_tokens.expires_at = 0 OR link_tokens.expires_at > ?)
+            )
+        `).run(...claimedIds, timestamp);
       }
 
       this.db.exec('COMMIT');
@@ -2309,13 +4068,104 @@ export class Store {
   }
 
   stats() {
+    const schemaVersion = this.getSchemaVersion();
     const watchCount = this.db.prepare('SELECT COUNT(*) AS count FROM watched_users').get().count;
     const videoCount = this.db.prepare('SELECT COUNT(*) AS count FROM seen_videos').get().count;
     const fileCount = this.db.prepare('SELECT COUNT(*) AS count FROM files WHERE trashed_at IS NULL').get().count;
     const trashCount = this.db.prepare('SELECT COUNT(*) AS count FROM files WHERE trashed_at IS NOT NULL').get().count;
+    const deadLetterCount = this.db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM monitor_download_failures
+      WHERE status IN ('dead_letter', 'retrying')
+    `).get().count;
     const latestJob = this.db.prepare('SELECT * FROM jobs ORDER BY created_at DESC LIMIT 1').get() ?? null;
-    return { watchCount, videoCount, fileCount, trashCount, latestJob };
+    return { schemaVersion, watchCount, videoCount, fileCount, trashCount, deadLetterCount, latestJob };
   }
+
+  checkReadiness() {
+    const probe = this.db.prepare('SELECT 1 AS ready').get();
+    if (Number(probe?.ready) !== 1) throw new Error('SQLite readiness probe failed.');
+    return {
+      database: 'ready',
+      schemaVersion: this.getSchemaVersion(),
+    };
+  }
+}
+
+function normalizeStoredPlatformProfile(input = {}) {
+  const remoteIdValue = input.remoteId ?? input.remote_id ?? null;
+  const handleValue = String(input.handle ?? '').trim();
+  if (!handleValue) throw new Error('A platform profile requires a current handle.');
+  const suppliedProfileUrl = input.profileUrl ?? input.profile_url ?? null;
+  const reference = createProfileReference({
+    platform: input.platform,
+    remoteId: remoteIdValue == null || remoteIdValue === '' ? null : remoteIdValue,
+    handle: handleValue,
+    canonicalUrl: suppliedProfileUrl || null,
+  });
+  return {
+    platform: reference.platform,
+    remoteId: reference.remoteId,
+    handle: reference.handle,
+    profileUrl: reference.canonicalUrl ?? defaultPlatformProfileUrl(reference.platform, reference.handle),
+  };
+}
+
+function normalizePlatformProfileLookup(reference, remoteId = undefined) {
+  if (Number.isInteger(reference) && reference > 0 && remoteId === undefined) {
+    return { id: reference };
+  }
+  let input;
+  if (typeof reference === 'string' && remoteId !== undefined) {
+    input = { platform: reference, remoteId };
+  } else if (reference && typeof reference === 'object') {
+    if (Number.isInteger(reference.id) && reference.id > 0) return { id: reference.id };
+    input = reference;
+  } else {
+    return null;
+  }
+
+  try {
+    const normalized = createProfileReference({
+      platform: input.platform,
+      remoteId: input.remoteId ?? input.remote_id ?? null,
+      handle: input.handle ?? null,
+    });
+    return {
+      platform: normalized.platform,
+      remoteId: normalized.remoteId,
+      handle: normalized.handle,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function defaultPlatformProfileUrl(platform, handle) {
+  if (platform === 'tiktok') return `https://www.tiktok.com/@${handle}`;
+  if (platform === 'instagram') return `https://www.instagram.com/${handle}/`;
+  return `https://x.com/${handle}`;
+}
+
+function normalizeCreatorGroupName(value) {
+  return String(value ?? '').trim().slice(0, 200);
+}
+
+function normalizePositiveId(value, label, throwOnInvalid = true) {
+  const id = Number(value);
+  if (Number.isInteger(id) && id > 0) return id;
+  if (!throwOnInvalid) return null;
+  throw new Error(`A valid ${label} ID is required.`);
+}
+
+function normalizeStoreTimestamp(value) {
+  const timestamp = Number(value);
+  if (!Number.isFinite(timestamp)) throw new Error('A valid timestamp is required.');
+  return Math.trunc(timestamp);
+}
+
+function hasOwn(value, key) {
+  return Object.prototype.hasOwnProperty.call(value ?? {}, key);
 }
 
 function normalizeNullableBoolean(value) {
@@ -2330,10 +4180,64 @@ function normalizeNullableInteger(value) {
   return Number.isFinite(number) ? Math.trunc(number) : null;
 }
 
+function normalizeAlertDeliveryKey({ videoId, subscriptionId, eventType = 'new_post' } = {}) {
+  const normalizedVideoId = String(videoId ?? '').trim();
+  const normalizedSubscriptionId = Number(subscriptionId);
+  const normalizedEventType = String(eventType ?? '').trim();
+  if (
+    !normalizedVideoId
+    || !Number.isInteger(normalizedSubscriptionId)
+    || normalizedSubscriptionId <= 0
+    || !normalizedEventType
+  ) {
+    return null;
+  }
+  return {
+    videoId: normalizedVideoId,
+    subscriptionId: normalizedSubscriptionId,
+    eventType: normalizedEventType,
+  };
+}
+
 function normalizeIds(ids) {
   return [...new Set((Array.isArray(ids) ? ids : [])
     .map((id) => Number(id))
     .filter((id) => Number.isInteger(id) && id > 0))];
+}
+
+function rewindFallbackAsset(file) {
+  const extension = path.extname(String(file?.filename || file?.path || '')).toLowerCase();
+  const media = {
+    '.avif': ['image', 'image/avif'],
+    '.gif': ['animated', 'image/gif'],
+    '.heic': ['image', 'image/heic'],
+    '.jpeg': ['image', 'image/jpeg'],
+    '.jpg': ['image', 'image/jpeg'],
+    '.m4v': ['video', 'video/x-m4v'],
+    '.mkv': ['video', 'video/x-matroska'],
+    '.mov': ['video', 'video/quicktime'],
+    '.mp4': ['video', 'video/mp4'],
+    '.png': ['image', 'image/png'],
+    '.webm': ['video', 'video/webm'],
+    '.webp': ['image', 'image/webp'],
+    '.zip': ['archive', 'application/zip'],
+  }[extension] ?? ['file', 'application/octet-stream'];
+  return {
+    id: null,
+    post_id: file?.post_id ?? null,
+    file_id: Number(file?.id),
+    position: 0,
+    role: extension === '.zip' ? 'package' : 'primary',
+    remote_id: String(file?.remote_id ?? ''),
+    kind: media[0],
+    mime_type: media[1],
+    path: String(file?.path ?? ''),
+    filename: String(file?.filename ?? ''),
+    size_bytes: Number(file?.size_bytes ?? 0),
+    width: null,
+    height: null,
+    duration_seconds: null,
+  };
 }
 
 export function createStore(dbPath) {

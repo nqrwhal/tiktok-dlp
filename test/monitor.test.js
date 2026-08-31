@@ -27,6 +27,7 @@ class FakeStore {
     this.usernameChanges = [];
     this.deletionSchedules = [];
     this.stillAvailable = [];
+    this.downloadFailures = new Map();
   }
 
   listWatches() {
@@ -44,6 +45,71 @@ class FakeStore {
   markVideoSeen(record, now) {
     this.seen.add(record.videoId);
     this.seenRecords.push({ record: { ...record }, now });
+  }
+
+  getMonitorDownloadFailure(videoId) {
+    const failure = this.downloadFailures.get(videoId);
+    return failure ? { ...failure } : null;
+  }
+
+  recordMonitorDownloadFailure(record, deadLetterAfter, now) {
+    const existing = this.downloadFailures.get(record.videoId);
+    if (existing?.status === 'dead_letter') return { ...existing };
+    const failureCount = Number(existing?.failure_count ?? 0) + 1;
+    const failure = {
+      ...existing,
+      video_id: record.videoId,
+      username: record.username,
+      source_url: record.sourceUrl,
+      title: record.title ?? '',
+      media_type: record.mediaType ?? '',
+      status: failureCount >= deadLetterAfter ? 'dead_letter' : 'retryable',
+      failure_count: failureCount,
+      retry_count: Number(existing?.retry_count ?? 0),
+      last_error: String(record.error?.message ?? record.error ?? ''),
+      updated_at: now,
+    };
+    this.downloadFailures.set(record.videoId, failure);
+    return { ...failure };
+  }
+
+  markMonitorDownloadFailureResolved(videoId, now) {
+    const existing = this.downloadFailures.get(videoId);
+    if (!existing) return null;
+    const failure = {
+      ...existing,
+      status: 'resolved',
+      failure_count: 0,
+      resolved_at: now,
+      updated_at: now,
+    };
+    this.downloadFailures.set(videoId, failure);
+    return { ...failure };
+  }
+
+  retryMonitorDownloadFailure(videoId, now) {
+    const existing = this.downloadFailures.get(videoId);
+    if (!existing) return { accepted: false, reason: 'not_found', failure: null };
+    if (existing.status !== 'dead_letter') {
+      return { accepted: false, reason: 'not_retryable', failure: { ...existing } };
+    }
+    const failure = {
+      ...existing,
+      status: 'retrying',
+      retry_count: Number(existing.retry_count ?? 0) + 1,
+      last_retry_at: now,
+      updated_at: now,
+    };
+    this.downloadFailures.set(videoId, failure);
+    return { accepted: true, failure: { ...failure } };
+  }
+
+  releaseMonitorDownloadRetry(videoId, now) {
+    const existing = this.downloadFailures.get(videoId);
+    if (!existing) return null;
+    const failure = { ...existing, status: 'dead_letter', updated_at: now };
+    this.downloadFailures.set(videoId, failure);
+    return { ...failure };
   }
 
   markWatchSuccess(username, now, nextCheckAt = null) {
@@ -576,7 +642,54 @@ test('runOnce retries failed alerts and marks videos seen only after alert succe
   assert.equal(store.seenRecords[0].record.alertedAt, now);
 });
 
-test('runOnce poisons a video after repeated download failures', async () => {
+test('runOnce never dead-letters a post because alert delivery keeps failing', async () => {
+  const now = 1_700_000_325_000;
+  let rejectAlerts = true;
+  const store = new FakeStore([
+    {
+      username: 'creator',
+      channel_id: 'channel-1',
+      failure_count: 0,
+      next_check_at: null,
+    },
+  ]);
+  const downloader = new FakeDownloader([
+    {
+      id: 'alert-failure-1',
+      title: 'New video',
+      webpage_url: 'https://www.tiktok.com/@creator/video/alert-failure-1',
+    },
+  ]);
+  const monitor = new TikTokMonitor({
+    store,
+    downloader,
+    downloadFailureDeadLetterAfter: 2,
+    alert: async () => {
+      if (rejectAlerts) throw new Error('Discord unavailable');
+    },
+    logger: { info() {}, warn() {} },
+    now: () => now,
+  });
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    store.watches[0].next_check_at = null;
+    const summary = await monitor.runOnce({ waitForDownloads: true });
+    assert.equal(summary.alertedVideos, 0);
+    assert.equal(store.seen.has('alert-failure-1'), false);
+  }
+  assert.equal(downloader.downloadCalls.length, 3);
+  assert.equal(monitor.status().metrics.totalAlertFailures, 3);
+  assert.equal(monitor.status().metrics.totalDownloadFailures, 0);
+
+  rejectAlerts = false;
+  store.watches[0].next_check_at = null;
+  const recovered = await monitor.runOnce({ waitForDownloads: true });
+  assert.equal(recovered.alertedVideos, 1);
+  assert.equal(store.seen.has('alert-failure-1'), true);
+  assert.equal(downloader.downloadCalls.length, 4);
+});
+
+test('runOnce dead-letters a video after repeated download failures without marking it seen', async () => {
   const now = 1_700_000_350_000;
   const store = new FakeStore([
     {
@@ -601,7 +714,7 @@ test('runOnce poisons a video after repeated download failures', async () => {
   const monitor = new TikTokMonitor({
     store,
     downloader,
-    downloadFailurePoisonAfter: 3,
+    downloadFailureDeadLetterAfter: 3,
     now: () => now,
   });
 
@@ -617,16 +730,115 @@ test('runOnce poisons a video after repeated download failures', async () => {
   store.watches[0].next_check_at = null;
   const third = await monitor.runOnce({ waitForDownloads: true });
   assert.equal(downloader.downloadCalls.length, 3);
-  assert.equal(store.seen.has('broken-1'), true);
+  assert.equal(store.seen.has('broken-1'), false);
   assert.equal(third.alertedVideos, 0);
-  assert.equal(store.seenRecords[0].record.videoId, 'broken-1');
-  assert.equal(store.seenRecords[0].record.alertedAt, undefined);
+  assert.equal(store.seenRecords.length, 0);
+  assert.equal(store.getMonitorDownloadFailure('broken-1').status, 'dead_letter');
+  assert.equal(store.getMonitorDownloadFailure('broken-1').failure_count, 3);
 
   store.watches[0].next_check_at = null;
   const fourth = await monitor.runOnce({ waitForDownloads: true });
   assert.equal(downloader.downloadCalls.length, 3);
   assert.equal(fourth.queuedDownloads, 0);
-  assert.equal(fourth.seenVideos, 1);
+  assert.equal(fourth.seenVideos, 0);
+});
+
+test('retryFailedVideo retries a dead letter directly and resolves it after alert delivery', async () => {
+  const now = 1_700_000_375_000;
+  const store = new FakeStore([
+    {
+      username: 'creator',
+      channel_id: 'channel-1',
+      failure_count: 0,
+      next_check_at: null,
+    },
+  ]);
+  const downloader = new FakeDownloader([
+    {
+      id: 'recovered-1',
+      title: 'Recovered post',
+      webpage_url: 'https://www.tiktok.com/@creator/video/recovered-1',
+    },
+  ]);
+  let rejectDownload = true;
+  downloader.download = async (video, context) => {
+    downloader.downloadCalls.push({ video, context });
+    if (rejectDownload) throw new Error('extractor failed');
+    return { filePath: `/downloads/${video.id}.mp4` };
+  };
+  const alerts = [];
+  const monitor = new TikTokMonitor({
+    store,
+    downloader,
+    alert: async (payload) => alerts.push(payload),
+    downloadFailureDeadLetterAfter: 1,
+    logger: { info() {}, warn() {} },
+    now: () => now,
+  });
+
+  await monitor.runOnce({ waitForDownloads: true });
+  assert.equal(store.getMonitorDownloadFailure('recovered-1').status, 'dead_letter');
+  rejectDownload = false;
+
+  const retry = await monitor.retryFailedVideo('recovered-1');
+  assert.equal(retry.accepted, true);
+  assert.equal(retry.completed, true);
+  assert.equal(downloader.downloadCalls.length, 2);
+  assert.equal(alerts.length, 1);
+  assert.equal(store.seen.has('recovered-1'), true);
+  assert.equal(store.getMonitorDownloadFailure('recovered-1').status, 'resolved');
+  assert.equal(store.getMonitorDownloadFailure('recovered-1').retry_count, 1);
+
+  const duplicate = await monitor.retryFailedVideo('recovered-1');
+  assert.equal(duplicate.accepted, false);
+  assert.equal(duplicate.reason, 'not_retryable');
+});
+
+test('retryFailedVideo returns to the dead-letter list when alert delivery fails', async () => {
+  const now = 1_700_000_380_000;
+  const store = new FakeStore([{
+    username: 'creator',
+    channel_id: 'channel-1',
+    failure_count: 0,
+    next_check_at: null,
+  }]);
+  const downloader = new FakeDownloader([{
+    id: 'alert-retry-1',
+    title: 'Recovered extraction',
+    webpage_url: 'https://www.tiktok.com/@creator/video/alert-retry-1',
+  }]);
+  let rejectDownload = true;
+  let rejectAlert = true;
+  downloader.download = async (video, context) => {
+    downloader.downloadCalls.push({ video, context });
+    if (rejectDownload) throw new Error('extractor failed');
+    return { filePath: `/downloads/${video.id}.mp4` };
+  };
+  const monitor = new TikTokMonitor({
+    store,
+    downloader,
+    alert: async () => {
+      if (rejectAlert) throw new Error('Discord unavailable');
+    },
+    downloadFailureDeadLetterAfter: 1,
+    logger: { info() {}, warn() {} },
+    now: () => now,
+  });
+
+  await monitor.runOnce({ waitForDownloads: true });
+  rejectDownload = false;
+  const failedAlert = await monitor.retryFailedVideo('alert-retry-1');
+  assert.equal(failedAlert.accepted, true);
+  assert.equal(failedAlert.completed, false);
+  assert.equal(failedAlert.error, 'Discord unavailable');
+  assert.equal(store.getMonitorDownloadFailure('alert-retry-1').status, 'dead_letter');
+  assert.equal(store.seen.has('alert-retry-1'), false);
+
+  rejectAlert = false;
+  const delivered = await monitor.retryFailedVideo('alert-retry-1');
+  assert.equal(delivered.completed, true);
+  assert.equal(store.getMonitorDownloadFailure('alert-retry-1').status, 'resolved');
+  assert.equal(store.seen.has('alert-retry-1'), true);
 });
 
 test('runOnce serializes overlapping cycles', async () => {

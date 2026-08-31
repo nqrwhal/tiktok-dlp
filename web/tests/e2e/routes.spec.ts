@@ -6,6 +6,7 @@ const routes = [
   { path: "/creator?creator=creator-alice", heading: "Alice Archive" },
   { path: "/dashboard", heading: "Dashboard" },
   { path: "/dashboard/videos", heading: "Videos" },
+  { path: "/dashboard/media", heading: "Media" },
   { path: "/dashboard/creators", heading: "Creators" },
   { path: "/dashboard/settings", heading: "Settings" },
 ];

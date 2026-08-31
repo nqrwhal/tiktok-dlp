@@ -5,6 +5,7 @@ const stableRoutes = [
   "/creator?creator=creator-alice",
   "/dashboard",
   "/dashboard/videos",
+  "/dashboard/media",
   "/dashboard/creators",
   "/dashboard/settings",
 ];

@@ -161,6 +161,17 @@ test('serves files only for valid tokens with private health, HEAD, and Range su
   assert.equal(healthHeadResponse.status, 200);
   assert.equal(await healthHeadResponse.text(), '');
 
+  const readyResponse = await fetch(`${baseUrl}/ready`);
+  assert.equal(readyResponse.status, 200);
+  assert.deepEqual(await readyResponse.json(), {
+    status: 'ready',
+    database: 'ready',
+    schemaVersion: 4,
+  });
+  const readyHeadResponse = await fetch(`${baseUrl}/ready`, { method: 'HEAD' });
+  assert.equal(readyHeadResponse.status, 200);
+  assert.equal(await readyHeadResponse.text(), '');
+
   const fileResponse = await fetch(`${baseUrl}/files/valid-token`);
   assert.equal(fileResponse.status, 200);
   assert.match(fileResponse.headers.get('content-disposition') ?? '', /attachment; filename="greeting.txt"/);
@@ -347,10 +358,12 @@ test('creator video deletion requires typed confirmation and trashes only that c
     path.join(creatorDir, '100.image'),
   ];
   const unrelatedPath = path.join(creatorDir, '1000.mp4');
+  const xVideoPath = path.join(creatorDir, 'x-100.mp4');
   await Promise.all([
     writeFile(creatorVideoPath, 'creator video'),
     ...sidecarPaths.map((sidecar) => writeFile(sidecar, 'metadata')),
     writeFile(unrelatedPath, 'other video'),
+    writeFile(xVideoPath, 'same-handle X video'),
   ]);
 
   const creatorFileId = store.createFileRecord({
@@ -373,6 +386,15 @@ test('creator video deletion requires typed confirmation and trashes only that c
     filePath: unrelatedPath,
     filename: '1000.mp4',
     sizeBytes: 11,
+  });
+  const xFileId = store.createFileRecord({
+    platform: 'x',
+    videoId: '100',
+    username: 'creator',
+    sourceUrl: 'https://x.com/creator/status/100',
+    filePath: xVideoPath,
+    filename: 'x-100.mp4',
+    sizeBytes: 19,
   });
 
   const { server, address } = await startHttpServer({
@@ -426,7 +448,9 @@ test('creator video deletion requires typed confirmation and trashes only that c
   await access(creatorVideoPath);
   for (const sidecarPath of sidecarPaths) await access(sidecarPath);
   await access(unrelatedPath);
+  await access(xVideoPath);
   assert.equal(store.getTrashedFile(creatorFileId)?.id, creatorFileId);
+  assert.equal(store.getLatestFileByPost('x', '100')?.id, xFileId);
   assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM files WHERE id = ?').get(unrelatedFileId).count, 1);
   assert.equal(store.getValidToken('creator-token'), null);
   assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM link_tokens WHERE token = ?').get('creator-token').count, 1);

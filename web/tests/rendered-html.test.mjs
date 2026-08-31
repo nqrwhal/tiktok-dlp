@@ -30,6 +30,7 @@ const routes = [
   ["/creator?creator=mina-makes", /Open feed/i],
   ["/dashboard", /Open feed/i],
   ["/dashboard/videos", /Search videos/i],
+  ["/dashboard/media", /Search saved media/i],
   ["/dashboard/creators", /Import creator/i],
   ["/dashboard/settings", /Save changes/i],
 ];
@@ -138,6 +139,49 @@ test("creator dashboard can stop monitoring without deleting its archive", async
   assert.match(source, /method:\s*"DELETE"/);
   assert.match(source, /Saved videos were kept/);
   assert.match(source, /every configured destination/);
+});
+
+test("creator dashboard manages explicit and reversible cross-platform profile links", async () => {
+  const manager = await readFile(new URL("../components/dashboard/CreatorManager.tsx", import.meta.url), "utf8");
+  const source = await readFile(new URL("../components/dashboard/ProfileGroupManager.tsx", import.meta.url), "utf8");
+  const types = await readFile(new URL("../lib/types.ts", import.meta.url), "utf8");
+  assert.match(manager, /<ProfileGroupManager apiBase=\{apiBase\}/);
+  assert.match(source, /\/api\/profile-groups/);
+  assert.match(source, /matching handles never link automatically/i);
+  assert.match(source, /mergeGroups/);
+  assert.match(source, /method: "POST" \| "PATCH" \| "DELETE"/);
+  assert.match(source, /\/profiles\/\$\{profile\.id\}/);
+  assert.match(source, /aria-label=\{`Unlink/);
+  assert.match(types, /export interface CreatorProfileGroup/);
+  assert.match(types, /export interface PlatformProfile/);
+});
+
+test("media dashboard preserves platform identity and ordered post assets", async () => {
+  const source = await readFile(new URL("../components/dashboard/MediaLibrary.tsx", import.meta.url), "utf8");
+  const hook = await readFile(new URL("../lib/useArchivePosts.ts", import.meta.url), "utf8");
+  const types = await readFile(new URL("../lib/types.ts", import.meta.url), "utf8");
+  assert.match(source, /post\.assets\[activeIndex\]/);
+  assert.match(source, /moveAsset\(post, 1\)/);
+  assert.match(source, /All platforms/);
+  assert.match(source, /post\.downloadUrl/);
+  assert.match(source, /archive\.setBookmarked\(post, !post\.bookmarked\)/);
+  assert.match(source, /aria-pressed=\{post\.bookmarked\}/);
+  assert.match(source, /Move this post to trash\?/);
+  assert.match(source, /Restore this post\?/);
+  assert.match(source, /archive\.moveToTrash\(lifecycleAction\.post\)/);
+  assert.match(source, /archive\.restore\(lifecycleAction\.post\)/);
+  assert.match(source, /hasMediaFilters \? "No matching trash" : "Trash is empty"/);
+  assert.match(hook, /\/api\/posts\?/);
+  assert.match(hook, /\/api\/post-bookmarks\//);
+  assert.match(hook, /\/api\/media-posts\//);
+  assert.match(hook, /payload\.restoredPost === true/);
+  assert.match(hook, /payload\.trashedPost === true/);
+  assert.match(hook, /params\.set\("platform", platform\)/);
+  assert.match(hook, /params\.set\("bookmarked", "1"\)/);
+  assert.match(hook, /params\.set\("trashed", "1"\)/);
+  assert.match(hook, /byId\.set\(post\.id, post\)/);
+  assert.match(types, /export interface SavedMediaAsset/);
+  assert.match(types, /export interface SavedPost/);
 });
 
 test("failed feed pages use a retry backoff instead of an immediate render loop", async () => {

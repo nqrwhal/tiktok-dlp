@@ -19,6 +19,7 @@ import { mockStats, mockVideos } from "../../lib/mock-data";
 import type { Creator, CreatorImport, CreatorImportItem } from "../../lib/types";
 import { useArchiveData } from "../../lib/useArchiveData";
 import { useModalDialog } from "../../lib/useModalDialog";
+import { ProfileGroupManager } from "./ProfileGroupManager";
 import styles from "./dashboard.module.css";
 
 const IMPORT_FAILURE_DETAIL_LIMIT = 5;
@@ -535,6 +536,8 @@ export function CreatorManager({ creators }: { creators: Creator[] }) {
           ) : null}
         </section>
       ) : null}
+
+      {apiBase ? <ProfileGroupManager apiBase={apiBase} /> : null}
 
       <div className={styles.filterBar}>
         <label className={styles.searchField}>

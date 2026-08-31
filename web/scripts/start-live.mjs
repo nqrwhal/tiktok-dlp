@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { isBridgeRequestPath } from "./start-live-core.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const projectDir = path.resolve(here, "..");
@@ -16,7 +17,7 @@ start("npm", ["run", "start", "--", "--port", String(frontendPort), "--hostname"
 
 const gateway = http.createServer((request, response) => {
   const pathname = new URL(request.url || "/", "http://rewind.local").pathname;
-  const targetPort = /^\/(?:api(?:\/|$)|media\/|thumbnail\/)/.test(pathname)
+  const targetPort = isBridgeRequestPath(pathname)
     ? bridgePort
     : frontendPort;
   proxyRequest(request, response, targetPort);

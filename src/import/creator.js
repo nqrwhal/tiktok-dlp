@@ -1,5 +1,5 @@
 import { stat } from 'node:fs/promises';
-import { fetchVideoMetadata, listProfileVideos } from '../tiktok/ytdlp.js';
+import { getPlatformAdapter } from '../platforms/index.js';
 import { normalizeUsername, profileUrl } from '../util/files.js';
 
 const DEFAULT_MAX_DURATION_SECONDS = 120;
@@ -10,8 +10,9 @@ export class CreatorImportService {
     config,
     store,
     downloadService,
-    profileLister = listProfileVideos,
-    metadataFetcher = fetchVideoMetadata,
+    platformAdapter = getPlatformAdapter('tiktok'),
+    profileLister = null,
+    metadataFetcher = null,
     fileStat = stat,
     now = () => Date.now(),
     logger = console,
@@ -22,8 +23,23 @@ export class CreatorImportService {
     this.config = config;
     this.store = store;
     this.downloadService = downloadService;
-    this.profileLister = profileLister;
-    this.metadataFetcher = metadataFetcher;
+    this.platformAdapter = platformAdapter;
+    this.profileLister = profileLister ?? (
+      typeof platformAdapter?.listCreatorPosts === 'function'
+        ? (value, options) => platformAdapter.listCreatorPosts(value, options)
+        : null
+    );
+    this.metadataFetcher = metadataFetcher ?? (
+      typeof platformAdapter?.probe === 'function'
+        ? (sourceUrl, operationConfig) => platformAdapter.probe(sourceUrl, { config: operationConfig })
+        : null
+    );
+    if (typeof this.profileLister !== 'function') {
+      throw new Error('CreatorImportService requires a TikTok creator-list operation.');
+    }
+    if (typeof this.metadataFetcher !== 'function') {
+      throw new Error('CreatorImportService requires a TikTok metadata-probe operation.');
+    }
     this.fileStat = fileStat;
     this.now = now;
     this.logger = logger ?? console;

@@ -5,9 +5,11 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   buildDownloadsListPayload,
+  buildDeliveryPayload,
   buildLinkHistoryEmbed,
   buildMonitorAlertPayload,
   handleButtonInteraction,
+  handleDownloadsInteraction,
   isDiscordEntityTooLarge,
   monitorScopeMatches,
   resolveMonitorDeliveryScope,
@@ -74,6 +76,7 @@ test('downloads list payload shows saved permanent downloads only', async () => 
     assert.equal(embed.title, 'Saved Downloads');
     assert.match(embed.footer.text, /2 saved downloads/);
     assert.equal(embed.fields.length, 1);
+    assert.match(embed.fields[0].name, /^1\. \[TikTok\]/);
     assert.match(embed.fields[0].name, /@OpenAI/);
     assert.match(embed.fields[0].name, /\.\.\./);
     assert.match(embed.fields[0].value, /https:\/\/example\.com\/files\/new-permanent/);
@@ -128,6 +131,202 @@ test('downloads list buttons are scoped to the requesting user', async () => {
   assert.equal(replies[0].ephemeral, true);
 });
 
+test('archive-wide purge rejects guild managers and allows only the configured owner', async () => {
+  const storeCalls = [];
+  const store = {
+    listPurgePlan(options) {
+      storeCalls.push(['plan', options]);
+      return [];
+    },
+    listFilePathsReferencedOutside() {
+      return [];
+    },
+    purgeDownloads(options) {
+      storeCalls.push(['purge', options]);
+      return { files: 0, links: 0, jobs: 0 };
+    },
+  };
+  const makeInteraction = (userId, canManageGuild, scope = 'all') => {
+    const replies = [];
+    const edits = [];
+    const deferrals = [];
+    return {
+      replies,
+      edits,
+      deferrals,
+      interaction: {
+        guildId: 'other-guild',
+        user: { id: userId },
+        memberPermissions: { has: () => canManageGuild },
+        options: {
+          getSubcommand: () => 'purge',
+          getString: (name) => name === 'scope' ? scope : 'PURGE',
+        },
+        async reply(payload) {
+          replies.push(payload);
+        },
+        async deferReply(payload) {
+          deferrals.push(payload);
+        },
+        async editReply(payload) {
+          edits.push(payload);
+        },
+      },
+    };
+  };
+  const config = { discordOwnerId: 'owner-1', downloadDir: '/tmp/archive' };
+
+  const manager = makeInteraction('other-guild-manager', true);
+  await handleDownloadsInteraction({ interaction: manager.interaction, config, store });
+  assert.equal(manager.replies[0].embeds[0].data.title, 'Permission Required');
+  assert.match(manager.replies[0].embeds[0].data.description, /configured bot owner/i);
+  assert.equal(manager.deferrals.length, 0);
+  assert.deepEqual(storeCalls, []);
+
+  const requester = makeInteraction('ordinary-user', false, 'mine');
+  await handleDownloadsInteraction({ interaction: requester.interaction, config, store });
+  assert.deepEqual(requester.deferrals, [{ ephemeral: true }]);
+  assert.deepEqual(storeCalls, [
+    ['plan', { requestedBy: 'ordinary-user' }],
+    ['purge', { requestedBy: 'ordinary-user', removeFileIds: [] }],
+  ]);
+  storeCalls.length = 0;
+
+  const owner = makeInteraction('owner-1', false);
+  await handleDownloadsInteraction({ interaction: owner.interaction, config, store });
+  assert.equal(owner.replies.length, 0);
+  assert.deepEqual(owner.deferrals, [{ ephemeral: true }]);
+  assert.equal(owner.edits[0].embeds[0].data.title, 'Downloads Purged');
+  assert.deepEqual(storeCalls, [
+    ['plan', { requestedBy: '' }],
+    ['purge', { requestedBy: '', removeFileIds: [] }],
+  ]);
+});
+
+test('archive list and history rows identify platforms with matching handles and post IDs', () => {
+  const entries = [
+    {
+      platform: 'instagram',
+      token: 'instagram-token',
+      username: 'same_creator',
+      video_id: 'same-post',
+      filename: 'instagram.jpg',
+      size_bytes: 100,
+      token_created_at: 1000,
+      expires_at: 0,
+    },
+    {
+      platform: 'x',
+      token: 'x-token',
+      username: 'same_creator',
+      video_id: 'same-post',
+      filename: 'x.jpg',
+      size_bytes: 100,
+      token_created_at: 1000,
+      expires_at: 0,
+    },
+  ];
+  const store = {
+    listPermanentDownloadsByRequester: () => entries,
+    countPermanentDownloadsByRequester: () => entries.length,
+  };
+  const config = { publicBaseUrl: 'https://example.com' };
+
+  const listFields = buildDownloadsListPayload({ config, store, userId: 'user-1' }).embeds[0].data.fields;
+  const historyFields = buildLinkHistoryEmbed(entries, { config }).data.fields;
+
+  assert.deepEqual(listFields.map((field) => field.name), [
+    '1. [Instagram] @same_creator - instagram.jpg',
+    '2. [X] @same_creator - x.jpg',
+  ]);
+  assert.deepEqual(historyFields.map((field) => field.name), [
+    '1. [Instagram] @same_creator - instagram.jpg',
+    '2. [X] @same_creator - x.jpg',
+  ]);
+});
+
+test('manual multi-asset delivery attaches ordered media and keeps the ZIP as the saved link', async () => {
+  const result = {
+    token: 'mixed-token',
+    publicUrl: 'https://example.com/files/mixed-token',
+    platform: 'x',
+    sourceUrl: 'https://x.com/creator/status/123',
+    filePath: '/tmp/mixed.zip',
+    filename: 'mixed.zip',
+    sizeBytes: 50 * 1024 * 1024,
+    videoId: '123',
+    username: 'creator',
+    mediaType: 'mixed',
+    assetCount: 3,
+    assets: [
+      { position: 2, path: '/tmp/third.jpg', filename: 'third.jpg', kind: 'image', sizeBytes: 1024 },
+      { position: 0, path: '/tmp/first.jpg', filename: 'first.jpg', kind: 'image', sizeBytes: 1024 },
+      { position: 1, path: '/tmp/second.mp4', filename: 'second.mp4', kind: 'video', sizeBytes: 2048 },
+    ],
+  };
+  const payload = await buildDeliveryPayload(result, {
+    publicBaseUrl: 'https://example.com',
+    discordUploadLimitBytes: 10 * 1024 * 1024,
+    downloadLinkTtlMinutes: 30,
+  }, 'auto');
+
+  assert.deepEqual(payload.files.map((file) => file.name), ['first.jpg', 'second.mp4', 'third.jpg']);
+  assert.equal(payload.embeds[0].data.fields.find((field) => field.name === 'Media').value, '3 files attached');
+  assert.equal(payload.embeds[0].data.fields.find((field) => field.name === 'Download').value, '[Click](https://example.com/files/mixed-token)');
+
+  const packagePayload = await buildDeliveryPayload({
+    ...result,
+    sizeBytes: 5 * 1024 * 1024,
+    assetCount: 11,
+    assets: Array.from({ length: 11 }, (_, position) => ({
+      position,
+      path: `/tmp/${position}.jpg`,
+      filename: `${position}.jpg`,
+      kind: 'image',
+      sizeBytes: 1024,
+    })),
+  }, {
+    publicBaseUrl: 'https://example.com',
+    discordUploadLimitBytes: 10 * 1024 * 1024,
+    downloadLinkTtlMinutes: 30,
+  }, 'auto');
+  assert.deepEqual(packagePayload.files.map((file) => file.name), ['mixed.zip']);
+  assert.equal(packagePayload.embeds[0].data.fields.find((field) => field.name === 'Media').value, 'ZIP (11 files)');
+
+  const aggregateOversizePayload = await buildDeliveryPayload({
+    ...result,
+    assetCount: 2,
+    assets: [
+      { position: 0, path: '/tmp/first.mp4', filename: 'first.mp4', kind: 'video', sizeBytes: 6 * 1024 * 1024 },
+      { position: 1, path: '/tmp/second.mp4', filename: 'second.mp4', kind: 'video', sizeBytes: 6 * 1024 * 1024 },
+    ],
+  }, {
+    publicBaseUrl: 'https://example.com',
+    discordUploadLimitBytes: 10 * 1024 * 1024,
+    downloadLinkTtlMinutes: 30,
+  }, 'auto');
+  assert.equal(aggregateOversizePayload.files.length, 0);
+  assert.equal(
+    aggregateOversizePayload.embeds[0].data.fields.find((field) => field.name === 'Media').value,
+    'Link (2 files)',
+  );
+
+  const requestBudgetPayload = await buildDeliveryPayload({
+    ...result,
+    sizeBytes: 40 * 1024 * 1024,
+    assetCount: 2,
+    assets: [
+      { position: 0, path: '/tmp/first.mp4', filename: 'first.mp4', kind: 'video', sizeBytes: 13 * 1024 * 1024 },
+      { position: 1, path: '/tmp/second.mp4', filename: 'second.mp4', kind: 'video', sizeBytes: 13 * 1024 * 1024 },
+    ],
+  }, {
+    publicBaseUrl: 'https://example.com',
+    discordUploadLimitBytes: 50 * 1024 * 1024,
+    downloadLinkTtlMinutes: 30,
+  }, 'auto');
+  assert.equal(requestBudgetPayload.files.length, 0);
+});
+
 test('monitor alert payload is embed-first with monitor-only buttons', async () => {
   const now = 1_700_000_120_000;
   const payload = await buildMonitorAlertPayload({
@@ -161,7 +360,7 @@ test('monitor alert payload is embed-first with monitor-only buttons', async () 
   assert.equal(payload.files.length, 1);
   assert.deepEqual(
     payload.components[0].components.map((button) => button.data.label),
-    ['Download video', 'Delete post'],
+    ['Download video', 'Delete saved copy'],
   );
   assert.equal(payload.components[0].components[0].data.url, 'https://example.com/files/monitor-token');
   assert.equal(payload.components[0].components[1].data.custom_id, 'monitor:delete:monitor-token');
@@ -174,7 +373,7 @@ test('isDiscordEntityTooLarge detects 40005 and 413', () => {
   assert.equal(isDiscordEntityTooLarge(new Error('discord failed')), false);
 });
 
-test('sendVideoAlert falls back to link-only on 40005 and still marks seen', async () => {
+test('sendVideoAlert falls back to link-only on 40005 without changing global seen state', async () => {
   const sends = [];
   const seen = [];
   const client = {
@@ -221,9 +420,7 @@ test('sendVideoAlert falls back to link-only on 40005 and still marks seen', asy
   assert.equal(sends.length, 2);
   assert.equal(sends[0].files, 1);
   assert.equal(sends[1].files, 0);
-  assert.equal(seen.length, 1);
-  assert.equal(seen[0].videoId, '7676968257571556626');
-  assert.equal(Boolean(seen[0].alertedAt), true);
+  assert.equal(seen.length, 0);
 });
 
 test('monitor story alert payload reflects story type and keeps download in the button', async () => {
@@ -258,7 +455,7 @@ test('monitor story alert payload reflects story type and keeps download in the 
   assert.equal(payload.files.length, 0);
   assert.deepEqual(
     payload.components[0].components.map((button) => button.data.label),
-    ['Download story', 'Delete post'],
+    ['Download story', 'Delete saved copy'],
   );
   assert.equal(payload.components[0].components[0].data.url, 'https://example.com/files/story-token');
 });
@@ -276,6 +473,10 @@ test('monitor slideshow alerts attach galleries only when Discord can show all i
     mediaType: 'slideshow',
     imageCount: 2,
     slideshowImagePaths: ['/tmp/slideshow__001.jpg', '/tmp/slideshow__002.jpg'],
+    assets: [
+      { position: 0, path: '/tmp/slideshow__001.jpg', kind: 'image', sizeBytes: 1024 },
+      { position: 1, path: '/tmp/slideshow__002.jpg', kind: 'image', sizeBytes: 1024 },
+    ],
   }, {
     publicBaseUrl: 'https://example.com',
     discordUploadLimitBytes: 10 * 1024 * 1024,
@@ -348,8 +549,12 @@ test('monitor delete button removes saved post records and slideshow sidecars', 
   try {
     const zipPath = path.join(dir, 'slideshow.zip');
     const sidecarPath = path.join(dir, 'slideshow__001.jpg');
+    const sharedPath = path.join(dir, 'shared.jpg');
+    const otherZipPath = path.join(dir, 'other.zip');
     await writeFile(zipPath, 'zip');
     await writeFile(sidecarPath, 'image');
+    await writeFile(sharedPath, 'shared image');
+    await writeFile(otherZipPath, 'other zip');
 
     const fileId = store.createFileRecord({
       videoId: 'photo-1',
@@ -374,6 +579,36 @@ test('monitor delete button removes saved post records and slideshow sidecars', 
       deliveryType: 'monitor',
       expiresAt: 0,
     }, 1000);
+    store.recordMediaDownload({
+      platform: 'tiktok',
+      remoteId: 'photo-1',
+      fileId,
+      filePath: zipPath,
+      filename: 'slideshow.zip',
+      sizeBytes: 3,
+      assets: [
+        { path: sidecarPath, filename: 'slideshow__001.jpg', kind: 'image', sizeBytes: 5 },
+        { path: sharedPath, filename: 'shared.jpg', kind: 'image', sizeBytes: 12 },
+      ],
+    }, 1000);
+    const otherFileId = store.createFileRecord({
+      videoId: 'photo-2',
+      username: 'creator',
+      sourceUrl: 'https://www.tiktok.com/@creator/photo/photo-2',
+      filePath: otherZipPath,
+      filename: 'other.zip',
+      sizeBytes: 9,
+    }, 1000);
+    store.recordMediaDownload({
+      platform: 'tiktok',
+      remoteId: 'photo-2',
+      fileId: otherFileId,
+      filePath: otherZipPath,
+      filename: 'other.zip',
+      sizeBytes: 9,
+      assets: [{ path: sharedPath, filename: 'shared.jpg', kind: 'image', sizeBytes: 12 }],
+    }, 1000);
+    store.createLinkToken({ token: 'other-token', fileId: otherFileId, expiresAt: 0 }, 1000);
     store.markVideoSeen({
       videoId: 'photo-1',
       username: 'creator',
@@ -405,6 +640,9 @@ test('monitor delete button removes saved post records and slideshow sidecars', 
     assert.equal(store.db.prepare('SELECT next_deletion_check_at FROM seen_videos WHERE video_id = ?').get('photo-1').next_deletion_check_at, null);
     await assert.rejects(access(zipPath));
     await assert.rejects(access(sidecarPath));
+    await access(sharedPath);
+    await access(otherZipPath);
+    assert.equal(store.getToken('other-token')?.id, otherFileId);
     assert.deepEqual(updates[0], { components: [] });
     assert.equal(followUps[0].embeds[0].data.title, 'Monitored Delivery Deleted');
   } finally {
@@ -486,6 +724,7 @@ test('link history embed shows temporary, permanent, and expired states', async 
 
     assert.equal(embed.title, 'Download Link History');
     assert.equal(embed.fields.length, 3);
+    assert.ok(embed.fields.every((field) => field.name.includes('[TikTok]')));
     assert.match(values, /permanent/);
     assert.match(values, /expires 1970-01-01T00:00:10\.000Z/);
     assert.match(values, /expired 1970-01-01T00:00:02\.000Z/);

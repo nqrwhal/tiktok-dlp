@@ -2,15 +2,21 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   MAX_LEGACY_VIDEO_LIMIT,
-  buildVideoSql,
+  MAX_PAGINATED_POST_LIMIT,
+  buildRewindPostReadPath,
+  buildRewindVideoReadPath,
   createActiveFileTracker,
   createBoundedRowCache,
   createExpiringSingleFlight,
   decodeVideoCursor,
   encodeVideoCursor,
   isTrashSchemaMigrationError,
+  isAllowedCorsOrigin,
   matchCreatorMonitoringProxyRoute,
   matchImportProxyRoute,
+  matchMediaPostMutationProxyRoute,
+  matchPostBookmarkProxyRoute,
+  matchProfileGroupsProxyRoute,
   matchesIfNoneMatch,
   resolveArchivePath,
   selectCacheEntriesForEviction,
@@ -32,18 +38,46 @@ test("video cursors round-trip stable keyset positions", () => {
   assert.throws(() => decodeVideoCursor(Buffer.from("[1,0]").toString("base64url")), /Invalid video cursor/);
 });
 
-test("video SQL is bounded, keyset-paginated, creator-safe, index-compatible, and excludes trash", () => {
-  const sql = buildVideoSql({
+test("backend video reads are bounded and encode keyset, creator, and bookmark filters", () => {
+  const requestPath = buildRewindVideoReadPath({
     username: "d'angelo",
     limit: MAX_LEGACY_VIDEO_LIMIT + 500,
     cursor: { createdAt: 4000, fileId: 25 },
+    bookmarkedOnly: true,
   });
-  assert.match(sql, /files\.trashed_at IS NULL/);
-  assert.match(sql, /files\.username = 'd''angelo' COLLATE NOCASE/);
-  assert.doesNotMatch(sql, /lower\(files\.username\)/);
-  assert.match(sql, /files\.created_at < 4000/);
-  assert.match(sql, /files\.created_at = 4000 AND files\.id < 25/);
-  assert.match(sql, /LIMIT 5000/);
+  const url = new URL(requestPath, "http://backend.test");
+  assert.equal(url.pathname, "/api/rewind/videos");
+  assert.equal(url.searchParams.get("username"), "d'angelo");
+  assert.equal(url.searchParams.get("limit"), "5001");
+  assert.equal(url.searchParams.get("beforeCreatedAt"), "4000");
+  assert.equal(url.searchParams.get("beforeFileId"), "25");
+  assert.equal(url.searchParams.get("bookmarked"), "1");
+});
+
+test("backend post reads preserve platform, profile, group, cursor, and bookmark filters", () => {
+  const requestPath = buildRewindPostReadPath({
+    platform: "Instagram",
+    username: "creator.one",
+    profileId: 7,
+    groupId: 9,
+    fileId: 11,
+    limit: MAX_PAGINATED_POST_LIMIT + 500,
+    cursor: { createdAt: 5000, fileId: 25 },
+    bookmarkedOnly: true,
+    trashedOnly: true,
+  });
+  const url = new URL(requestPath, "http://backend.test");
+  assert.equal(url.pathname, "/api/rewind/posts");
+  assert.equal(url.searchParams.get("platform"), "instagram");
+  assert.equal(url.searchParams.get("username"), "creator.one");
+  assert.equal(url.searchParams.get("profileId"), "7");
+  assert.equal(url.searchParams.get("groupId"), "9");
+  assert.equal(url.searchParams.get("fileId"), "11");
+  assert.equal(url.searchParams.get("limit"), "101");
+  assert.equal(url.searchParams.get("beforeCreatedAt"), "5000");
+  assert.equal(url.searchParams.get("beforeFileId"), "25");
+  assert.equal(url.searchParams.get("bookmarked"), "1");
+  assert.equal(url.searchParams.get("trashed"), "1");
 });
 
 test("concurrent expiring refreshes share one archive scan", async () => {
@@ -80,6 +114,18 @@ test("returned video rows satisfy every ID lookup without exact SQL and stay bou
   cache.add([{ id: 4 }]);
   assert.equal(cache.size, 3);
   assert.equal(cache.get(1), undefined);
+});
+
+test("row cache entries expire so out-of-band lifecycle changes require an authoritative read", () => {
+  let now = 1_000;
+  const cache = createBoundedRowCache(3, { ttlMs: 50, now: () => now });
+  const row = { id: 1, retention_status: "active" };
+  cache.add([row]);
+  now = 1_049;
+  assert.equal(cache.get(1), row);
+  now = 1_050;
+  assert.equal(cache.get(1), undefined);
+  assert.equal(cache.size, 0);
 });
 
 test("cache eviction enforces age and size bounds without touching in-flight or partial files", () => {
@@ -153,6 +199,7 @@ test("thumbnail candidates stay beside the media file and prefer the .image conv
 
 test("trash-schema startup races have a dedicated error classification", () => {
   assert.equal(isTrashSchemaMigrationError(new Error("no such column: files.trashed_at")), true);
+  assert.equal(isTrashSchemaMigrationError(new Error("no such column: files.platform")), true);
   assert.equal(isTrashSchemaMigrationError(new Error("database is locked")), false);
 });
 
@@ -178,4 +225,98 @@ test("creator monitoring proxy route allows only DELETE", () => {
   );
   assert.equal(matchCreatorMonitoringProxyRoute("/api/creators/alice.archive/videos", "DELETE"), null);
   assert.equal(matchCreatorMonitoringProxyRoute("/api/creators/alice/archive/monitoring", "DELETE"), null);
+});
+
+test("profile group proxy routes expose only explicit management methods", () => {
+  assert.deepEqual(matchProfileGroupsProxyRoute("/api/profile-groups", "GET"), {
+    allowed: true,
+    readsBody: false,
+  });
+  assert.deepEqual(matchProfileGroupsProxyRoute("/api/profile-groups", "POST"), {
+    allowed: true,
+    readsBody: true,
+  });
+  assert.deepEqual(matchProfileGroupsProxyRoute("/api/profile-groups", "DELETE"), {
+    allowed: false,
+    readsBody: false,
+  });
+  assert.deepEqual(matchProfileGroupsProxyRoute("/api/profile-groups/12", "PATCH"), {
+    allowed: true,
+    readsBody: true,
+  });
+  assert.deepEqual(matchProfileGroupsProxyRoute("/api/profile-groups/12", "GET"), {
+    allowed: false,
+    readsBody: false,
+  });
+  assert.deepEqual(matchProfileGroupsProxyRoute("/api/profile-groups/12/profiles/8", "DELETE"), {
+    allowed: true,
+    readsBody: false,
+  });
+  assert.deepEqual(matchProfileGroupsProxyRoute("/api/profile-groups/12/profiles/8", "PATCH"), {
+    allowed: false,
+    readsBody: false,
+  });
+  assert.equal(matchProfileGroupsProxyRoute("/api/profile-groups/not-an-id", "PATCH"), null);
+});
+
+test("post bookmark proxy routes allow only an exact numeric mutation", () => {
+  assert.deepEqual(matchPostBookmarkProxyRoute("/api/post-bookmarks/42", "PUT"), {
+    allowed: true,
+    fileId: 42,
+  });
+  assert.deepEqual(matchPostBookmarkProxyRoute("/api/post-bookmarks/42", "DELETE"), {
+    allowed: true,
+    fileId: 42,
+  });
+  assert.deepEqual(matchPostBookmarkProxyRoute("/api/post-bookmarks/42", "GET"), {
+    allowed: false,
+    fileId: 42,
+  });
+  assert.equal(matchPostBookmarkProxyRoute("/api/post-bookmarks/not-an-id", "PUT"), null);
+  assert.equal(matchPostBookmarkProxyRoute("/api/post-bookmarks/42/extra", "PUT"), null);
+});
+
+test("media post lifecycle proxy routes expose only confirmed trash and restore methods", () => {
+  assert.deepEqual(matchMediaPostMutationProxyRoute("/api/media-posts/42", "DELETE"), {
+    allowed: true,
+    fileId: 42,
+    readsBody: true,
+  });
+  assert.deepEqual(matchMediaPostMutationProxyRoute("/api/media-posts/42", "PUT"), {
+    allowed: false,
+    fileId: 42,
+    readsBody: false,
+  });
+  assert.deepEqual(matchMediaPostMutationProxyRoute("/api/media-posts/42/restore", "POST"), {
+    allowed: true,
+    fileId: 42,
+    readsBody: true,
+  });
+  assert.deepEqual(matchMediaPostMutationProxyRoute("/api/media-posts/42/restore", "DELETE"), {
+    allowed: false,
+    fileId: 42,
+    readsBody: false,
+  });
+  assert.equal(matchMediaPostMutationProxyRoute("/api/media-posts/not-an-id", "DELETE"), null);
+});
+
+test("CORS accepts the configured app and exact loopback origins without hostname lookalikes", () => {
+  const options = { publicBaseUrl: "https://rewind.example.com/app" };
+  assert.equal(isAllowedCorsOrigin("", options), true);
+  assert.equal(isAllowedCorsOrigin("https://rewind.example.com", options), true);
+  assert.equal(isAllowedCorsOrigin("http://localhost:3000", options), true);
+  assert.equal(isAllowedCorsOrigin("http://127.0.0.1:8787", options), true);
+  assert.equal(isAllowedCorsOrigin("http://[::1]:8787", options), true);
+  assert.equal(isAllowedCorsOrigin("https://rewind.example.com.evil.test", options), false);
+  assert.equal(isAllowedCorsOrigin("http://localhost.evil.test", options), false);
+  assert.equal(isAllowedCorsOrigin("null", options), false);
+  assert.equal(isAllowedCorsOrigin("https://other.example.com", options), false);
+  assert.equal(isAllowedCorsOrigin("https://rewind.example.com", {
+    ...options,
+    allowLoopback: false,
+  }), true);
+  assert.equal(isAllowedCorsOrigin("http://localhost:3000", {
+    ...options,
+    allowLoopback: false,
+  }), false);
 });

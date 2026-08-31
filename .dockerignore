@@ -1,6 +1,7 @@
 .git
 .env
 .secrets
+cookies
 node_modules
 **/node_modules
 data

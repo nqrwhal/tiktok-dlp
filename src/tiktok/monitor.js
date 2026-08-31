@@ -11,7 +11,7 @@ const DEFAULT_DELETION_CHECK_LEASE_MS = 10 * 60 * 1000;
 const DELETION_CONFIRMATION_DELAY_MS = 15 * 60 * 1000;
 const DEFAULT_BACKOFF_BASE_MS = 60 * 1000;
 const DEFAULT_BACKOFF_MAX_MS = 60 * 60 * 1000;
-const DEFAULT_DOWNLOAD_FAILURE_POISON_AFTER = 5;
+const DEFAULT_DOWNLOAD_FAILURE_DEAD_LETTER_AFTER = 5;
 const DELETION_CHECK_DELAYS_MS = [
   60 * 1000,
   60 * 1000,
@@ -281,7 +281,8 @@ export class TikTokMonitor {
     deletionCheckLeaseMs = DEFAULT_DELETION_CHECK_LEASE_MS,
     backoffBaseMs = DEFAULT_BACKOFF_BASE_MS,
     backoffMaxMs = DEFAULT_BACKOFF_MAX_MS,
-    downloadFailurePoisonAfter = DEFAULT_DOWNLOAD_FAILURE_POISON_AFTER,
+    downloadFailureDeadLetterAfter = null,
+    downloadFailurePoisonAfter = null,
     now = () => Date.now(),
     sleep = defaultSleep,
   } = {}) {
@@ -304,7 +305,11 @@ export class TikTokMonitor {
     this.deletionCheckLeaseMs = Math.max(1, Number(deletionCheckLeaseMs) || DEFAULT_DELETION_CHECK_LEASE_MS);
     this.backoffBaseMs = backoffBaseMs;
     this.backoffMaxMs = backoffMaxMs;
-    this.downloadFailurePoisonAfter = Math.max(1, Number(downloadFailurePoisonAfter) || DEFAULT_DOWNLOAD_FAILURE_POISON_AFTER);
+    this.downloadFailureDeadLetterAfter = Math.max(
+      1,
+      Number(downloadFailureDeadLetterAfter ?? downloadFailurePoisonAfter)
+        || DEFAULT_DOWNLOAD_FAILURE_DEAD_LETTER_AFTER,
+    );
     this.now = now;
     this.sleep = sleep;
 
@@ -325,6 +330,7 @@ export class TikTokMonitor {
   #activeDownloads = 0;
   #pendingDownloadIds = new Set();
   #downloadFailures = new Map();
+  #deadLetteredDownloadIds = new Set();
   #deletionQueue = [];
   #activeDeletionChecks = 0;
   #pendingDeletionIds = new Set();
@@ -336,6 +342,7 @@ export class TikTokMonitor {
     totalQueuedDownloads: 0,
     totalCompletedDownloads: 0,
     totalDownloadFailures: 0,
+    totalAlertFailures: 0,
     lastCycleStartedAt: null,
     lastCycleFinishedAt: null,
     lastCycleDurationMs: 0,
@@ -587,6 +594,10 @@ export class TikTokMonitor {
         partial.seenVideos += 1;
         continue;
       }
+      const storedFailure = await Promise.resolve(this.store.getMonitorDownloadFailure?.(videoId));
+      if (storedFailure?.status === 'dead_letter' || storedFailure?.status === 'retrying' || this.#deadLetteredDownloadIds.has(videoId)) {
+        continue;
+      }
 
       const sourceUrl = resolveVideoSourceUrl(video, fallbackUrl);
       const seenRecord = {
@@ -671,15 +682,47 @@ export class TikTokMonitor {
   }
 
   async #runDownloadTask({ videoId, video, watch, normalized, sourceUrl, seenRecord }) {
+    let downloaded;
     try {
-      const downloaded = await this.#downloadVideo(video, {
+      downloaded = await this.#downloadVideo(video, {
         watch,
         username: normalized.username,
         profileUrl: normalized.profileUrl,
         sourceUrl,
       });
-      const mediaType = resolveVideoMediaType(video);
+    } catch (error) {
+      this.#metrics.totalDownloadFailures += 1;
+      this.#metrics.lastError = error instanceof Error ? error.message : String(error);
+      this.logger?.warn?.(`TikTok monitor download failed for ${videoId}: ${this.#metrics.lastError}`);
+      let failure;
+      if (typeof this.store.recordMonitorDownloadFailure === 'function') {
+        failure = await Promise.resolve(this.store.recordMonitorDownloadFailure({
+          ...seenRecord,
+          mediaType: resolveVideoMediaType(video),
+          error,
+        }, this.downloadFailureDeadLetterAfter, this.now()));
+      } else {
+        const failures = (this.#downloadFailures.get(videoId) ?? 0) + 1;
+        this.#downloadFailures.set(videoId, failures);
+        failure = {
+          failure_count: failures,
+          status: failures >= this.downloadFailureDeadLetterAfter ? 'dead_letter' : 'retryable',
+        };
+      }
+      if (failure?.status === 'dead_letter') {
+        this.#downloadFailures.delete(videoId);
+        this.#deadLetteredDownloadIds.add(videoId);
+        this.logger?.warn?.(`TikTok monitor dead-lettered ${videoId} after ${failure.failure_count} download failures.`);
+        return { downloaded: false, alerted: false, deadLettered: true };
+      }
+      throw error;
+    }
 
+    this.#downloadFailures.delete(videoId);
+    this.#deadLetteredDownloadIds.delete(videoId);
+    const storedFailure = await Promise.resolve(this.store.getMonitorDownloadFailure?.(videoId));
+    const mediaType = resolveVideoMediaType(video);
+    try {
       await Promise.resolve(
         this.alert({
           watch: { ...watch, username: normalized.username, profileUrl: normalized.profileUrl },
@@ -690,29 +733,89 @@ export class TikTokMonitor {
           result: downloaded,
         }),
       );
-
-      const now = this.now();
-      this.#downloadFailures.delete(videoId);
-      await Promise.resolve(this.store.markVideoSeen({ ...seenRecord, alertedAt: now }, now));
-      if (mediaType !== 'story') {
-        await Promise.resolve(this.store.scheduleVideoDeletionCheck?.(videoId, now + nextDeletionCheckDelayMs(0)));
-      }
-      this.#metrics.totalCompletedDownloads += 1;
-      return { downloaded: true, alerted: true };
     } catch (error) {
-      this.#metrics.totalDownloadFailures += 1;
-      this.#metrics.lastError = error instanceof Error ? error.message : String(error);
-      const failures = (this.#downloadFailures.get(videoId) ?? 0) + 1;
-      this.#downloadFailures.set(videoId, failures);
-      this.logger?.warn?.(`TikTok monitor download failed for ${videoId}: ${this.#metrics.lastError}`);
-      if (failures >= this.downloadFailurePoisonAfter) {
-        const poisonAt = this.now();
-        await Promise.resolve(this.store.markVideoSeen(seenRecord, poisonAt));
-        this.#downloadFailures.delete(videoId);
-        this.logger?.warn?.(`TikTok monitor poisoned ${videoId} after ${failures} failures.`);
-        return { downloaded: false, alerted: false, poisoned: true };
+      if (storedFailure?.status === 'retrying') {
+        try {
+          const released = await Promise.resolve(this.store.releaseMonitorDownloadRetry?.(videoId, this.now()));
+          if (released?.status === 'dead_letter') this.#deadLetteredDownloadIds.add(videoId);
+        } catch (releaseError) {
+          this.logger?.warn?.(`TikTok monitor could not release manual retry ${videoId}: ${releaseError instanceof Error ? releaseError.message : String(releaseError)}`);
+        }
       }
+      this.#metrics.totalAlertFailures += 1;
+      this.#metrics.lastError = error instanceof Error ? error.message : String(error);
+      this.logger?.warn?.(`TikTok monitor alert failed for ${videoId}: ${this.#metrics.lastError}`);
       throw error;
+    }
+
+    const now = this.now();
+    await Promise.resolve(this.store.markMonitorDownloadFailureResolved?.(videoId, now));
+    this.#deadLetteredDownloadIds.delete(videoId);
+    await Promise.resolve(this.store.markVideoSeen({ ...seenRecord, alertedAt: now }, now));
+    if (mediaType !== 'story') {
+      await Promise.resolve(this.store.scheduleVideoDeletionCheck?.(videoId, now + nextDeletionCheckDelayMs(0)));
+    }
+    this.#metrics.totalCompletedDownloads += 1;
+    return { downloaded: true, alerted: true };
+  }
+
+  async retryFailedVideo(videoId) {
+    const id = String(videoId ?? '').trim();
+    const failure = await Promise.resolve(this.store.getMonitorDownloadFailure?.(id));
+    if (!failure) return { accepted: false, reason: 'not_found', failure: null };
+    if (failure.status !== 'dead_letter') {
+      return { accepted: false, reason: 'not_retryable', failure };
+    }
+
+    const watch = await Promise.resolve(this.store.getWatch?.(failure.username));
+    if (!watch) return { accepted: false, reason: 'watch_not_found', failure };
+    const normalized = normalizeWatchedUser(watch);
+    const sourceUrl = String(failure.source_url ?? '').trim();
+    if (!sourceUrl) return { accepted: false, reason: 'source_missing', failure };
+
+    const retry = await Promise.resolve(this.store.retryMonitorDownloadFailure?.(id, this.now()));
+    if (!retry?.accepted) return retry ?? { accepted: false, reason: 'not_retryable', failure };
+
+    this.#deadLetteredDownloadIds.delete(id);
+    const video = {
+      id,
+      title: failure.title ?? '',
+      webpage_url: sourceUrl,
+      mediaType: failure.media_type ?? '',
+    };
+    const promise = this.#enqueueDownload({
+      videoId: id,
+      video,
+      watch,
+      normalized,
+      sourceUrl,
+      seenRecord: {
+        videoId: id,
+        username: normalized.username,
+        sourceUrl,
+        title: failure.title ?? '',
+      },
+    });
+    if (!promise) {
+      const released = await Promise.resolve(this.store.releaseMonitorDownloadRetry?.(id, this.now()));
+      return { accepted: false, reason: 'already_pending', failure: released ?? retry.failure };
+    }
+
+    try {
+      const result = await promise;
+      return {
+        accepted: true,
+        completed: Boolean(result?.downloaded && result?.alerted),
+        result,
+        failure: await Promise.resolve(this.store.getMonitorDownloadFailure?.(id)),
+      };
+    } catch (error) {
+      return {
+        accepted: true,
+        completed: false,
+        error: error instanceof Error ? error.message : String(error),
+        failure: await Promise.resolve(this.store.getMonitorDownloadFailure?.(id)),
+      };
     }
   }
 
@@ -885,6 +988,7 @@ export class TikTokMonitor {
       burstScanLimit: this.burstScanLimit,
       checkConcurrency: this.checkConcurrency,
       downloadConcurrency: this.downloadConcurrency,
+      downloadFailureDeadLetterAfter: this.downloadFailureDeadLetterAfter,
       queueLength: this.#downloadQueue.length,
       activeDownloads: this.#activeDownloads,
       pendingDownloads: this.#pendingDownloadIds.size,

@@ -3,6 +3,7 @@
 import {
   Clapperboard,
   Home,
+  Images,
   LayoutDashboard,
   Menu,
   Settings,
@@ -17,6 +18,7 @@ import styles from "./dashboard.module.css";
 const navigation = [
   { href: "/dashboard", label: "Overview", icon: LayoutDashboard },
   { href: "/dashboard/videos", label: "Videos", icon: Clapperboard },
+  { href: "/dashboard/media", label: "Media", icon: Images },
   { href: "/dashboard/creators", label: "Creators", icon: Users },
   { href: "/dashboard/settings", label: "Settings", icon: Settings },
 ];

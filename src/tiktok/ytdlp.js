@@ -1583,7 +1583,7 @@ function makePhotoUrl(username, id) {
   return username && id ? `https://www.tiktok.com/@${username}/photo/${id}` : '';
 }
 
-async function createZipFile(zipPath, entries) {
+export async function createZipFile(zipPath, entries) {
   const now = new Date();
   const centralDirectory = [];
   let offset = 0;

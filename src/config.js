@@ -41,6 +41,7 @@ export function loadConfig(env = process.env, cwd = process.cwd()) {
   const dataDir = resolvePath(env.DATA_DIR ?? './data', cwd);
   const downloadDir = resolvePath(env.DOWNLOAD_DIR ?? path.join(dataDir, 'downloads'), cwd);
   const stateDbPath = resolvePath(env.STATE_DB ?? path.join(dataDir, 'state.db'), cwd);
+  const galleryDlTempDir = resolvePath(env.GALLERY_DL_TEMP_DIR ?? path.join(dataDir, 'gallery-dl-staging'), cwd);
   const publicBaseUrl = String(env.PUBLIC_BASE_URL ?? 'https://example.com').replace(/\/+$/, '');
   const uploadLimitMb = parsePositiveInt(env.DISCORD_UPLOAD_LIMIT_MB, 10);
   const httpPort = parsePositiveInt(env.HTTP_PORT, 8080);
@@ -48,6 +49,8 @@ export function loadConfig(env = process.env, cwd = process.cwd()) {
   const slideshowItemLimitMb = parsePositiveInt(env.MAX_SLIDESHOW_ITEM_MB, 20);
   const slideshowTotalLimitMb = parsePositiveInt(env.MAX_SLIDESHOW_TOTAL_MB, 250);
   const mediaLimitMb = parsePositiveInt(env.MAX_MEDIA_DOWNLOAD_MB, 2_048);
+  const galleryDlItemLimitMb = parsePositiveInt(env.GALLERY_DL_MAX_ITEM_MB, 250);
+  const galleryDlTotalLimitMb = parsePositiveInt(env.GALLERY_DL_MAX_TOTAL_MB, 500);
 
   return {
     discordToken: env.DISCORD_TOKEN ?? '',
@@ -61,6 +64,7 @@ export function loadConfig(env = process.env, cwd = process.cwd()) {
     dataDir,
     downloadDir,
     stateDbPath,
+    galleryDlTempDir,
     pollIntervalSeconds: parsePositiveInt(env.POLL_INTERVAL_SECONDS, 60),
     profileScanLimit: parsePositiveInt(env.PROFILE_SCAN_LIMIT, 5),
     profileBurstScanLimit: parsePositiveInt(env.PROFILE_BURST_SCAN_LIMIT, 20),
@@ -87,6 +91,15 @@ export function loadConfig(env = process.env, cwd = process.cwd()) {
     maxSlideshowItemBytes: slideshowItemLimitMb * 1024 * 1024,
     maxSlideshowTotalBytes: slideshowTotalLimitMb * 1024 * 1024,
     maxMediaDownloadBytes: mediaLimitMb * 1024 * 1024,
+    galleryDlPath: String(env.GALLERY_DL_PATH ?? 'gallery-dl').trim(),
+    galleryDlTimeoutMs: parsePositiveInt(env.GALLERY_DL_TIMEOUT_SECONDS, 120) * 1000,
+    galleryDlMaxAssets: parsePositiveInt(env.GALLERY_DL_MAX_ASSETS, 20),
+    galleryDlMaxItemBytes: galleryDlItemLimitMb * 1024 * 1024,
+    galleryDlMaxTotalBytes: galleryDlTotalLimitMb * 1024 * 1024,
+    instagramCookiesFile: env.INSTAGRAM_COOKIES_FILE ? resolvePath(env.INSTAGRAM_COOKIES_FILE, cwd) : '',
+    instagramProxy: String(env.INSTAGRAM_PROXY ?? '').trim(),
+    xCookiesFile: env.X_COOKIES_FILE ? resolvePath(env.X_COOKIES_FILE, cwd) : '',
+    xProxy: String(env.X_PROXY ?? '').trim(),
     pingMode: String(env.PING_MODE ?? 'none').toLowerCase(),
     pingRoleId: env.PING_ROLE_ID ?? '',
     ytdlpPath: env.YTDLP_PATH ?? 'yt-dlp',
@@ -101,6 +114,7 @@ export function loadConfig(env = process.env, cwd = process.cwd()) {
 export async function ensureRuntimeDirs(config) {
   await mkdir(path.dirname(config.stateDbPath), { recursive: true });
   await mkdir(config.downloadDir, { recursive: true });
+  await mkdir(config.galleryDlTempDir, { recursive: true });
 }
 
 export function validateRuntimeConfig(config, { requireDiscord = true } = {}) {

@@ -11,27 +11,80 @@ import {
 } from './discord/client.js';
 import { registerCommands } from './discord/register-commands.js';
 import { TikTokMonitor, resolveVideoMediaType } from './tiktok/monitor.js';
-import { fetchVideoMetadata } from './tiktok/ytdlp.js';
+import { getPlatformAdapter } from './platforms/index.js';
 import { cleanupExpiredDownloads } from './cleanup/downloads.js';
 import { createDownloadService } from './download/service.js';
 import { createCreatorImportService } from './import/creator.js';
 
-export async function deliverMonitorAlerts(targets, deliver, { videoId = 'unknown' } = {}) {
-  const outcomes = await Promise.allSettled(targets.map(deliver));
+export async function deliverMonitorAlerts(targets, deliver, {
+  videoId = 'unknown',
+  eventType = 'new_post',
+  store = null,
+} = {}) {
+  const deliveryTargets = Array.isArray(targets) ? targets : [];
+  let pendingTargets = deliveryTargets;
+  if (typeof store?.isAlertDelivered === 'function') {
+    const pendingFlags = await Promise.all(deliveryTargets.map(async (target) => {
+      const key = alertDeliveryKey(target, videoId, eventType);
+      if (!key) return true;
+      return !await Promise.resolve(store.isAlertDelivered(key));
+    }));
+    pendingTargets = deliveryTargets.filter((target, index) => pendingFlags[index]);
+  }
+  const outcomes = await Promise.allSettled(pendingTargets.map(async (target) => {
+    const key = alertDeliveryKey(target, videoId, eventType);
+    try {
+      const result = await deliver(target);
+      if (key && typeof store?.markAlertDelivered === 'function') {
+        await Promise.resolve(store.markAlertDelivered(key));
+      }
+      return result;
+    } catch (error) {
+      if (key && typeof store?.markAlertDeliveryFailed === 'function') {
+        try {
+          await Promise.resolve(store.markAlertDeliveryFailed({ ...key, error }));
+        } catch (stateError) {
+          console.warn('[monitor] Failed to persist alert delivery failure.', stateError);
+        }
+      }
+      throw error;
+    }
+  }));
   const failures = outcomes.filter((outcome) => outcome.status === 'rejected');
   if (!failures.length) return outcomes;
 
-  const message = `[monitor] ${failures.length} of ${targets.length} alert delivery target(s) failed for ${videoId}.`;
+  const message = `[monitor] ${failures.length} of ${pendingTargets.length} alert delivery target(s) failed for ${videoId}.`;
   const errors = failures.map((failure) => failure.reason);
   console.warn(message, errors);
   const error = new AggregateError(errors, message);
   error.failedTargets = failures.length;
-  error.targetCount = targets.length;
+  error.targetCount = pendingTargets.length;
+  error.totalTargets = deliveryTargets.length;
   error.videoId = videoId;
   throw error;
 }
 
-export async function checkVideoAvailability(video, config, fetchMetadata = fetchVideoMetadata) {
+function alertDeliveryKey(target, videoId, eventType) {
+  const subscriptionId = Number(target?.id);
+  const normalizedVideoId = String(videoId ?? '').trim();
+  const normalizedEventType = String(eventType ?? '').trim();
+  if (
+    !normalizedVideoId
+    || normalizedVideoId === 'unknown'
+    || !Number.isInteger(subscriptionId)
+    || subscriptionId <= 0
+    || !normalizedEventType
+  ) {
+    return null;
+  }
+  return { videoId: normalizedVideoId, subscriptionId, eventType: normalizedEventType };
+}
+
+export async function checkVideoAvailability(
+  video,
+  config,
+  availabilityChecker = getPlatformAdapter('tiktok')?.checkAvailability,
+) {
   const sourceUrl = video?.source_url || video?.sourceUrl || video?.url || video?.webpage_url || '';
   if (resolveVideoMediaType(video) === 'story') {
     return { available: true, reason: 'Story deletion checks are skipped.' };
@@ -39,9 +92,12 @@ export async function checkVideoAvailability(video, config, fetchMetadata = fetc
   if (!sourceUrl) {
     throw Object.assign(new Error('The original post URL is missing.'), { kind: 'invalid_url' });
   }
+  if (typeof availabilityChecker !== 'function') {
+    throw new Error('TikTok availability checks are not configured.');
+  }
   try {
-    await fetchMetadata(sourceUrl, config);
-    return { available: true };
+    const result = await availabilityChecker(sourceUrl, { config, video });
+    return typeof result?.available === 'boolean' ? result : { available: true };
   } catch (error) {
     if (String(error?.kind ?? '') === 'not_found') {
       return { available: false, reason: error.message ?? String(error) };
@@ -75,9 +131,17 @@ if (process.env.NODE_ENV !== 'test') {
   const downloadService = createDownloadService({ config, store });
   const creatorImportService = createCreatorImportService({ config, store, downloadService });
   const downloadOne = downloadService.request.bind(downloadService);
+  const tiktokPlatformAdapter = getPlatformAdapter('tiktok');
+  if (
+    typeof tiktokPlatformAdapter?.listCreatorPosts !== 'function'
+    || typeof tiktokPlatformAdapter?.listCreatorStories !== 'function'
+    || typeof tiktokPlatformAdapter?.checkAvailability !== 'function'
+  ) {
+    throw new Error('The TikTok platform adapter is missing required monitor operations.');
+  }
 
   async function checkVideoAvailable(video) {
-    return checkVideoAvailability(video, config);
+    return checkVideoAvailability(video, config, tiktokPlatformAdapter.checkAvailability);
   }
 
   const monitor = new TikTokMonitor({
@@ -91,14 +155,12 @@ if (process.env.NODE_ENV !== 'test') {
     deletionCheckConcurrency: config.deletionCheckConcurrency,
     deletionCheckBatchSize: config.deletionCheckBatchSize,
     downloader: {
-      listProfileVideos: async (username, options = {}) => {
-        const { listProfileVideos } = await import('./tiktok/ytdlp.js');
-        return listProfileVideos(username, { ...config, ...options });
-      },
-      listProfileStories: async (username, options = {}) => {
-        const { listProfileStories } = await import('./tiktok/ytdlp.js');
-        return listProfileStories(username, { ...config, ...options });
-      },
+      listProfileVideos: async (username, options = {}) => (
+        tiktokPlatformAdapter.listCreatorPosts(username, { ...config, ...options })
+      ),
+      listProfileStories: async (username, options = {}) => (
+        tiktokPlatformAdapter.listCreatorStories(username, { ...config, ...options })
+      ),
       downloadVideo: async (video, options = {}) => downloadOne(video.url || video.webpage_url || video.sourceUrl || options.sourceUrl, {
         type: 'monitor',
         username: options.username || video.username,
@@ -127,12 +189,15 @@ if (process.env.NODE_ENV !== 'test') {
         await sendVideoAlert({
           client: discordClient,
           config,
-          store,
           result: scopedResult,
           video,
           watch: { ...watch, channel_id: subscription.channel_id },
         });
-      }, { videoId: video?.id ?? video?.video_id ?? 'unknown' });
+      }, {
+        videoId: video?.id ?? video?.video_id ?? 'unknown',
+        eventType: 'new_post',
+        store,
+      });
     },
     deletionAlert: async ({ video, reason }) => {
       if (!discordClient) {
@@ -156,7 +221,11 @@ if (process.env.NODE_ENV !== 'test') {
           watch: { ...watch, channel_id: subscription.channel_id },
           reason,
         });
-      }, { videoId: video?.video_id ?? 'unknown' });
+      }, {
+        videoId: video?.video_id ?? 'unknown',
+        eventType: 'deletion',
+        store,
+      });
       return { delivered: true };
     },
     usernameChangeAlert: async (change) => {

@@ -13,8 +13,11 @@ RUN apt-get update \
     python3-pip \
     tini \
     tzdata \
-  && python3 -m pip install --no-cache-dir --break-system-packages 'curl_cffi>=0.10' \
+  && python3 -m pip install --no-cache-dir --break-system-packages \
+    'curl_cffi>=0.10' \
+    'gallery-dl==1.32.10' \
   && python3 -c 'import curl_cffi' \
+  && test "$(gallery-dl --version)" = "1.32.10" \
   && curl --fail --location --retry 3 \
     https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp \
     --output /usr/local/bin/yt-dlp \
@@ -39,7 +42,7 @@ USER node
 EXPOSE 8080
 
 HEALTHCHECK --interval=60s --timeout=5s --start-period=20s --retries=3 \
-  CMD node -e "const p=process.env.HTTP_PORT||8080;require('http').get('http://127.0.0.1:'+p+'/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
+  CMD node -e "const p=process.env.HTTP_PORT||8080;require('http').get('http://127.0.0.1:'+p+'/ready',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
 
 ENTRYPOINT ["tini", "--"]
 CMD ["npm", "start"]
