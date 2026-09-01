@@ -12,6 +12,7 @@ import {
   stat,
   writeFile,
 } from 'node:fs/promises';
+import { listPrivateHighlights, listPrivatePosts, listPrivateStories } from './instagramPrivate.js';
 import os from 'node:os';
 import path from 'node:path';
 import { createPostReference } from './references.js';
@@ -180,62 +181,88 @@ function resolveListingSettings(platform, options = {}) {
 
 export async function listInstagramCreatorPosts(usernameOrUrl, options = {}) {
   const handle = normalizeInstagramHandle(usernameOrUrl);
-  const limit = Math.max(1, Math.min(50, Number(options.limit) || 5));
-  const rangeEnd = Math.max(limit * INSTAGRAM_LISTING_RANGE_MULTIPLIER, limit + 2);
-  const listingUrl = instagramPostsListingUrl(handle);
-  const settings = resolveListingSettings('instagram', options);
-  return withPlatformRuntime('instagram', settings, async (runtime) => {
-    const args = [
-      ...buildListingCommonArgs('instagram', settings, runtime, rangeEnd),
-      '-o',
-      'output.num-to-str=true',
-      '--dump-json',
-      '--',
-      listingUrl,
-    ];
-    const { stdout } = await runGalleryDl(settings.executable, args, settings);
-    return parseInstagramPostsListing(stdout, handle, listingUrl, limit);
-  });
+  try {
+    return await listPrivatePosts(handle, options);
+  } catch (privateError) {
+    const limit = Math.max(1, Math.min(50, Number(options.limit) || 5));
+    const rangeEnd = Math.max(limit * INSTAGRAM_LISTING_RANGE_MULTIPLIER, limit + 2);
+    const listingUrl = instagramPostsListingUrl(handle);
+    const settings = resolveListingSettings('instagram', options);
+    try {
+      return await withPlatformRuntime('instagram', settings, async (runtime) => {
+        const args = [
+          ...buildListingCommonArgs('instagram', settings, runtime, rangeEnd),
+          '-o',
+          'output.num-to-str=true',
+          '--dump-json',
+          '--',
+          listingUrl,
+        ];
+        const { stdout } = await runGalleryDl(settings.executable, args, settings);
+        return parseInstagramPostsListing(stdout, handle, listingUrl, limit);
+      });
+    } catch (galleryError) {
+      if (String(privateError?.kind ?? '') === 'not_found') throw privateError;
+      if (String(galleryError?.kind ?? '') === 'rate_limited' && String(privateError?.kind ?? '') !== 'rate_limited') throw privateError;
+      throw galleryError;
+    }
+  }
 }
-
 export async function listInstagramCreatorStories(usernameOrUrl, options = {}) {
   const handle = normalizeInstagramHandle(usernameOrUrl);
-  const limit = Math.max(1, Math.min(50, Number(options.limit) || 5));
-  const listingUrl = instagramStoriesListingUrl(handle);
-  const settings = resolveListingSettings('instagram', options);
-  return withPlatformRuntime('instagram', settings, async (runtime) => {
-    const args = [
-      ...buildListingCommonArgs('instagram', settings, runtime, limit * 2),
-      '-o',
-      'output.num-to-str=true',
-      '--dump-json',
-      '--',
-      listingUrl,
-    ];
-    const { stdout } = await runGalleryDl(settings.executable, args, settings);
-    return parseInstagramStoriesListing(stdout, handle, listingUrl, limit);
-  });
+  try {
+    return await listPrivateStories(handle, options);
+  } catch (privateError) {
+    const limit = Math.max(1, Math.min(50, Number(options.limit) || 5));
+    const listingUrl = instagramStoriesListingUrl(handle);
+    const settings = resolveListingSettings('instagram', options);
+    try {
+      return await withPlatformRuntime('instagram', settings, async (runtime) => {
+        const args = [
+          ...buildListingCommonArgs('instagram', settings, runtime, limit * 2),
+          '-o',
+          'output.num-to-str=true',
+          '--dump-json',
+          '--',
+          listingUrl,
+        ];
+        const { stdout } = await runGalleryDl(settings.executable, args, settings);
+        return parseInstagramStoriesListing(stdout, handle, listingUrl, limit);
+      });
+    } catch (galleryError) {
+      if (String(privateError?.kind ?? '') === 'not_found') throw privateError;
+      throw galleryError;
+    }
+  }
 }
 
 export async function listInstagramCreatorHighlights(usernameOrUrl, options = {}) {
   const handle = normalizeInstagramHandle(usernameOrUrl);
-  const limit = Math.max(1, Math.min(50, Number(options.limit) || 20));
-  const listingUrl = instagramHighlightsListingUrl(handle);
-  const settings = resolveListingSettings('instagram', options);
-  return withPlatformRuntime('instagram', settings, async (runtime) => {
-    const args = [
-      ...buildListingCommonArgs('instagram', settings, runtime, Math.max(limit * 5, 50)),
-      '-o',
-      'output.num-to-str=true',
-      '--dump-json',
-      '--',
-      listingUrl,
-    ];
-    const { stdout } = await runGalleryDl(settings.executable, args, settings);
-    return parseInstagramHighlightsListing(stdout, handle, listingUrl, limit);
-  });
+  try {
+    return await listPrivateHighlights(handle, options);
+  } catch (privateError) {
+    const limit = Math.max(1, Math.min(50, Number(options.limit) || 20));
+    const listingUrl = instagramHighlightsListingUrl(handle);
+    const settings = resolveListingSettings('instagram', options);
+    try {
+      return await withPlatformRuntime('instagram', settings, async (runtime) => {
+        const args = [
+          ...buildListingCommonArgs('instagram', settings, runtime, Math.max(limit * 5, 50)),
+          '-o',
+          'output.num-to-str=true',
+          '--dump-json',
+          '--',
+          listingUrl,
+        ];
+        const { stdout } = await runGalleryDl(settings.executable, args, settings);
+        return parseInstagramHighlightsListing(stdout, handle, listingUrl, limit);
+      });
+    } catch (galleryError) {
+      if (String(privateError?.kind ?? '') === 'not_found') throw privateError;
+      throw galleryError;
+    }
+  }
 }
-
 export function parseInstagramPostsListing(stdout, handle, sourceUrl, limit = 5) {
   let messages;
   try {

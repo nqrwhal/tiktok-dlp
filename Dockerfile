@@ -16,7 +16,9 @@ RUN apt-get update \
   && python3 -m pip install --no-cache-dir --break-system-packages \
     'curl_cffi>=0.10' \
     'gallery-dl==1.32.10' \
-  && python3 -c 'import curl_cffi' \
+    'Pillow>=8.1.1' \
+    'instagrapi==2.1.5' \
+  && python3 -c 'import curl_cffi; import instagrapi; print(instagrapi.__name__)' \
   && test "$(gallery-dl --version)" = "1.32.10" \
   && curl --fail --location --retry 3 \
     https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp \
@@ -33,8 +35,8 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 
 COPY src ./src
+COPY scripts ./scripts
 COPY README.md ./
-
 RUN mkdir -p /app/data/downloads /app/cookies && chown -R node:node /app
 
 USER node
