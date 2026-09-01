@@ -17,6 +17,7 @@ const TRACKING_QUERY_KEYS = new Set([
   'fbclid',
   'igsh',
   'igshid',
+  'igsi',
   'ref_src',
   's',
   'source',
